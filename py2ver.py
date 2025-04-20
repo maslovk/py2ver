@@ -110,6 +110,15 @@ class FunctionVisitor(ast.NodeVisitor):
     def visit_Add(self, node):
         return " + "
 
+    def visit_Sub(self, node):
+        return " - "
+
+    def visit_Mult(self, node):
+        return " * "
+
+    def visit_Div(self, node):
+        return " / "
+
     def visit_BinOp(self, node):
         left = self.visit(node.left)
         right = self.visit(node.right)
@@ -155,7 +164,7 @@ class FunctionVisitor(ast.NodeVisitor):
                 output_list = self.indent(self.visit(item))
             else :
                 if isinstance(item, ast.Assign):
-                    assign_list = self.indent(self.visit(item))
+                    assign_list += (self.indent(self.visit(item)) + "\n")
         if node.args is not None:
             values = self.visit(node.args)
             portlist = self.indent(values['port_list'])
