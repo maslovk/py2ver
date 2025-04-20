@@ -1,0 +1,1 @@
+input {% if signed %}signed {% endif %}{% if width != '' %}[{{ width - 1 }}:0] {% endif %}{{ name }}{% if dimensions != '' %} {{ dimensions }}{% endif %};
