@@ -236,6 +236,7 @@ class Py2ver:
         self.output_args_list = f_visitor.get_output_args_list()
         self.env = Environment(loader=FileSystemLoader(DEFAULT_TEMPLATE_DIR))
         self.template_cache = {}
+        self.attr = attr
 
         if not os.path.isdir("hdl"):
             os.mkdir("hdl")
@@ -274,6 +275,11 @@ class Py2ver:
     def tb(self):
         return self.tb_fun
 
+    def tosigned(self, n, nbits):
+        n = n & 0xffffffff
+        p = pow(2, nbits - 1)
+        return (n ^ p) - p
+
     def tb_fun(self, *in_arg):
         print("I was called with", len(in_arg), "arguments:", in_arg)
         if os.path.isfile('results/results.pickle'):
@@ -283,7 +289,12 @@ class Py2ver:
         if os.path.isfile('results/results.pickle'):
             with open('results/results.pickle', 'rb') as handle:
                 p = pickle.load(handle)
-                b = ast.literal_eval(p)
+                d = ast.literal_eval(p)
+                for dk in d.keys():
+                    if dk in self.attr.keys():
+                        if self.attr[dk]['signed'] == 1:
+                            d[dk] = self.tosigned(d[dk], self.attr[dk]['width'])
+                b = tuple([dk for dk in d.values()])
         else:
             b = (0,) * len(self.output_args_list)
         return b
