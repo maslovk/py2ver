@@ -197,6 +197,7 @@ class FunctionVisitor(ast.NodeVisitor):
         #Dump waves
         template_dw = self.get_template('dumpwaves.txt')
         template_dw_dict = {
+            'top_name': self.top_name
         }
 
         output_dw = template_dw.render(template_dw_dict)
