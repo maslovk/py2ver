@@ -4,7 +4,7 @@ from jinja2 import Environment, FileSystemLoader
 import os
 import functools
 import time
-import  testbench
+import  tb_runner
 import pickle
 
 DEFAULT_TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__)) + '/templates/'
@@ -47,6 +47,7 @@ class FunctionVisitor(ast.NodeVisitor):
         self.indent = functools.partial(indent, prefix=' ' * indentsize)
         self.template_cache = {}
         self.top_name = ''
+        self.input_args_list =[]
 
     def check_attributes(self, name):
             if name in self.attr.keys():
@@ -92,7 +93,7 @@ class FunctionVisitor(ast.NodeVisitor):
         }
         rslt_portlist = template.render(template_dict)
         rslt_inputlist = ''.join(inputs)
-        return {"port_list" : rslt_portlist,"input_list" : rslt_inputlist}
+        return {"port_list" : ports,"port_list_str" : rslt_portlist,"input_list" : rslt_inputlist}
 
     def visit_Return(self, node):
         return node.value.id
@@ -172,7 +173,8 @@ class FunctionVisitor(ast.NodeVisitor):
                     assign_list += (self.indent(self.visit(item)) + "\n")
         if node.args is not None:
             values = self.visit(node.args)
-            portlist = self.indent(values['port_list'])
+            portlist = self.indent(values['port_list_str'])
+            self.input_args_list = values['port_list']
             input_list = self.indent(values['input_list'])
 
         items = [input_list, output_list, assign_list]
@@ -190,6 +192,9 @@ class FunctionVisitor(ast.NodeVisitor):
     def get_top_name(self):
         return self.top_name
 
+    def get_input_args_list(self):
+        return self.input_args_list
+
 class Py2ver:
     t_name = ''
     def __init__(self, func, attr):
@@ -198,6 +203,9 @@ class Py2ver:
         f_visitor = FunctionVisitor(attr)
         result = f_visitor.visit(tree)
         self.t_name = f_visitor.get_top_name()
+        self.input_args_list = f_visitor.get_input_args_list()
+        self.env = Environment(loader=FileSystemLoader(DEFAULT_TEMPLATE_DIR))
+        self.template_cache = {}
 
         if not os.path.isdir("hdl"):
             os.mkdir("hdl")
@@ -206,13 +214,46 @@ class Py2ver:
         f.write(result)
         f.close()
 
+    def get_template(self, filename):
+        if filename in self.template_cache:
+            return self.template_cache[filename]
+
+        template = self.env.get_template(filename)
+        self.template_cache[filename] = template
+        return template
+
+    def gen_tb(self, *in_arg):
+        #Check if we have values for all arguments
+        key_val = []
+        for i in range(len(self.input_args_list)):
+            if in_arg[i] is not None:
+                key_val.append((self.input_args_list[i],in_arg[i]))
+            else:
+                key_val.append((self.input_args_list[i],0))
+        template = self.get_template("tb.txt")
+        template_dict = {
+            'in_args': key_val
+        }
+        tb_out = template.render(template_dict)
+        with open("tb.py", "w+") as f:
+            f.write(tb_out)
+
+
+
     def tb(self):
         return self.tb_fun
 
-    def tb_fun(self):
-        testbench.test_runner(self.t_name)
-        with open('results/results.pickle', 'rb') as handle:
-            b = pickle.load(handle)
+    def tb_fun(self, *in_arg):
+        print("I was called with", len(in_arg), "arguments:", in_arg)
+        if os.path.isfile('results/results.pickle'):
+            os.remove('results/results.pickle')
+        self.gen_tb(*in_arg)
+        tb_runner.test_runner(self.t_name)
+        if os.path.isfile('results/results.pickle'):
+            with open('results/results.pickle', 'rb') as handle:
+                b = pickle.load(handle)
+        else:
+            b = 0
         return b
 
 

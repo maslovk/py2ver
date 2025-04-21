@@ -16,6 +16,7 @@ attr = {'arg1': {'signed': 0, 'width': 8},
 
 foo_tb = Py2ver(foo, attr).tb()
 
-print(foo_tb())
+e = foo_tb(1,32)
+print(e)
 
 
