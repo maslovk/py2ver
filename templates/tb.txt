@@ -20,6 +20,10 @@ def tb_test(dut):
     dut.{{ arg[0] }}.value = {{ arg[1] }}
 {% endfor %}
     yield Timer(1)
-    return_val = int(dut.a.value)
+    return_val = (
+    {% for arg in out_args %}
+    int(dut.{{ arg }}.value),
+    {% endfor %}
+    )
     print("FIFO Dout Value=", return_val)
     yield save_results(str(return_val))

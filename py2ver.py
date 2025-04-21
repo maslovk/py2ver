@@ -48,12 +48,13 @@ class FunctionVisitor(ast.NodeVisitor):
         self.template_cache = {}
         self.top_name = ''
         self.input_args_list =[]
+        self.output_args_list =[]
 
     def check_attributes(self, name):
             if name in self.attr.keys():
                 result = self.attr[name]
             else:
-                result = [{'signed': 0, 'width': 1}]
+                result = {'signed': 0, 'width': 1}
 
             return result
 
@@ -96,7 +97,12 @@ class FunctionVisitor(ast.NodeVisitor):
         return {"port_list" : ports,"port_list_str" : rslt_portlist,"input_list" : rslt_inputlist}
 
     def visit_Return(self, node):
-        return node.value.id
+        out = self.visit(node.value)
+        return out
+
+    def visit_Tuple(self, node):
+        tup = [self.visit(elts) for elts in node.elts]
+        return tup
 
 
     def visit_Name(self,node):
@@ -153,21 +159,31 @@ class FunctionVisitor(ast.NodeVisitor):
         paramlist = ''
         output_list = ''
         portlist = ''
+        out_portlist_str = ''
         input_list = ''
         assign_list = ''
         output_args = ''
         for item in node.body:
             if isinstance(item, ast.Return):
-                output_args = self.indent(self.visit(item))
-                output_template = self.get_template('output.txt')
-                attr = self.check_attributes(item.value.id)
-                output_template_dict = {
-                    'name': item.value.id,
-                    'width': attr['width'],
-                    'signed': attr['signed'],
-                    'dimensions': '',
+                items = self.visit(item)
+                self.output_args_list = items
+                for it in items:
+                    output_template = self.get_template('output.txt')
+                    attr = self.check_attributes(it)
+                    output_template_dict = {
+                        'name': it,
+                        'width': attr['width'],
+                        'signed': attr['signed'],
+                        'dimensions': '',
+                    }
+                    output_list += output_template.render(output_template_dict) + "\n"
+
+                template_pl = self.get_template('portlist.txt')
+                template_pl_dict = {
+                       'ports': items,
+                       'len_ports': len(items),
                 }
-                output_list = output_template.render(output_template_dict)
+                out_portlist_str = template_pl.render(template_pl_dict)
             else :
                 if isinstance(item, ast.Assign):
                     assign_list += (self.indent(self.visit(item)) + "\n")
@@ -177,12 +193,21 @@ class FunctionVisitor(ast.NodeVisitor):
             self.input_args_list = values['port_list']
             input_list = self.indent(values['input_list'])
 
-        items = [input_list, output_list, assign_list]
+
+        #Dump waves
+        template_dw = self.get_template('dumpwaves.txt')
+        template_dw_dict = {
+        }
+
+        output_dw = template_dw.render(template_dw_dict)
+
+
+        items = [input_list, output_list, assign_list, output_dw]
 
         template_dict = {
             'modulename': node.name,
             'paramlist': paramlist,
-            'portlist': portlist + ','+output_args,
+            'portlist': portlist + ',\n' +out_portlist_str + ',' +output_args,
             'items': [self.indent(item) for item in items] if items else (),
         }
         rslt = template.render(template_dict)
@@ -195,6 +220,9 @@ class FunctionVisitor(ast.NodeVisitor):
     def get_input_args_list(self):
         return self.input_args_list
 
+    def get_output_args_list(self):
+        return self.output_args_list
+
 class Py2ver:
     t_name = ''
     def __init__(self, func, attr):
@@ -204,6 +232,7 @@ class Py2ver:
         result = f_visitor.visit(tree)
         self.t_name = f_visitor.get_top_name()
         self.input_args_list = f_visitor.get_input_args_list()
+        self.output_args_list = f_visitor.get_output_args_list()
         self.env = Environment(loader=FileSystemLoader(DEFAULT_TEMPLATE_DIR))
         self.template_cache = {}
 
@@ -232,7 +261,8 @@ class Py2ver:
                 key_val.append((self.input_args_list[i],0))
         template = self.get_template("tb.txt")
         template_dict = {
-            'in_args': key_val
+            'in_args': key_val,
+            'out_args': self.output_args_list
         }
         tb_out = template.render(template_dict)
         with open("tb.py", "w+") as f:
@@ -251,9 +281,10 @@ class Py2ver:
         tb_runner.test_runner(self.t_name)
         if os.path.isfile('results/results.pickle'):
             with open('results/results.pickle', 'rb') as handle:
-                b = pickle.load(handle)
+                p = pickle.load(handle)
+                b = ast.literal_eval(p)
         else:
-            b = 0
+            b = (0,) * len(self.output_args_list)
         return b
 
 
