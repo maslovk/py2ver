@@ -4,6 +4,8 @@ from jinja2 import Environment, FileSystemLoader
 import os
 import functools
 import time
+import  testbench
+import pickle
 
 DEFAULT_TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__)) + '/templates/'
 
@@ -44,6 +46,7 @@ class FunctionVisitor(ast.NodeVisitor):
         self.env = Environment(loader=FileSystemLoader(DEFAULT_TEMPLATE_DIR))
         self.indent = functools.partial(indent, prefix=' ' * indentsize)
         self.template_cache = {}
+        self.top_name = ''
 
     def check_attributes(self, name):
             if name in self.attr.keys():
@@ -92,16 +95,7 @@ class FunctionVisitor(ast.NodeVisitor):
         return {"port_list" : rslt_portlist,"input_list" : rslt_inputlist}
 
     def visit_Return(self, node):
-        output_template = self.get_template('output.txt')
-        attr = self.check_attributes(node.value.id)
-        output_template_dict = {
-            'name': node.value.id,
-            'width': attr['width'],
-            'signed': attr['signed'],
-            'dimensions': '',
-        }
-        rslt_output = output_template.render(output_template_dict)
-        return rslt_output
+        return node.value.id
 
 
     def visit_Name(self,node):
@@ -153,15 +147,26 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         print(f"Found function: {node.name}")
+        self.top_name = node.name
         template = self.get_template("moduledef.txt")
         paramlist = ''
         output_list = ''
         portlist = ''
         input_list = ''
         assign_list = ''
+        output_args = ''
         for item in node.body:
             if isinstance(item, ast.Return):
-                output_list = self.indent(self.visit(item))
+                output_args = self.indent(self.visit(item))
+                output_template = self.get_template('output.txt')
+                attr = self.check_attributes(item.value.id)
+                output_template_dict = {
+                    'name': item.value.id,
+                    'width': attr['width'],
+                    'signed': attr['signed'],
+                    'dimensions': '',
+                }
+                output_list = output_template.render(output_template_dict)
             else :
                 if isinstance(item, ast.Assign):
                     assign_list += (self.indent(self.visit(item)) + "\n")
@@ -175,18 +180,39 @@ class FunctionVisitor(ast.NodeVisitor):
         template_dict = {
             'modulename': node.name,
             'paramlist': paramlist,
-            'portlist': portlist + ','+output_list,
+            'portlist': portlist + ','+output_args,
             'items': [self.indent(item) for item in items] if items else (),
         }
         rslt = template.render(template_dict)
         #self.generic_visit(node)
         return rslt
 
+    def get_top_name(self):
+        return self.top_name
+
 class Py2ver:
+    t_name = ''
     def __init__(self, func, attr):
         source_foo = inspect.getsource(func)
         tree = ast.parse(source_foo)
-        result = FunctionVisitor(attr).visit(tree)
+        f_visitor = FunctionVisitor(attr)
+        result = f_visitor.visit(tree)
+        self.t_name = f_visitor.get_top_name()
 
-        with open("main.v", "w") as text_file:
-            text_file.write(result)
+        if not os.path.isdir("hdl"):
+            os.mkdir("hdl")
+
+        f = open("hdl/main.v", "w+")
+        f.write(result)
+        f.close()
+
+    def tb(self):
+        return self.tb_fun
+
+    def tb_fun(self):
+        testbench.test_runner(self.t_name)
+        with open('results/results.pickle', 'rb') as handle:
+            b = pickle.load(handle)
+        return b
+
+
