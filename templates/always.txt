@@ -1,0 +1,5 @@
+
+always @(posedge {{ sens_list }}) begin
+{{ statement }}
+end
+

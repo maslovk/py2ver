@@ -50,11 +50,17 @@ class FunctionVisitor(ast.NodeVisitor):
         self.input_args_list =[]
         self.output_args_list =[]
 
+    def check_regs_present(self):
+        for item in self.attr.keys():
+            if 'reg' in self.attr[item].values():
+                return True
+        return False
+
     def check_attributes(self, name):
             if name in self.attr.keys():
                 result = self.attr[name]
             else:
-                result = {'signed': 0, 'width': 1}
+                result = {'signed': 0, 'width': 1, 'type' : 'wire'}
 
             return result
 
@@ -88,6 +94,11 @@ class FunctionVisitor(ast.NodeVisitor):
         values  = [self.visit(arg) for arg in node.args]
         ports = [val["port"] for val in values]
         inputs = [val["input"] for val in values]
+        if self.check_regs_present():
+            #If at least one reg is present, generate clk port
+            ports.append('clk')
+            inputs.append('input clk;')
+
         template_dict = {
             'ports': ports,
             'len_ports': len(ports),
@@ -137,17 +148,28 @@ class FunctionVisitor(ast.NodeVisitor):
     def visit_Assign(self, node):
         op = self.visit(node.value)
         target = ''
+        rslt_regs = ''
+        rslt_wires = ''
         for item in node.targets:
             target = self.visit(item)
-
-        template = self.get_template("assign.txt")
-        template_dict = {
-            'left': target,
-            'right': op,
-        }
-        rslt = template.render(template_dict)
-        rslt = indent_multiline_assign(rslt)
-        return rslt
+            attr = self.check_attributes(target)
+            if 'type' in attr.keys() and attr['type'] == 'reg':
+                template = self.get_template("regassign.txt")
+                template_dict = {
+                    'left': target,
+                    'right': op,
+                }
+                rslt_regs += template.render(template_dict) + "\n"
+            else:
+                template = self.get_template("assign.txt")
+                template_dict = {
+                    'left': target,
+                    'right': op,
+                }
+                rslt_wires += template.render(template_dict)+ "\n"
+        rslt_regs = indent_multiline_assign(rslt_regs)
+        rslt_wires = indent_multiline_assign(rslt_wires)
+        return self.indent(rslt_regs), self.indent(rslt_wires)
 
     def visit_Module(self, node):
         return self.visit(node.body[0])
@@ -161,15 +183,21 @@ class FunctionVisitor(ast.NodeVisitor):
         portlist = ''
         out_portlist_str = ''
         input_list = ''
-        assign_list = ''
+        assign_list_regs = ''
+        assign_list_wires = ''
         output_args = ''
+        output_always = ''
         for item in node.body:
             if isinstance(item, ast.Return):
                 items = self.visit(item)
                 self.output_args_list = items
                 for it in items:
-                    output_template = self.get_template('output.txt')
                     attr = self.check_attributes(it)
+                    if 'type' in attr.keys() and attr['type'] == 'reg':
+                        output_template = self.get_template('outputreg.txt')
+                    else:
+                        output_template = self.get_template('output.txt')
+
                     output_template_dict = {
                         'name': it,
                         'width': attr['width'],
@@ -186,7 +214,9 @@ class FunctionVisitor(ast.NodeVisitor):
                 out_portlist_str = template_pl.render(template_pl_dict)
             else :
                 if isinstance(item, ast.Assign):
-                    assign_list += (self.indent(self.visit(item)) + "\n")
+                    regs, wires = self.visit(item)
+                    assign_list_regs += regs
+                    assign_list_wires += wires
         if node.args is not None:
             values = self.visit(node.args)
             portlist = self.indent(values['port_list_str'])
@@ -202,8 +232,17 @@ class FunctionVisitor(ast.NodeVisitor):
 
         output_dw = template_dw.render(template_dw_dict)
 
+        #Generate always block if required
+        if self.check_regs_present():
+            template_always = self.get_template('always.txt')
+            template_always_dict = {
+                'sens_list': 'clk',
+                'statement': assign_list_regs
+            }
+            output_always = template_always.render(template_always_dict)
 
-        items = [input_list, output_list, assign_list, output_dw]
+
+        items = [input_list, output_list, output_always, assign_list_wires, output_dw]
 
         template_dict = {
             'modulename': node.name,
@@ -257,12 +296,15 @@ class Py2ver:
         #Check if we have values for all arguments
         key_val = []
         for i in range(len(self.input_args_list)):
-            if in_arg[i] is not None:
-                key_val.append((self.input_args_list[i],in_arg[i]))
-            else:
-                key_val.append((self.input_args_list[i],0))
+            #Check for reserved ports(clk,rst)
+            if self.input_args_list[i] is not 'clk':
+                if in_arg[i] is not None:
+                    key_val.append((self.input_args_list[i],in_arg[i]))
+                else:
+                    key_val.append((self.input_args_list[i],0))
         template = self.get_template("tb.txt")
         template_dict = {
+            'period' : 2000 if 'clk' in self.input_args_list else 0,
             'in_args': key_val,
             'out_args': self.output_args_list
         }

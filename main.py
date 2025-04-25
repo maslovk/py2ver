@@ -12,7 +12,7 @@ print (e)
 
 attr = {'arg1': {'signed': 0, 'width': 8},
         'arg2': {'signed': 0, 'width': 8},
-        'a': {'signed': 0, 'width': 9},
+        'a': {'signed': 0, 'width': 9, 'type' : 'reg'},
         'b': {'signed': 1, 'width': 9},
         'c': {'signed': 0, 'width': 9},
         'd': {'signed': 0, 'width': 9},}

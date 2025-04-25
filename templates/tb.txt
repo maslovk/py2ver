@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 from cocotb.runner import get_runner
 from cocotb.triggers import Timer
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge
 import pickle
 
 async def save_results(ret_val):
@@ -15,14 +17,18 @@ async def save_results(ret_val):
 
 # Start a testcase
 @cocotb.test()
-def tb_test(dut):
+async def tb_test(dut):
+{% if period > 0 %}
+    cocotb.start_soon(Clock(dut.clk, {{ period }}, units="ms").start())
+    await RisingEdge(dut.clk)
+{% endif %}
 {% for arg in in_args %}
     dut.{{ arg[0] }}.value = {{ arg[1] }}
 {% endfor %}
-    yield Timer(1)
+    await Timer(10)
     return_val = {
     {% for arg in out_args %}
     '{{ arg }}' : int(dut.{{ arg }}.value),
     {% endfor %}
     }
-    yield save_results(str(return_val))
+    await save_results(str(return_val))

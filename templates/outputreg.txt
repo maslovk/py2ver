@@ -1,0 +1,1 @@
+output {% if signed %}signed {% endif %} reg {% if width != '' %}[{{ width-1 }}:0] {% endif %}{{ name }}{% if dimensions != '' %} {{ dimensions }}{% endif %};
