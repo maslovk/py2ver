@@ -15,10 +15,18 @@ attr = {'arg1': {'signed': 0, 'width': 8},
         'a': {'signed': 0, 'width': 9, 'type' : 'reg'},
         'b': {'signed': 1, 'width': 9},
         'c': {'signed': 0, 'width': 9},
-        'd': {'signed': 0, 'width': 9},}
+        'd': {'signed': 0, 'width': 9},
+        }
 
-foo_tb = Py2ver(foo, attr).tb()
+foo_tb = Py2ver(foo, attr).TB()
+
+syn_attr ={'QUARTUS_DIR':'/opt/intelFPGA/22.1std/quartus/bin'
+
+}
+
+foo_hw = Py2ver(foo, attr).HW(syn_attr)
 
 g = foo_tb(4,4)
+foo_hw()
 print(g)
 

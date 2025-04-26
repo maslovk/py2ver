@@ -3,9 +3,10 @@ import ast
 from jinja2 import Environment, FileSystemLoader
 import os
 import functools
-import time
 import  tb_runner
 import pickle
+import subprocess
+import shutil
 
 DEFAULT_TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__)) + '/templates/'
 
@@ -284,6 +285,70 @@ class Py2ver:
         f.write(result)
         f.close()
 
+
+    def HW(self, syn_attr):
+        self.syn_attr = syn_attr
+        self.createHWproject()
+        return self.hw_run
+
+    def hw_run(self):
+        return 1
+
+    def createHWproject(self):
+
+        syn_tool_dir = self.syn_attr.get('QUARTUS_DIR')
+        if syn_tool_dir is None:
+            print("No syntesis tool specified")
+            return
+
+        #Delete previous results
+        if os.path.isdir(os.path.join(os.getcwd(), "hw")):
+            shutil.rmtree(os.path.join(os.getcwd(), "hw"))
+        # Project settings
+        project_name = self.t_name
+        project_dir = os.path.join(os.getcwd(), "hw", project_name)
+        top_level_entity = self.t_name
+
+        # Create project directory
+        os.makedirs(project_dir, exist_ok=True)
+
+        # Write .qpf file
+        with open(os.path.join(project_dir, f"{project_name}.qpf"), "w") as f:
+            f.write(f"PROJECT_REVISION = {project_name}\n")
+
+        # Write .qsf file
+        qsf_content = f"""set_global_assignment -name FAMILY "Cyclone IV E"
+        set_global_assignment -name DEVICE EP4CE10F17C8
+        set_global_assignment -name TOP_LEVEL_ENTITY {top_level_entity}
+        set_global_assignment -name VERILOG_FILE {top_level_entity}.v
+        """
+        with open(os.path.join(project_dir, f"{project_name}.qsf"), "w") as f:
+            f.write(qsf_content)
+
+        shutil.copy(os.path.join(os.getcwd(),"hdl","main.v"),os.path.join( project_dir,top_level_entity+".v"))
+
+        print(f"Quartus project '{project_name}' created at {project_dir}")
+
+        # === Compile using Quartus command-line ===
+        print("Starting compilation...")
+        result = subprocess.run([os.path.join(syn_tool_dir,"quartus_sh"), "--flow", "compile", project_name], cwd=project_dir, capture_output=True, text=True)
+        #print("Output:", result.stdout)
+
+        # === Program the FPGA (adjust device and cable as needed) ===
+        sof_file = os.path.join(project_dir, f"{project_name}.sof")
+        if os.path.exists(sof_file):
+            print("Programming FPGA...")
+            result = subprocess.run([
+                os.path.join(syn_tool_dir,"quartus_pgm"), "-m", "jtag", "-o", f"p;{sof_file}"
+            ], capture_output=True, text=True)
+            print("Output:", result.stdout)
+        else:
+            print("Error: .sof file not found. Compilation may have failed.")
+
+    def TB(self):
+        return self.tb_fun
+
+
     def get_template(self, filename):
         if filename in self.template_cache:
             return self.template_cache[filename]
@@ -297,7 +362,7 @@ class Py2ver:
         key_val = []
         for i in range(len(self.input_args_list)):
             #Check for reserved ports(clk,rst)
-            if self.input_args_list[i] is not 'clk':
+            if self.input_args_list[i] != 'clk':
                 if in_arg[i] is not None:
                     key_val.append((self.input_args_list[i],in_arg[i]))
                 else:
@@ -311,11 +376,6 @@ class Py2ver:
         tb_out = template.render(template_dict)
         with open("tb.py", "w+") as f:
             f.write(tb_out)
-
-
-
-    def tb(self):
-        return self.tb_fun
 
     def tosigned(self, n, nbits):
         n = n & 0xffffffff
