@@ -50,6 +50,10 @@ class FunctionVisitor(ast.NodeVisitor):
         self.top_name = ''
         self.input_args_list =[]
         self.output_args_list =[]
+        self.input_bit_count = 0
+        self.output_bit_count = 0
+        self.input_args_width_list = []
+        self.output_args_width_list = []
 
     def check_regs_present(self):
         for item in self.attr.keys():
@@ -77,6 +81,7 @@ class FunctionVisitor(ast.NodeVisitor):
         template = self.get_template('port.txt')
         input_template = self.get_template('input.txt')
         attr = self.check_attributes(node.arg)
+        self.input_bit_count += attr['width']
         input_template_dict = {
             'name': node.arg,
             'width': attr['width'],
@@ -88,12 +93,13 @@ class FunctionVisitor(ast.NodeVisitor):
         }
         rslt_port = template.render(template_dict)
         rslt_input = input_template.render(input_template_dict)
-        return {"port" : rslt_port,"input" : rslt_input}
+        return {"port" : rslt_port, "input" : rslt_input, "width" : attr['width']}
 
     def visit_arguments(self, node):
         template = self.get_template('portlist.txt')
         values  = [self.visit(arg) for arg in node.args]
         ports = [val["port"] for val in values]
+        widths = [val["width"] for val in values]
         inputs = [val["input"] for val in values]
         if self.check_regs_present():
             #If at least one reg is present, generate clk port
@@ -106,7 +112,7 @@ class FunctionVisitor(ast.NodeVisitor):
         }
         rslt_portlist = template.render(template_dict)
         rslt_inputlist = ''.join(inputs)
-        return {"port_list" : ports,"port_list_str" : rslt_portlist,"input_list" : rslt_inputlist}
+        return {"port_list" : ports,"port_list_str" : rslt_portlist,"input_list" : rslt_inputlist, "width_list" : widths}
 
     def visit_Return(self, node):
         out = self.visit(node.value)
@@ -194,6 +200,8 @@ class FunctionVisitor(ast.NodeVisitor):
                 self.output_args_list = items
                 for it in items:
                     attr = self.check_attributes(it)
+                    self.output_bit_count += attr['width']
+                    self.output_args_width_list.append(attr['width'])
                     if 'type' in attr.keys() and attr['type'] == 'reg':
                         output_template = self.get_template('outputreg.txt')
                     else:
@@ -222,6 +230,7 @@ class FunctionVisitor(ast.NodeVisitor):
             values = self.visit(node.args)
             portlist = self.indent(values['port_list_str'])
             self.input_args_list = values['port_list']
+            self.input_args_width_list = values['width_list']
             input_list = self.indent(values['input_list'])
 
 
@@ -255,8 +264,20 @@ class FunctionVisitor(ast.NodeVisitor):
         #self.generic_visit(node)
         return rslt
 
+    def get_in_args_bit_count(self):
+        return self.input_bit_count
+
+    def get_out_bit_count(self):
+        return self.output_bit_count
+
     def get_top_name(self):
         return self.top_name
+
+    def get_input_args_width_list(self):
+        return self.input_args_width_list
+
+    def get_output_args_width_list(self):
+        return self.output_args_width_list
 
     def get_input_args_list(self):
         return self.input_args_list
@@ -271,9 +292,13 @@ class Py2ver:
         tree = ast.parse(source_foo)
         f_visitor = FunctionVisitor(attr)
         result = f_visitor.visit(tree)
+        self.input_args_bits = f_visitor.get_in_args_bit_count()
+        self.output_bits = f_visitor.get_out_bit_count()
         self.t_name = f_visitor.get_top_name()
         self.input_args_list = f_visitor.get_input_args_list()
         self.output_args_list = f_visitor.get_output_args_list()
+        self.input_args_width_list = f_visitor.get_input_args_width_list()
+        self.output_args_width_list = f_visitor.get_output_args_width_list()
         self.env = Environment(loader=FileSystemLoader(DEFAULT_TEMPLATE_DIR))
         self.template_cache = {}
         self.attr = attr
@@ -317,13 +342,84 @@ class Py2ver:
             f.write(f"PROJECT_REVISION = {project_name}\n")
 
         # Write .qsf file
-        qsf_content = f"""set_global_assignment -name FAMILY "Cyclone IV E"
-        set_global_assignment -name DEVICE EP4CE10F17C8
-        set_global_assignment -name TOP_LEVEL_ENTITY {top_level_entity}
-        set_global_assignment -name VERILOG_FILE {top_level_entity}.v
-        """
+        template_qsf = self.get_template("hw/de0_nano_qsf.txt")
+        template_qsf_dict = {
+        }
+        rslt_qsf= template_qsf.render(template_qsf_dict)
         with open(os.path.join(project_dir, f"{project_name}.qsf"), "w") as f:
-            f.write(qsf_content)
+            f.write(rslt_qsf)
+
+        #UART transceiver
+        template_rxtx = self.get_template("hw/uart_transceiver.txt")
+        template_rxtx_dict = {
+            'in_clk_freq': 50000000,
+            'baud_rate'  : 115200
+        }
+        rslt_rxtx = template_rxtx.render(template_rxtx_dict)
+        with open(os.path.join(project_dir, f"uart_transceiver.sv"), "w") as f:
+            f.write(rslt_rxtx)
+
+        #SDC
+        template_sdc = self.get_template("hw/de0_nano_sdc.txt")
+        template_sdc_dict = {
+        }
+        rslt_sdc = template_sdc.render(template_sdc_dict)
+        with open(os.path.join(project_dir, f"DE0_Nano.SDC"), "w") as f:
+            f.write(rslt_sdc)
+
+        # Write top-level Verilog
+        reg_wire = f"""
+        wire [{self.output_bits - 1}:0] tx_data;
+        wire [{self.input_args_bits - 1}:0] rx_data;
+        wire tx_valid;
+        wire rx_valid;
+        wire tx_busy;
+        """
+
+        #Input args
+        structural_ports = ""
+        reg_off = 0
+        for item in range(len(self.input_args_width_list)):
+            structural_ports += '.'+ self.input_args_list[item]+"(rx_data["+str(
+                self.input_args_width_list[item] + reg_off -1)+":"+str(reg_off)+"]),"
+            reg_off += self.input_args_width_list[item]
+
+        #Clock
+        if 'clk' in self.input_args_list:
+            structural_ports += ".clk(CLOCK_50),"
+
+        #Output args
+        reg_off = 0
+        for item in range(len(self.output_args_width_list)):
+            structural_ports += '.' + self.output_args_list[item] + "(tx_data[" + str(
+                self.output_args_width_list[item] + reg_off - 1) + ":" + str(reg_off) + "]),"
+            reg_off += self.output_args_width_list[item]
+
+        structural = f"""
+        uart_transceiver #( .REG_WIDTH_RX({self.input_args_bits}), .REG_WIDTH_TX({self.output_bits}) ) uart_transceiver_inst  (CLOCK_50, KEY[0], tx_data, KEY[1], GPIO_0_TX, GPIO_0_RX,rx_data,rx_valid,tx_busy);
+        
+        {project_name} {project_name}_inst({structural_ports});
+        """
+
+        # (
+        #   arg1,
+        #   arg2,
+        #   clk,
+        # a,
+        # b,
+        # c,
+        # d,
+        # );
+
+        #Board specific top file(DE0-Nano)
+        template_board = self.get_template("hw/de0_nano_top.txt")
+        template_board_dict = {
+            "reg_wire": reg_wire,
+            "structural" : structural
+        }
+        rslt_board = template_board.render(template_board_dict)
+        with open(os.path.join(project_dir, f"DE0_Nano.v"), "w") as f:
+            f.write(rslt_board)
 
         shutil.copy(os.path.join(os.getcwd(),"hdl","main.v"),os.path.join( project_dir,top_level_entity+".v"))
 
@@ -332,18 +428,18 @@ class Py2ver:
         # === Compile using Quartus command-line ===
         print("Starting compilation...")
         result = subprocess.run([os.path.join(syn_tool_dir,"quartus_sh"), "--flow", "compile", project_name], cwd=project_dir, capture_output=True, text=True)
-        #print("Output:", result.stdout)
-
-        # === Program the FPGA (adjust device and cable as needed) ===
-        sof_file = os.path.join(project_dir, f"{project_name}.sof")
-        if os.path.exists(sof_file):
-            print("Programming FPGA...")
-            result = subprocess.run([
-                os.path.join(syn_tool_dir,"quartus_pgm"), "-m", "jtag", "-o", f"p;{sof_file}"
-            ], capture_output=True, text=True)
-            print("Output:", result.stdout)
-        else:
-            print("Error: .sof file not found. Compilation may have failed.")
+        print("Output:", result.stdout)
+        #
+        # # === Program the FPGA (adjust device and cable as needed) ===
+        # sof_file = os.path.join(project_dir, f"{project_name}.sof")
+        # if os.path.exists(sof_file):
+        #     print("Programming FPGA...")
+        #     result = subprocess.run([
+        #         os.path.join(syn_tool_dir,"quartus_pgm"), "-m", "jtag", "-o", f"p;{sof_file}"
+        #     ], capture_output=True, text=True)
+        #     print("Output:", result.stdout)
+        # else:
+        #     print("Error: .sof file not found. Compilation may have failed.")
 
     def TB(self):
         return self.tb_fun

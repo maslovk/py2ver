@@ -1,0 +1,209 @@
+module baud_tick_gen (
+    input  wire clk,
+    input  wire rst_n,
+    output reg  tick
+);
+    parameter CLK_FREQ  = 50000000;
+    parameter BAUD_RATE = 115200;
+
+    localparam TICKS_PER_BIT = CLK_FREQ / BAUD_RATE;
+    localparam CTR_WIDTH = $clog2(TICKS_PER_BIT);
+
+    reg [CTR_WIDTH-1:0] counter;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            counter <= 0;
+            tick    <= 0;
+        end else if (counter == TICKS_PER_BIT - 1) begin
+            counter <= 0;
+            tick    <= 1;
+        end else begin
+            counter <= counter + 1;
+            tick    <= 0;
+        end
+    end
+endmodule
+
+module uart_tx (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       tick,
+    input  wire [REG_WIDTH_TX-1:0] data_in,
+    input  wire       data_valid,
+    output reg        tx,
+    output reg        busy
+);
+    parameter REG_WIDTH_TX  = 8;
+    localparam CTR_WIDTH = $clog2(REG_WIDTH_TX);
+
+
+    // FSM States
+    typedef enum logic [1:0] {
+        IDLE, START, DATA, STOP
+    } state_t;
+
+    state_t state, next_state;
+    reg [CTR_WIDTH-1:0] bit_cnt;
+    reg [REG_WIDTH_TX-1:0] shift_reg;
+
+    // FSM Transition
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) state <= IDLE;
+        else if (tick)   state <= next_state;
+    end
+
+    always @(*) begin
+        case (state)
+            IDLE:  next_state = data_valid ? START : IDLE;
+            START: next_state = DATA;
+            DATA:  next_state = (bit_cnt == (REG_WIDTH_TX-1)) ? STOP : DATA;
+            STOP:  next_state = IDLE;
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // Output Logic
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx <= 1'b1;
+            busy <= 0;
+            bit_cnt <= 0;
+            shift_reg <= 0;
+        end else if (tick) begin
+            case (state)
+                IDLE: begin
+                    busy <= data_valid;
+                end
+                START: begin
+                    tx <= 0;
+                    shift_reg <= data_in;
+                    bit_cnt <= 0;
+                end
+                DATA: begin
+                    tx <= shift_reg[0];
+                    shift_reg <= shift_reg >> 1;
+                    bit_cnt <= bit_cnt + 1;
+                end
+                STOP: begin
+                    tx <= 1;
+                    busy <= 0;
+                end
+            endcase
+        end
+    end
+endmodule
+
+module uart_rx (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       tick,
+    input  wire       rx,
+    output reg [REG_WIDTH_RX-1:0]  data_out,
+    output reg        data_valid
+);
+    parameter REG_WIDTH_RX  = 8;
+    localparam CTR_WIDTH = $clog2(REG_WIDTH_RX);
+
+    // FSM States
+    typedef enum logic [1:0] {
+        IDLE, START, DATA, STOP
+    } state_t;
+
+    state_t state, next_state;
+    reg [CTR_WIDTH-1:0] bit_cnt;
+    reg [REG_WIDTH_RX-1:0] shift_reg;
+    reg       rx_sync;
+
+    // FSM Transition
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) state <= IDLE;
+        else if (tick)   state <= next_state;
+    end
+
+    always @(*) begin
+        case (state)
+            IDLE:  next_state = (rx == 0) ? START : IDLE;
+            START: next_state = DATA;
+            DATA:  next_state = (bit_cnt == (REG_WIDTH_RX-1)) ? STOP : DATA;
+            STOP:  next_state = IDLE;
+            default: next_state = IDLE;
+        endcase
+    end
+
+    // Output Logic
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            data_out   <= 0;
+            data_valid <= 0;
+            shift_reg  <= 0;
+            bit_cnt    <= 0;
+        end else if (tick) begin
+            case (state)
+                START: begin
+                    bit_cnt <= 0;
+                end
+                DATA: begin
+                    shift_reg <= {rx, shift_reg[(REG_WIDTH_RX-1):1]};
+                    bit_cnt <= bit_cnt + 1;
+                end
+                STOP: begin
+                    data_out <= shift_reg;
+                    data_valid <= 1;
+                end
+                default: data_valid <= 0;
+            endcase
+        end
+    end
+endmodule
+
+module uart_transceiver (
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire [REG_WIDTH_TX-1:0] tx_data,
+    input  wire       tx_valid,
+    output wire       tx,
+    input  wire       rx,
+    output wire [REG_WIDTH_RX-1:0] rx_data,
+    output wire       rx_valid,
+    output wire       tx_busy
+);
+    parameter CLK_FREQ  = 50000000;
+    parameter BAUD_RATE = 115200;
+    parameter REG_WIDTH_TX  = 8;
+    parameter REG_WIDTH_RX  = 8;
+
+    wire baud_tick;
+
+    baud_tick_gen #(
+        .CLK_FREQ(CLK_FREQ),
+        .BAUD_RATE(BAUD_RATE)
+    ) baud_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .tick(baud_tick)
+    );
+
+    uart_tx #(
+        .REG_WIDTH_TX(REG_WIDTH_TX)
+    ) tx_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .tick(baud_tick),
+        .data_in(tx_data),
+        .data_valid(tx_valid),
+        .tx(tx),
+        .busy(tx_busy)
+    );
+
+    uart_rx #(
+       .REG_WIDTH_RX(REG_WIDTH_RX)
+    ) rx_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .tick(baud_tick),
+        .rx(rx),
+        .data_out(rx_data),
+        .data_valid(rx_valid)
+    );
+endmodule
