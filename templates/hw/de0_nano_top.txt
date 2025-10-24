@@ -132,13 +132,70 @@ input 		     [1:0]		GPIO_1_IN;
 //  REG/WIRE declarations
 //=======================================================
 
-{{reg_wire}}
+wire input_valid;
+wire ready;
+{%- for input in inputs %}
+    wire [{{input.width - 1}}:0] {{ input.name }}_int;
+{%- endfor %}
 
+{%- for output in outputs %}
+    wire [{{output.width - 1}}:0] {{ output.name }}_int;
+    wire [{{output.width - 1}}:0] {{ output.name }}_out_int;
+{%- endfor %}
+
+wire [{{inputs_size - 1}}:0] rx_data_int;
+wire [{{outputs_size - 1}}:0]tx_data_int;
 
 //=======================================================
 //  Structural coding
 //=======================================================
 
-{{structural}}
+delayed_registers delayed_registers_inst (
+    .clk(CLOCK_50),
+    .rst_n(KEY[0]),
+    .input_valid(input_valid),
+{%- for output in outputs %}
+    .{{ output.name }}({{ output.name }}_int),
+    .{{ output.name }}_out({{ output.name }}_out_int),
+{%- endfor %}
+    .ready(ready)
+);
+
+    assign tx_data_int = {
+        {%- for output in outputs %}
+        {{ output.name }}_out_int,
+        {%- endfor %}
+    };
+
+    assign rx_data_int = {
+        {%- for input in inputs %}
+        {{ input.name }}_int,
+        {%- endfor %}
+    };
+
+uart_transceiver uart_transceiver_inst  (
+    .clk(CLOCK_50),
+    .rst_n(KEY[0]),
+    .tx_data(tx_data_int),
+    .tx_valid(ready),
+    .tx(GPIO_0_TX),
+    .rx(GPIO_0_RX),
+    .rx_data(rx_data_int),
+    .rx_valid(input_valid),
+    .tx_busy()
+    );
+
+
+{{ top_name }} {{ top_name }}_inst (
+    .clk(CLOCK_50),
+{%- for input in inputs %}
+    .{{ input.name }}({{ input.name }}_int),
+{%- endfor %}
+
+{%- for output in outputs %}
+    .{{ output.name }}({{ output.name }}_int),
+{%- endfor %}
+);
+
 
 endmodule

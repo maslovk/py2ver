@@ -1,0 +1,88 @@
+module delayed_registers (
+    input  logic clk,
+    input  logic rst_n, // Active-low reset
+    input  logic input_valid,
+{%- for output in outputs %}
+    input  logic [{{ output.width - 1 }}:0] {{ output.name }},
+    output logic [{{ output.width - 1 }}:0] {{ output.name }}_out,
+{%- endfor %}
+    output logic ready
+);
+
+    // Internal signals
+{%- for output in outputs %}
+{%- if output.delay > 0 %}
+    logic [{{ output.width - 1 }}:0] {{ output.name }}_regs [{{ output.delay }}-1:0];
+    logic [{{ output.width - 1 }}:0] {{ output.name }}_out_reg;
+    logic [$clog2({{ output.delay + 1 }}):0] {{ output.name }}_counter;
+    assign {{ output.name }}_out = {{ output.name }}_out_reg;
+{%- else %}
+    logic [{{ output.width - 1 }}:0] {{ output.name }}_out_reg;
+    assign {{ output.name }}_out = {{ output.name }}_out_reg;
+{%- endif %}
+{%- endfor %}
+    logic ready_internal;
+
+    // Delay and output register logic
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+{%- for output in outputs %}
+{%- if output.delay > 0 %}
+            {{ output.name }}_counter <= 0;
+            {{ output.name }}_out_reg <= '0;
+            for (int i = 0; i < {{ output.delay }}; i++) begin
+                {{ output.name }}_regs[i] <= '0;
+            end
+{%- else %}
+            {{ output.name }}_out_reg <= '0;
+{%- endif %}
+{%- endfor %}
+            ready_internal <= 0;
+        end else begin
+            ready_internal <= 0;
+
+{%- for output in outputs %}
+{%- if output.delay > 0 %}
+            // Shift delay pipeline
+            for (int i = {{ output.delay }} - 1; i > 0; i--) begin
+                {{ output.name }}_regs[i] <= {{ output.name }}_regs[i-1];
+            end
+
+            if (input_valid) begin
+                {{ output.name }}_regs[0] <= {{ output.name }};
+                {{ output.name }}_counter <= 0;
+            end else begin
+                if ({{ output.name }}_counter < {{ output.delay }}) begin
+                    {{ output.name }}_counter <= {{ output.name }}_counter + 1;
+                end
+            end
+
+            // Latch output only once delay is done
+            if ({{ output.name }}_counter == {{ output.delay }}) begin
+                {{ output.name }}_out_reg <= {{ output.name }}_regs[{{ output.delay - 1 }}];
+            end
+{%- else %}
+            if (input_valid) begin
+                {{ output.name }}_out_reg <= {{ output.name }};
+            end
+{%- endif %}
+{%- endfor %}
+
+            // Check if all delays are done to pulse ready
+            if (
+{%- for output in outputs %}
+{%- if output.delay > 0 %}
+                {{ output.name }}_counter == {{ output.delay }}{{ " &&" if not loop.last }}
+{%- else %}
+                input_valid{{ " &&" if not loop.last }}
+{%- endif %}
+{%- endfor %}
+            ) begin
+                ready_internal <= 1;
+            end
+        end
+    end
+
+    assign ready = ready_internal;
+
+endmodule
