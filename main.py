@@ -1,4 +1,8 @@
 from py2ver import Py2ver
+import logging
+
+logging.basicConfig(level=logging.DEBUG,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 def foo(arg1, arg2):
     a = arg1 + arg2
