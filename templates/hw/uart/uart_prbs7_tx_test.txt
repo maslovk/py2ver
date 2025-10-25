@@ -1,16 +1,18 @@
 // uart_prbs7_tx_test.sv
-// Sends a PRBS7 byte stream every PERIOD_MS (default 500 ms) when enable=1.
-// Built from split UART blocks: uart_baud_gen + uart_tx_8n1.
+// PRBS7 burst transmitter with safe busy-edge handshake.
+// Bit7 is hard-forced to 0 for every transmitted byte (bytes <= 0x7F).
+// Optional preamble: 0x55, 0xAA, <seed> to simplify PC-side lock.
 
 module uart_prbs7_tx_test #(
-    parameter int CLK_HZ     = 50_000_000,
-    parameter int BAUD       = 115_200,
-    parameter int PERIOD_MS  = 500,      // period between bursts
-    parameter int BURST_BYTES= 256       // how many PRBS bytes per burst
+    parameter int CLK_HZ       = 50_000_000,
+    parameter int BAUD         = 115_200,
+    parameter int PERIOD_MS    = 500,      // period between bursts
+    parameter int BURST_BYTES  = 256,      // PRBS payload bytes per burst (not counting preamble)
+    parameter bit PREAMBLE     = 1'b0      // 1 -> send 55 AA <seed> before payload
 )(
     input  logic clk,
     input  logic rst_n,
-    input  logic enable,     // drive with sw[1]
+    input  logic enable,     // drive with SW[1]
     output logic tx,         // UART TX output (to board-level mux)
     output logic active      // 1 while a burst is being transmitted
 );
@@ -43,11 +45,17 @@ module uart_prbs7_tx_test #(
         .tx_busy  (tx_busy_b)
     );
 
-    // --------------------- PRBS7 -----------------------
-    // Polynomial x^7 + x^6 + 1 (taps at bits 6 and 5), 7-bit LFSR
-    logic [6:0] lfsr;     // must never be 0
+    // --------------------- PRBS7 core ------------------
+    // Polynomial x^7 + x^6 + 1 (taps at bits 6 and 5), 7-bit LFSR (must never be 0)
+    logic [6:0] lfsr;
+
     function automatic [6:0] prbs7_next(input [6:0] s);
         prbs7_next = {s[5:0], s[6] ^ s[5]};
+    endfunction
+
+    // Always force MSB=0 on the wire (bytes <= 0x7F)
+    function automatic [7:0] prbs7_byte(input [6:0] s);
+        prbs7_byte = {1'b0, s};
     endfunction
 
     // --------------------- Period timer ----------------
@@ -59,26 +67,43 @@ module uart_prbs7_tx_test #(
     typedef enum logic [1:0] {IDLE, WAIT_GAP, BURST} state_e;
     state_e state;
 
+    // Remaining payload bytes in current burst
     logic [$clog2(BURST_BYTES+1)-1:0] bytes_left;
 
+    // Optional preamble sequencer
+    // 0:55, 1:AA, 2:seed, >=3: payload (only when PREAMBLE=1)
+    logic [1:0] hdr_idx;
+
+    // Handshake helpers
+    logic tx_busy_q;        // previous tx_busy_b
+    logic launch_pending;   // we pulsed tx_start; waiting for busy to rise
+
+    // ===============================================================
+    // FSM
+    // ===============================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state       <= IDLE;
-            active      <= 1'b0;
-            tmr         <= '0;
-            tmr_expired <= 1'b0;
-            bytes_left  <= '0;
-            lfsr        <= 7'h7F;  // non-zero seed
-            tx_start_b  <= 1'b0;
-            tx_byte_b   <= 8'h00;
+            state          <= IDLE;
+            active         <= 1'b0;
+            tmr            <= '0;
+            tmr_expired    <= 1'b0;
+            bytes_left     <= '0;
+            hdr_idx        <= '0;
+            lfsr           <= 7'h7F;      // non-zero seed
+            tx_start_b     <= 1'b0;
+            tx_byte_b      <= 8'h00;
+            tx_busy_q      <= 1'b0;
+            launch_pending <= 1'b0;
         end else begin
+            // defaults each cycle
             tx_start_b  <= 1'b0;
             tmr_expired <= 1'b0;
+            tx_busy_q   <= tx_busy_b;
 
             // gap timer
             if (state == WAIT_GAP) begin
                 if (tmr == PERIOD_TICKS - 1) begin
-                    tmr <= '0;
+                    tmr         <= '0;
                     tmr_expired <= 1'b1;
                 end else begin
                     tmr <= tmr + 1'b1;
@@ -89,43 +114,87 @@ module uart_prbs7_tx_test #(
 
             unique case (state)
                 IDLE: begin
-                    active <= 1'b0;
+                    active         <= 1'b0;
+                    launch_pending <= 1'b0;
+                    hdr_idx        <= '0;
                     if (enable) begin
-                        // start immediately, then go into periodic WAIT_GAP
                         bytes_left <= BURST_BYTES[$clog2(BURST_BYTES+1)-1:0];
                         state      <= BURST;
                         active     <= 1'b1;
+                        // For deterministic bursts, reseed here:
+                        // lfsr <= 7'h7F;
                     end
                 end
 
                 WAIT_GAP: begin
-                    active <= 1'b0;
+                    active         <= 1'b0;
+                    launch_pending <= 1'b0;
+                    hdr_idx        <= '0;
                     if (!enable) begin
                         state <= IDLE;
                     end else if (tmr_expired) begin
                         bytes_left <= BURST_BYTES[$clog2(BURST_BYTES+1)-1:0];
                         state      <= BURST;
                         active     <= 1'b1;
+                        // For deterministic bursts, reseed here:
+                        // lfsr <= 7'h7F;
                     end
                 end
 
                 BURST: begin
                     active <= 1'b1;
+
                     if (!enable) begin
-                        state <= IDLE;
-                    end else if (!tx_busy_b) begin
-                        // load next PRBS byte when TX is free
-                        tx_byte_b  <= {1'b0, lfsr}; // 7-bit PRBS in bits[6:0]
-                        tx_start_b <= 1'b1;
-                        lfsr       <= prbs7_next(lfsr);
-                        if (bytes_left == 0) begin
-                            // just in case: should not happen
-                            state <= WAIT_GAP;
-                        end else if (bytes_left == 1) begin
-                            bytes_left <= '0;
-                            state      <= WAIT_GAP;
+                        state          <= IDLE;
+                        launch_pending <= 1'b0;
+                        hdr_idx        <= '0;
+                    end else begin
+                        // 1) Prepare the next byte to launch (preamble or payload)
+                        logic [7:0] next_byte;
+                        if (PREAMBLE && hdr_idx < 3) begin
+                            case (hdr_idx)
+                                2'd0: next_byte = 8'h55;
+                                2'd1: next_byte = 8'hAA;
+                                2'd2: next_byte = prbs7_byte(lfsr);  // publish seed (bit7=0)
+                                default: next_byte = prbs7_byte(lfsr);
+                            endcase
                         end else begin
-                            bytes_left <= bytes_left - 1'b1;
+                            next_byte = prbs7_byte(lfsr);            // payload (bit7=0)
+                        end
+
+                        // 2) Launch exactly once per idle window
+                        if (!launch_pending && !tx_busy_b) begin
+                            tx_byte_b      <= next_byte;
+                            tx_start_b     <= 1'b1;     // 1-cycle pulse
+                            launch_pending <= 1'b1;     // wait for acceptance
+                        end
+
+                        // 3) On busy rising edge, advance state machine once
+                        if (launch_pending && !tx_busy_q && tx_busy_b) begin
+                            launch_pending <= 1'b0;
+
+                            if (PREAMBLE && hdr_idx < 3) begin
+                                // advance through 55, AA, seed
+                                if (hdr_idx == 2) begin
+                                    // just sent the seed: advance LFSR so payload starts from next state
+                                    lfsr    <= prbs7_next(lfsr);
+                                    hdr_idx <= 2'd3; // switch to payload
+                                end else begin
+                                    hdr_idx <= hdr_idx + 2'd1;
+                                end
+                                // no payload counter consumed on preamble
+                            end else begin
+                                // payload: advance LFSR and decrement counter
+                                lfsr <= prbs7_next(lfsr);
+
+                                if (bytes_left <= 1) begin
+                                    bytes_left <= '0;
+                                    state      <= WAIT_GAP;
+                                    hdr_idx    <= '0;
+                                end else begin
+                                    bytes_left <= bytes_left - 1'b1;
+                                end
+                            end
                         end
                     end
                 end

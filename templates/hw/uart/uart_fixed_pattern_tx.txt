@@ -1,6 +1,6 @@
 // uart_fixed_pattern_tx.sv
 // Sends a repeating known 8-bit test pattern at ~PERIOD_MS interval when enable=1.
-// Useful for wiring & baud validation (no PRBS decode required).
+// Uses a safe busy-edge handshake so each byte is launched exactly once.
 
 module uart_fixed_pattern_tx #(
     parameter int CLK_HZ     = 50_000_000,
@@ -22,9 +22,9 @@ module uart_fixed_pattern_tx #(
         .BAUD  (BAUD),
         .OSR   (16)
     ) u_baud (
-        .clk(clk),
-        .rst_n(rst_n),
-        .os_tick(os_tick),
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .os_tick  (os_tick),
         .baud_tick(baud_tick)
     );
 
@@ -34,17 +34,16 @@ module uart_fixed_pattern_tx #(
     logic [7:0] tx_byte_b;
 
     uart_tx_8n1 u_tx (
-        .clk(clk),
-        .rst_n(rst_n),
+        .clk      (clk),
+        .rst_n    (rst_n),
         .baud_tick(baud_tick),
-        .tx_byte(tx_byte_b),
-        .tx_start(tx_start_b),
-        .tx(tx),
-        .tx_busy(tx_busy_b)
+        .tx_byte  (tx_byte_b),
+        .tx_start (tx_start_b),
+        .tx       (tx),
+        .tx_busy  (tx_busy_b)
     );
 
     // --------------------- Pattern ROM -----------------
-    // (modify to your heart's content)
     localparam logic [7:0] PATTERN [0:NUM_BYTES-1] = '{
         8'h55, 8'hAA, 8'h33, 8'hCC, 8'hF0, 8'h0F, 8'h69, 8'h96,
         8'h00, 8'hFF, 8'h77, 8'h88, 8'h3C, 8'hC3, 8'h5A, 8'hA5,
@@ -62,62 +61,91 @@ module uart_fixed_pattern_tx #(
     typedef enum logic [1:0] {IDLE, WAIT_GAP, BURST} state_e;
     state_e state;
 
+    // --------------------- Handshake helpers -----------------------
+    logic tx_busy_q;        // previous value of tx_busy_b
+    logic launch_pending;   // we've asserted tx_start; waiting for busy to rise
+
+    // ===============================================================
+    // FSM
+    // ===============================================================
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state       <= IDLE;
-            active      <= 1'b0;
-            tx_start_b  <= 1'b0;
-            idx         <= '0;
-            tmr         <= '0;
-            tmr_expired <= 1'b0;
+            state          <= IDLE;
+            active         <= 1'b0;
+            tx_start_b     <= 1'b0;
+            idx            <= '0;
+            tmr            <= '0;
+            tmr_expired    <= 1'b0;
+            tx_busy_q      <= 1'b0;
+            launch_pending <= 1'b0;
         end else begin
+            // defaults
             tx_start_b  <= 1'b0;
             tmr_expired <= 1'b0;
+            tx_busy_q   <= tx_busy_b;
 
             // gap timer
             if (state == WAIT_GAP) begin
                 if (tmr == PERIOD_TICKS - 1) begin
-                    tmr <= '0;
+                    tmr         <= '0;
                     tmr_expired <= 1'b1;
-                end else tmr <= tmr + 1'b1;
-            end else tmr <= '0;
+                end else begin
+                    tmr <= tmr + 1'b1;
+                end
+            end else begin
+                tmr <= '0;
+            end
 
             case (state)
                 IDLE: begin
-                    active <= 1'b0;
+                    active         <= 1'b0;
+                    launch_pending <= 1'b0;
                     if (enable) begin
-                        idx   <= '0;
-                        state <= BURST;
+                        idx    <= '0;
+                        state  <= BURST;
                         active <= 1'b1;
                     end
                 end
 
                 WAIT_GAP: begin
-                    active <= 1'b0;
+                    active         <= 1'b0;
+                    launch_pending <= 1'b0;
                     if (!enable) begin
                         state <= IDLE;
                     end else if (tmr_expired) begin
-                        idx   <= '0;
-                        state <= BURST;
+                        idx    <= '0;
+                        state  <= BURST;
                         active <= 1'b1;
                     end
                 end
 
                 BURST: begin
                     active <= 1'b1;
-                    if (!enable)
-                        state <= IDLE;
-                    else if (!tx_busy_b) begin
-                        tx_byte_b  <= PATTERN[idx];
-                        tx_start_b <= 1'b1;
 
-                        if (idx == NUM_BYTES - 1) begin
-                            state <= WAIT_GAP;
-                        end else begin
-                            idx <= idx + 1'b1;
+                    if (!enable) begin
+                        state          <= IDLE;
+                        launch_pending <= 1'b0;
+                    end else begin
+                        // 1) Launch exactly one byte while TX is idle
+                        if (!launch_pending && !tx_busy_b) begin
+                            tx_byte_b      <= PATTERN[idx];
+                            tx_start_b     <= 1'b1;   // 1-cycle pulse
+                            launch_pending <= 1'b1;   // wait for acceptance
+                        end
+
+                        // 2) When TX acknowledges (busy rises), advance index once
+                        if (launch_pending && !tx_busy_q && tx_busy_b) begin
+                            launch_pending <= 1'b0;
+                            if (idx == NUM_BYTES - 1) begin
+                                state <= WAIT_GAP;
+                            end else begin
+                                idx <= idx + 1'b1;
+                            end
                         end
                     end
                 end
+
+                default: state <= IDLE;
             endcase
         end
     end
