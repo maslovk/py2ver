@@ -1,7 +1,13 @@
 # py2ver.py
 """
 py2ver: Python → AST → IR → Verilog generator + TB and Quartus project scaffolding.
-Readability & clarity improvements only — no behavior changes, live Quartus output.
+
+This version emits the UART split modules and appends QSF assignments:
+  - uart/uart_baud_gen.sv
+  - uart/uart_rx_8n1.sv
+  - uart/uart_tx_8n1.sv
+  - uart/uart_fifo4x8.sv
+  - uart_transceiver.sv
 """
 
 from __future__ import annotations
@@ -41,10 +47,8 @@ class Py2ver:
 
     def __init__(self, func: Callable, attr: Dict[str, Any],
                  template_dir: Path = DEFAULT_TEMPLATE_DIR) -> None:
-        """Build IR from a Python function and emit HDL to hdl/main.v."""
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
 
-        # ---- Extract source and parse AST ----
         try:
             source_foo = inspect.getsource(func)
         except Exception as e:
@@ -54,7 +58,6 @@ class Py2ver:
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 
-        # Store module name + IO
         self.t_name = ir.name
         self.input_args_list = [p.name for p in ir.inputs if p.kind != "clk"]
         self.output_args_list = [p.name for p in ir.outputs]
@@ -65,15 +68,15 @@ class Py2ver:
         self.output_bits = sum(self.output_args_width_list)
         self.attr = attr
 
-        log.info("IR built: module=%s, inputs=%s (%d bits), outputs=%s (%d bits)",
-                 self.t_name, self.input_args_list, self.input_args_bits,
-                 self.output_args_list, self.output_bits)
+        log.info(
+            "IR built: module=%s, inputs=%s (%d bits), outputs=%s (%d bits)",
+            self.t_name, self.input_args_list, self.input_args_bits,
+            self.output_args_list, self.output_bits
+        )
 
-        # ---- Verilog render ----
         renderer = Renderer(template_dir)
         verilog_text = renderer.render_module(ir)
 
-        # ---- Write HDL ----
         self.outdir = Path(os.getcwd())
         self.hdl_dir = self.outdir / "hdl"
         self.hdl_dir.mkdir(exist_ok=True)
@@ -82,16 +85,14 @@ class Py2ver:
         hdl_path.write_text(verilog_text, encoding="utf-8")
         log.info("Generated HDL written to %s", hdl_path)
 
-        # ---- Jinja environment ----
         self.env = Environment(
             loader=FileSystemLoader(str(template_dir)),
             undefined=StrictUndefined,
             autoescape=False,
         )
-        self._tpl_cache = {}
+        self._tpl_cache: Dict[str, Any] = {}
         self.template_dir = template_dir
 
-        # Synthesis metadata to templates
         self.syn_data = {
             "top_name": self.t_name,
             "inputs": [
@@ -106,17 +107,36 @@ class Py2ver:
             "outputs_size": self.output_bits,
         }
 
-    # ----------------------------------------------------------------
+    @property
+    def _hw_root(self) -> Path:
+        return self.outdir / "hw"
+
+    @property
+    def _project_dir(self) -> Path:
+        return self._hw_root / self.t_name
+
+    def get_template(self, filename: str):
+        if filename not in self._tpl_cache:
+            self._tpl_cache[filename] = self.env.get_template(filename)
+        return self._tpl_cache[filename]
+
+    @staticmethod
+    def tosigned(n: int, nbits: int) -> int:
+        mask = (1 << nbits) - 1
+        n &= mask
+        sign_bit = 1 << (nbits - 1)
+        return (n ^ sign_bit) - sign_bit
+
+    # ------------------------------------------------------------------------
     # Hardware flow
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------------
+
     def HW(self, syn_attr: Dict[str, Any]) -> Callable[..., int]:
-        """Initialize Quartus project. Return hw_run."""
         self.syn_attr = syn_attr
         self.createHWproject()
         return self.hw_run
 
     def hw_run(self) -> int:
-        """Placeholder for compatibility."""
         return 1
 
     def createHWproject(self) -> None:
@@ -130,60 +150,62 @@ class Py2ver:
             log.error("quartus_sh not found: %s", quartus_sh)
             return
 
-        # hw directory
-        hw_root = self.outdir / "hw"
-        if hw_root.is_dir():
-            shutil.rmtree(hw_root)
-        project_dir = hw_root / self.t_name
+        if self._hw_root.is_dir():
+            shutil.rmtree(self._hw_root)
+        project_dir = self._project_dir
         project_dir.mkdir(parents=True, exist_ok=True)
 
         project_name = self.t_name
 
-        # QPF
         (project_dir / f"{project_name}.qpf").write_text(
             f"PROJECT_REVISION = {project_name}\n", encoding="utf-8"
         )
 
-        # QSF
-        template = self.get_template("hw/de0_nano_qsf.txt")
-        (project_dir / f"{project_name}.qsf").write_text(
-            template.render({}), encoding="utf-8"
-        )
+        qsf_path = project_dir / f"{project_name}.qsf"
+        self.get_template("hw/de0_nano_qsf.txt") \
+            .stream({}).dump(str(qsf_path))
 
-        # UART transceiver
-        template = self.get_template("hw/uart_transceiver.txt")
-        (project_dir / "uart_transceiver.sv").write_text(template.render({
+        # Emit UART split modules
+        uart_dir = project_dir / "uart"
+        uart_dir.mkdir(exist_ok=True)
+
+        self.get_template("hw/uart/uart_baud_gen.txt") \
+            .stream({}).dump(str(uart_dir / "uart_baud_gen.sv"))
+        self.get_template("hw/uart/uart_rx_8n1.txt") \
+            .stream({}).dump(str(uart_dir / "uart_rx_8n1.sv"))
+        self.get_template("hw/uart/uart_tx_8n1.txt") \
+            .stream({}).dump(str(uart_dir / "uart_tx_8n1.sv"))
+        self.get_template("hw/uart/uart_fifo4x8.txt") \
+            .stream({}).dump(str(uart_dir / "uart_fifo4x8.sv"))
+        self.get_template("hw/uart/uart_transceiver_top.txt").stream({
             "in_clk_freq": DEFAULT_CLK_FREQ,
-            "baud_rate": DEFAULT_BAUD_RATE,
+            "baud_rate":   DEFAULT_BAUD_RATE,
             "reg_width_tx": self.output_bits,
             "reg_width_rx": self.input_args_bits
-        }), encoding="utf-8")
+        }).dump(str(project_dir / "uart_transceiver.sv"))
 
-        # SDC
-        template = self.get_template("hw/de0_nano_sdc.txt")
-        (project_dir / "DE0_Nano.SDC").write_text(
-            template.render({}), encoding="utf-8"
-        )
+        # ✅ Append UART leafs to QSF
+        with qsf_path.open("a", encoding="utf-8") as qsf:
+            qsf.write("\n# UART split modules\n")
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_baud_gen.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_rx_8n1.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_tx_8n1.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fifo4x8.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart_transceiver.sv\n')
 
-        # Delay regs
-        template = self.get_template("hw/delayed_registers.txt")
-        (project_dir / "delayed_registers.sv").write_text(
-            template.render(self.syn_data), encoding="utf-8"
-        )
+        self.get_template("hw/de0_nano_sdc.txt") \
+            .stream({}).dump(str(project_dir / "DE0_Nano.SDC"))
 
-        # Top
-        template = self.get_template("hw/de0_nano_top.txt")
-        (project_dir / "DE0_Nano.v").write_text(
-            template.render(self.syn_data), encoding="utf-8"
-        )
+        self.get_template("hw/delayed_registers.txt") \
+            .stream(self.syn_data).dump(str(project_dir / "delayed_registers.sv"))
 
-        # Copy core
-        shutil.copy(self.hdl_dir / "main.v",
-                    project_dir / f"{project_name}.v")
+        self.get_template("hw/de0_nano_top.txt") \
+            .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
+
+        shutil.copy(self.hdl_dir / "main.v", project_dir / f"{project_name}.v")
 
         log.info("Quartus project created at %s", project_dir)
 
-        # ---- Compile ----
         log.info("Running Quartus compile...")
         result = subprocess.run(
             [quartus_sh, "--flow", "compile", project_name],
@@ -201,47 +223,34 @@ class Py2ver:
         else:
             log.warning("No output_files/ directory found.")
 
-        # ---- Auto program FPGA ----
         self._program_fpga(syn_tool_dir, project_dir, project_name)
 
-    # ----------------------------------------------------------------
-    # Testbench flow
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # Testbench
+    # ------------------------------------------------------------------------
+
     def TB(self) -> Callable[..., Tuple[int, ...]]:
         return self.tb_fun
 
-    def get_template(self, filename: str):
-        if filename not in self._tpl_cache:
-            self._tpl_cache[filename] = self.env.get_template(filename)
-        return self._tpl_cache[filename]
-
     def gen_tb(self, *in_arg: Any) -> None:
         key_val = [
-            (name, in_arg[i] if i < len(in_arg) and in_arg[i] is not None else 0)
+            (name, in_arg[i] if i < len(in_arg) else 0)
             for i, name in enumerate(self.input_args_list)
         ]
 
-        template = self.get_template("tb.txt")
-        tb_out = template.render({
+        tb_out = self.get_template("tb.txt").render({
             "period": DEFAULT_TB_PERIOD,
             "in_args": key_val,
             "out_args": self.output_args_list
         })
         Path("tb.py").write_text(tb_out, encoding="utf-8")
 
-    @staticmethod
-    def tosigned(n: int, nbits: int) -> int:
-        mask = (1 << nbits) - 1
-        n &= mask
-        sign_bit = 1 << (nbits - 1)
-        return (n ^ sign_bit) - sign_bit
-
     def tb_fun(self, *in_arg: Any) -> Tuple[int, ...]:
-        log.info("tb_fun args=%s", in_arg)
-
         if RESULTS_PATH.exists():
-            try: RESULTS_PATH.unlink()
-            except OSError as e: log.warning(e)
+            try:
+                RESULTS_PATH.unlink()
+            except OSError as e:
+                log.warning(e)
 
         self.gen_tb(*in_arg)
         tb_runner.test_runner(self.t_name)
@@ -251,7 +260,6 @@ class Py2ver:
                 payload = pickle.load(handle)
                 d = payload if isinstance(payload, dict) else ast.literal_eval(payload)
         else:
-            log.warning("No results — returning zeros.")
             d = {}
 
         outs = []
@@ -262,24 +270,19 @@ class Py2ver:
             outs.append(v)
         return tuple(outs)
 
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------------
     # FPGA Programmer
-    # ----------------------------------------------------------------
+    # ------------------------------------------------------------------------
+
     @staticmethod
     def _program_fpga(syn_tool_dir: str, project_dir: Path, project_name: str) -> None:
-        """Program FPGA automatically if a .sof is available."""
-
-        # Possible .sof locations
         out_dir = project_dir / "output_files"
         candidates = [
             out_dir / f"{project_name}.sof",
             next(iter(out_dir.glob("*.sof")), None) if out_dir.exists() else None,
             project_dir / f"{project_name}.sof",
         ]
-        sof_file = next(
-            (p for p in candidates if isinstance(p, Path) and p and p.exists()),
-            None
-        )
+        sof_file = next((p for p in candidates if isinstance(p, Path) and p and p.exists()), None)
 
         if not sof_file:
             log.warning("No .sof found, skipping programming.")
@@ -296,7 +299,6 @@ class Py2ver:
             capture_output=True,
             text=True,
         )
-
         if result.returncode != 0:
             log.error("quartus_pgm failed: %s", result.stderr)
         else:
@@ -305,6 +307,5 @@ class Py2ver:
 
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     log.info("py2ver executed as script")

@@ -1,0 +1,52 @@
+// uart_baud_gen.sv — 16× oversample + 1× baud tick (phase-aligned)
+module uart_baud_gen #(
+    parameter int CLK_HZ = 50_000_000,
+    parameter int BAUD   = 115_200,
+    parameter int OSR    = 16
+)(
+    input  logic clk,
+    input  logic rst_n,
+    output logic os_tick,    // 16× oversample tick
+    output logic baud_tick   // 1× baud tick (aligned to os_tick)
+);
+    // Fixed-OSR variant
+    // synthesis translate_off
+    initial if (OSR != 16) $error("uart_baud_gen: OSR must be 16 in this variant.");
+    // synthesis translate_on
+
+    localparam int DIV_OS_TICK = (CLK_HZ + (BAUD*OSR)/2) / (BAUD*OSR);
+
+    logic [$clog2(DIV_OS_TICK)-1:0] os_div = '0;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            os_div  <= '0;
+            os_tick <= 1'b0;
+        end else begin
+            os_tick <= 1'b0;
+            if (os_div == DIV_OS_TICK-1) begin
+                os_div  <= '0;
+                os_tick <= 1'b1;
+            end else begin
+                os_div <= os_div + 1'b1;
+            end
+        end
+    end
+
+    logic [3:0] osr_cnt = '0; // 0..15
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            osr_cnt   <= '0;
+            baud_tick <= 1'b0;
+        end else begin
+            baud_tick <= 1'b0;
+            if (os_tick) begin
+                if (osr_cnt == OSR-1) begin
+                    osr_cnt   <= '0;
+                    baud_tick <= 1'b1;
+                end else begin
+                    osr_cnt <= osr_cnt + 4'd1;
+                end
+            end
+        end
+    end
+endmodule

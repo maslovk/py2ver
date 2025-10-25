@@ -1,0 +1,50 @@
+// uart_fifo4x8.sv — tiny 4×8 FIFO for loopback path
+module uart_fifo4x8 (
+    input  logic       clk,
+    input  logic       rst_n,
+    // push
+    input  logic       push,
+    input  logic [7:0] din,
+    // pop
+    input  logic       pop,
+    output logic [7:0] dout,
+    // status
+    output logic       empty,
+    output logic       full,
+    output logic [2:0] count,
+    output logic       overflow_latched
+);
+    logic [7:0] mem [0:3];
+    logic [1:0] rptr, wptr;
+
+    assign dout = mem[rptr];
+    assign full  = (count == 3'd4);
+    assign empty = (count == 3'd0);
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rptr <= '0; wptr <= '0; count <= '0;
+            overflow_latched <= 1'b0;
+        end else begin
+            // push
+            if (push) begin
+                if (!full) begin
+                    mem[wptr] <= din;
+                    wptr <= wptr + 2'd1;
+                end else begin
+                    overflow_latched <= 1'b1;
+                end
+            end
+            // pop
+            if (pop && !empty) begin
+                rptr <= rptr + 2'd1;
+            end
+            // count update (allow push+pop same cycle)
+            unique case ({push && !full, pop && !empty})
+                2'b10: count <= count + 3'd1;
+                2'b01: count <= count - 3'd1;
+                default: /* no change */;
+            endcase
+        end
+    end
+endmodule

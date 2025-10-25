@@ -1,0 +1,157 @@
+// -----------------------------------------------------------------------------
+// uart_transceiver.sv  (LOOPBACK-capable, single-writer FIFO — no multi-drivers)
+//  - 50 MHz default, 115200 baud
+//  - RX: 16x oversampling (mid-bit sampling with optional majority-of-3)
+//  - Normal: packs tx_data -> UART; RX assembles bytes -> rx_data (pulses rx_valid)
+//  - LOOPBACK=1: ignore tx_data/tx_valid; echo each received byte
+//  - baud_tick is phase-aligned to oversample_tick (derived from it)
+// -----------------------------------------------------------------------------
+module uart_transceiver #(
+    parameter int CLK_HZ          = 50000000,
+    parameter int BAUD            = 115200,
+    parameter int TX_WIDTH        = 32,
+    parameter int RX_WIDTH        = 32,
+    parameter bit LOOPBACK        = 1'b1,
+    parameter int OSR             = 16,   // fixed-OSR variant assumes 16
+    parameter bit RX_ENA_STOPCHK  = 1'b1, // gate output on a good stop bit
+    parameter bit RX_MAJ3         = 1'b1  // 3-sample majority around mid-bit
+)(
+    input  logic                   clk,
+    input  logic                   rst_n,
+    // Parallel transmit (ignored when LOOPBACK=1)
+    input  logic [TX_WIDTH-1:0]    tx_data,
+    input  logic                   tx_valid,   // 1-clk strobe to start sending tx_data
+    output logic                   tx_busy,
+    // UART pins
+    output logic                   tx,
+    input  logic                   rx,
+    // Parallel receive
+    output logic [RX_WIDTH-1:0]    rx_data,
+    output logic                   rx_valid,
+    // Status (optional)
+    output logic                   rx_ferr,      // framing error (bad stop) pulse
+    output logic                   lb_overflow   // loopback FIFO overflow latched
+);
+    // ------------------------- Baud / Oversample -------------------------
+    logic os_tick, baud_tick;
+    uart_baud_gen #(
+        .CLK_HZ(CLK_HZ), .BAUD(BAUD), .OSR(OSR)
+    ) u_baud (
+        .clk, .rst_n, .os_tick, .baud_tick
+    );
+
+    // ------------------------------- RX ---------------------------------
+    logic [7:0] rx_byte;
+    logic       rx_byte_ready;
+    uart_rx_8n1 #(
+        .RX_ENA_STOPCHK(RX_ENA_STOPCHK),
+        .RX_MAJ3(RX_MAJ3)
+    ) u_rx (
+        .clk, .rst_n, .os_tick, .rx,
+        .rx_byte, .rx_byte_ready, .rx_ferr
+    );
+
+    // --------------------------- LOOPBACK FIFO ---------------------------
+    logic [7:0] lb_dout;
+    logic       lb_push, lb_pop, lb_empty, lb_full;
+    logic [2:0] lb_count;
+
+    assign lb_push = LOOPBACK ? rx_byte_ready : 1'b0;
+
+    uart_fifo4x8 u_lb (
+        .clk, .rst_n,
+        .push(lb_push), .din(rx_byte),
+        .pop(lb_pop),   .dout(lb_dout),
+        .empty(lb_empty), .full(lb_full), .count(lb_count),
+        .overflow_latched(lb_overflow)
+    );
+
+    // ------------------------------- TX ---------------------------------
+    // Byte serializer (always used). Top selects source:
+    //   - Normal: slices tx_data into bytes
+    //   - LOOPBACK: pops from FIFO
+    logic       tx_start_b;
+    logic [7:0] tx_byte_b;
+    logic       tx_busy_b;
+
+    uart_tx_8n1 u_tx (
+        .clk, .rst_n, .baud_tick,
+        .tx_byte(tx_byte_b), .tx_start(tx_start_b),
+        .tx, .tx_busy(tx_busy_b)
+    );
+
+    assign tx_busy = tx_busy_b;
+
+    // ---------------------- Normal-mode byte slicer ----------------------
+    localparam int TX_BYTES = (TX_WIDTH + 7) / 8;
+    logic [$clog2(TX_BYTES):0] tx_byte_idx;
+
+    // ---------------------- RX parallel assembler -----------------------
+    localparam int RX_BYTES = (RX_WIDTH + 7) / 8;
+    logic [$clog2(RX_BYTES):0] rx_byte_idx;
+    logic [RX_WIDTH-1:0]       rx_accum, next_accum;
+
+    // ------------------------- Control / Dataflow ------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // TX path
+            tx_start_b   <= 1'b0;
+            tx_byte_b    <= 8'h00;
+            tx_byte_idx  <= '0;
+            lb_pop       <= 1'b0;
+
+            // RX path
+            rx_byte_idx  <= '0;
+            rx_accum     <= '0;
+            rx_data      <= '0;
+            rx_valid     <= 1'b0;
+        end else begin
+            tx_start_b <= 1'b0;
+            lb_pop     <= 1'b0;
+            rx_valid   <= 1'b0;
+
+            // ----------------------- TX producer ------------------------
+            if (!tx_busy_b) begin
+                if (!LOOPBACK) begin
+                    if (tx_valid) begin
+                        // load first byte
+                        tx_byte_idx <= (TX_BYTES > 1) ? 1 : '0;
+                        tx_byte_b   <= tx_data[7:0];          // LSB-first byte
+                        tx_start_b  <= 1'b1;
+                    end else if (tx_byte_idx != 0) begin
+                        // continuing multi-byte packet
+                        tx_byte_b   <= tx_data[(tx_byte_idx*8) +: 8];
+                        tx_start_b  <= 1'b1;
+                        if (tx_byte_idx + 1 < TX_BYTES) begin
+                            tx_byte_idx <= tx_byte_idx + 1'b1;
+                        end else begin
+                            tx_byte_idx <= '0;
+                        end
+                    end
+                end else begin
+                    // LOOPBACK: consume from FIFO whenever available
+                    if (!lb_empty) begin
+                        tx_byte_b  <= lb_dout;
+                        tx_start_b <= 1'b1;
+                        lb_pop     <= 1'b1;  // pop the byte we just loaded
+                    end
+                end
+            end
+
+            // ----------------------- RX assembler -----------------------
+            if (rx_byte_ready) begin
+                next_accum = rx_accum;
+                next_accum[(rx_byte_idx*8) +: 8] = rx_byte; // LSB-first
+                if (rx_byte_idx + 1 < RX_BYTES) begin
+                    rx_accum    <= next_accum;
+                    rx_byte_idx <= rx_byte_idx + 1'b1;
+                end else begin
+                    rx_accum    <= '0;          // optional clear
+                    rx_data     <= next_accum;  // full word ready
+                    rx_valid    <= 1'b1;
+                    rx_byte_idx <= '0;
+                end
+            end
+        end
+    end
+endmodule
