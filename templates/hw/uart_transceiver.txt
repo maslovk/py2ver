@@ -6,12 +6,13 @@
 //  - LOOPBACK=1: ignore tx_data/tx_valid; echo each received byte
 // -----------------------------------------------------------------------------
 module uart_transceiver #(
-    parameter integer CLK_HZ    = 50000000,
-    parameter integer BAUD      = 115200,
-    parameter integer TX_WIDTH  = 32,
-    parameter integer RX_WIDTH  = 32,
-    parameter bit     LOOPBACK  = 1'b1,
-    parameter integer OSR       = 16          // oversample rate (fixed at 16 in logic below)
+    parameter integer CLK_HZ          = 50000000,
+    parameter integer BAUD            = 115200,
+    parameter integer TX_WIDTH        = 32,
+    parameter integer RX_WIDTH        = 32,
+    parameter bit     LOOPBACK        = 1'b1,
+    parameter integer OSR             = 16,   // oversample rate (logic assumes 16)
+    parameter bit     RX_ENA_STOPCHK  = 1'b1  // gate output on a good stop bit
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -27,8 +28,18 @@ module uart_transceiver #(
 
     // Parallel receive
     output reg  [RX_WIDTH-1:0]      rx_data,
-    output reg                      rx_valid
+    output reg                      rx_valid,
+
+    // Status (optional)
+    output reg                      rx_ferr,      // framing error (bad stop) pulse
+    output reg                      lb_overflow   // loopback FIFO overflow latched
 );
+    // Enforce OSR=16 for this implementation
+    localparam _ASSERT_OSR_16 = (OSR == 16) ? 1 : -1;
+    // synthesis translate_off
+    initial if (OSR != 16) $error("uart_transceiver: OSR must be 16 in this variant.");
+    // synthesis translate_on
+
     // =========================================================================
     // Baud / Oversample
     // =========================================================================
@@ -87,8 +98,10 @@ module uart_transceiver #(
             rx_byte_ready <= 1'b0;
             rx_byte       <= 8'h00;
             rx_stop_ok    <= 1'b0;
+            rx_ferr       <= 1'b0;
         end else begin
             rx_byte_ready <= 1'b0;
+            rx_ferr       <= 1'b0;
 
             if (!rx_busy_b) begin
                 // look for start (line low) on an oversample tick
@@ -106,13 +119,11 @@ module uart_transceiver #(
                 rx_total_os <= rx_total_os + 8'd1;
 
                 // mid-bit sample points: 7, 23, 39, ..., 7 + n*16
-                // start bit is at total_os in [0..15], ignore sample at 7
                 if (rx_os_cnt == 4'd7) begin
                     if (rx_total_os >= 8'd16 && rx_total_os < 8'd144) begin
-                        // data bits window (8 bits @ 16 ticks each)
-                        // LSB-first: shift-left and append sampled bit into bit0
-                        rx_shift   <= {rx_shift[6:0], rx_s2};
-                        rx_bit_idx <= rx_bit_idx + 3'd1;
+                        // data bits window (8 bits @ 16 ticks each), LSB-first
+                        rx_shift[rx_bit_idx] <= rx_s2; // <<< FIXED (indexed write)
+                        rx_bit_idx           <= rx_bit_idx + 3'd1;
                     end else if (rx_total_os == 8'd151) begin
                         // mid stop-bit sample (near end)
                         rx_stop_ok <= rx_s2; // expect high
@@ -122,8 +133,12 @@ module uart_transceiver #(
                 // end of 10-bit frame (start + 8 data + stop)
                 if (rx_total_os == (OSR*10 - 1)) begin
                     rx_busy_b     <= 1'b0;
-                    rx_byte       <= rx_shift;
-                    rx_byte_ready <= 1'b1; // you could gate with rx_stop_ok if desired
+                    if (!RX_ENA_STOPCHK || rx_stop_ok) begin
+                        rx_byte       <= rx_shift;
+                        rx_byte_ready <= 1'b1;
+                    end else begin
+                        rx_ferr       <= 1'b1; // bad stop bit
+                    end
                 end
             end
         end
@@ -144,22 +159,26 @@ module uart_transceiver #(
     wire lb_push_pulse = LOOPBACK && rx_byte_ready && !lb_full;
     reg  lb_pop_pulse;  // set by TX state machine when it consumes a byte
 
-    // SINGLE always block updates pointers & count
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             lb_rptr <= 2'd0; lb_wptr <= 2'd0; lb_count <= 3'd0;
+            lb_overflow <= 1'b0;
         end else if (LOOPBACK) begin
             // push
-            if (lb_push_pulse) begin
-                lb_mem[lb_wptr] <= rx_byte;
-                lb_wptr <= lb_wptr + 2'd1;
+            if (rx_byte_ready) begin
+                if (!lb_full) begin
+                    lb_mem[lb_wptr] <= rx_byte;
+                    lb_wptr <= lb_wptr + 2'd1;
+                end else begin
+                    lb_overflow <= 1'b1; // sticky; clear externally if you add a CSR
+                end
             end
             // pop
             if (lb_pop_pulse && !lb_empty) begin
                 lb_rptr <= lb_rptr + 2'd1;
             end
             // count update (push/pop same cycle allowed)
-            case ({lb_push_pulse, (lb_pop_pulse && !lb_empty)})
+            case ({(rx_byte_ready && !lb_full), (lb_pop_pulse && !lb_empty)})
                 2'b10: lb_count <= lb_count + 3'd1;
                 2'b01: lb_count <= lb_count - 3'd1;
                 default: /* no change */ ;
@@ -167,6 +186,7 @@ module uart_transceiver #(
         end else begin
             // keep reset when not used
             lb_rptr <= 2'd0; lb_wptr <= 2'd0; lb_count <= 3'd0;
+            lb_overflow <= 1'b0;
         end
     end
 
@@ -249,6 +269,7 @@ module uart_transceiver #(
     localparam integer RX_BYTES = (RX_WIDTH + 7) / 8;
     reg [$clog2(RX_BYTES):0] rx_byte_idx;
     reg [RX_WIDTH-1:0]       rx_accum;
+    reg [RX_WIDTH-1:0]       next_accum; // moved out for portability
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -259,8 +280,6 @@ module uart_transceiver #(
         end else begin
             rx_valid <= 1'b0;
             if (rx_byte_ready) begin
-                // build next_accum to avoid NB-assign race on the last byte
-                reg [RX_WIDTH-1:0] next_accum;
                 next_accum = rx_accum;
                 next_accum[(rx_byte_idx*8) +: 8] = rx_byte; // LSB-first
 
