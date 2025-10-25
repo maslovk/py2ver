@@ -1,490 +1,279 @@
-module baud_tick_gen_dual #(
-    parameter CLK_FREQ     = 50000000,
-    parameter BAUD_RATE    = 115200,
-    parameter OVERSAMPLE   = 16
+// -----------------------------------------------------------------------------
+// uart_transceiver.v  (LOOPBACK-capable, single-writer FIFO — no multi-drivers)
+//  - 50 MHz default, 115200 baud
+//  - RX: 16x oversampling (mid-bit sampling)
+//  - Normal: packs tx_data -> UART; RX assembles bytes -> rx_data (pulses rx_valid)
+//  - LOOPBACK=1: ignore tx_data/tx_valid; echo each received byte
+// -----------------------------------------------------------------------------
+module uart_transceiver #(
+    parameter integer CLK_HZ    = 50000000,
+    parameter integer BAUD      = 115200,
+    parameter integer TX_WIDTH  = 32,
+    parameter integer RX_WIDTH  = 32,
+    parameter bit     LOOPBACK  = 1'b1,
+    parameter integer OSR       = 16          // oversample rate (fixed at 16 in logic below)
 )(
-    input  wire clk,
-    input  wire rst_n,
-    output reg  baud_tick,        // 1 pulse per bit
-    output reg  oversample_tick   // OVERSAMPLE pulses per bit
+    input  wire                     clk,
+    input  wire                     rst_n,
+
+    // Parallel transmit (ignored when LOOPBACK=1)
+    input  wire [TX_WIDTH-1:0]      tx_data,
+    input  wire                     tx_valid,   // 1-clk strobe to start sending tx_data
+    output wire                     tx_busy,
+
+    // UART pins
+    output wire                     tx,
+    input  wire                     rx,
+
+    // Parallel receive
+    output reg  [RX_WIDTH-1:0]      rx_data,
+    output reg                      rx_valid
 );
+    // =========================================================================
+    // Baud / Oversample
+    // =========================================================================
+    localparam integer DIV_OS_TICK  = (CLK_HZ + (BAUD*OSR)/2) / (BAUD*OSR);
+    localparam integer DIV_BAUD_TCK = (CLK_HZ + BAUD/2)       / BAUD;
 
-    localparam TICKS_PER_OVERSAMPLE = CLK_FREQ / (BAUD_RATE * OVERSAMPLE);
-    localparam TICKS_PER_BIT        = OVERSAMPLE; // Number of oversample ticks per bit
+    // 16x oversample tick
+    reg [$clog2(DIV_OS_TICK)-1:0] os_div = 0;
+    reg os_tick;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin os_div <= 0; os_tick <= 1'b0; end
+        else begin
+            os_tick <= 1'b0;
+            if (os_div == DIV_OS_TICK-1) begin os_div <= 0; os_tick <= 1'b1; end
+            else os_div <= os_div + 1'b1;
+        end
+    end
 
-    localparam OS_CTR_WIDTH = $clog2(TICKS_PER_OVERSAMPLE);
-    localparam B_CTR_WIDTH  = $clog2(TICKS_PER_BIT);
+    // 1x baud tick
+    reg [$clog2(DIV_BAUD_TCK)-1:0] bd_div = 0;
+    reg baud_tick;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin bd_div <= 0; baud_tick <= 1'b0; end
+        else begin
+            baud_tick <= 1'b0;
+            if (bd_div == DIV_BAUD_TCK-1) begin bd_div <= 0; baud_tick <= 1'b1; end
+            else bd_div <= bd_div + 1'b1;
+        end
+    end
 
-    reg [OS_CTR_WIDTH-1:0] os_counter; // clock cycles between oversample ticks
-    reg [B_CTR_WIDTH-1:0]  b_counter;  // count oversample ticks to make a baud tick
+    // =========================================================================
+    // UART RX (8N1, 16x oversampling with mid-bit sample)
+    // =========================================================================
+    reg rx_s1, rx_s2;
+    always @(posedge clk) begin
+        rx_s1 <= rx;
+        rx_s2 <= rx_s1; // double-sync
+    end
+
+    reg [3:0]  rx_os_cnt;     // 0..15 within bit
+    reg [7:0]  rx_total_os;   // 0..159 over frame (10 bits * 16)
+    reg [2:0]  rx_bit_idx;    // data bits 0..7
+    reg [7:0]  rx_shift;
+    reg        rx_busy_b;
+    reg        rx_byte_ready;
+    reg [7:0]  rx_byte;
+    reg        rx_stop_ok;    // simple stop-bit check (optional)
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            os_counter      <= 0;
-            b_counter       <= 0;
-            oversample_tick <= 0;
-            baud_tick       <= 0;
+            rx_os_cnt     <= 0;
+            rx_total_os   <= 0;
+            rx_bit_idx    <= 0;
+            rx_shift      <= 8'h00;
+            rx_busy_b     <= 1'b0;
+            rx_byte_ready <= 1'b0;
+            rx_byte       <= 8'h00;
+            rx_stop_ok    <= 1'b0;
         end else begin
-            // Oversample tick generator
-            if (os_counter == TICKS_PER_OVERSAMPLE - 1) begin
-                os_counter      <= 0;
-                oversample_tick <= 1;
+            rx_byte_ready <= 1'b0;
 
-                // Baud tick generator (count oversample ticks)
-                if (b_counter == TICKS_PER_BIT - 1) begin
-                    b_counter <= 0;
-                    baud_tick <= 1;
+            if (!rx_busy_b) begin
+                // look for start (line low) on an oversample tick
+                if (os_tick && (rx_s2 == 1'b0)) begin
+                    rx_busy_b   <= 1'b1;
+                    rx_os_cnt   <= 4'd0;
+                    rx_total_os <= 8'd0;
+                    rx_bit_idx  <= 3'd0;
+                    rx_shift    <= 8'h00;
+                    rx_stop_ok  <= 1'b0;
+                end
+            end else if (os_tick) begin
+                // advance oversample counters
+                rx_os_cnt   <= rx_os_cnt + 4'd1;     // wraps naturally 15->0
+                rx_total_os <= rx_total_os + 8'd1;
+
+                // mid-bit sample points: 7, 23, 39, ..., 7 + n*16
+                // start bit is at total_os in [0..15], ignore sample at 7
+                if (rx_os_cnt == 4'd7) begin
+                    if (rx_total_os >= 8'd16 && rx_total_os < 8'd144) begin
+                        // data bits window (8 bits @ 16 ticks each)
+                        // LSB-first: shift-left and append sampled bit into bit0
+                        rx_shift   <= {rx_shift[6:0], rx_s2};
+                        rx_bit_idx <= rx_bit_idx + 3'd1;
+                    end else if (rx_total_os == 8'd151) begin
+                        // mid stop-bit sample (near end)
+                        rx_stop_ok <= rx_s2; // expect high
+                    end
+                end
+
+                // end of 10-bit frame (start + 8 data + stop)
+                if (rx_total_os == (OSR*10 - 1)) begin
+                    rx_busy_b     <= 1'b0;
+                    rx_byte       <= rx_shift;
+                    rx_byte_ready <= 1'b1; // you could gate with rx_stop_ok if desired
+                end
+            end
+        end
+    end
+
+    // =========================================================================
+    // Tiny 4-byte FIFO for LOOPBACK (single writer block!)
+    // =========================================================================
+    reg [7:0] lb_mem [0:3];
+    reg [1:0] lb_rptr, lb_wptr;
+    reg [2:0] lb_count; // 0..4
+
+    wire lb_full  = (lb_count == 3'd4);
+    wire lb_empty = (lb_count == 3'd0);
+    wire [7:0] lb_dout = lb_mem[lb_rptr];
+
+    // Push/pop pulses (generated by RX/TX logic)
+    wire lb_push_pulse = LOOPBACK && rx_byte_ready && !lb_full;
+    reg  lb_pop_pulse;  // set by TX state machine when it consumes a byte
+
+    // SINGLE always block updates pointers & count
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            lb_rptr <= 2'd0; lb_wptr <= 2'd0; lb_count <= 3'd0;
+        end else if (LOOPBACK) begin
+            // push
+            if (lb_push_pulse) begin
+                lb_mem[lb_wptr] <= rx_byte;
+                lb_wptr <= lb_wptr + 2'd1;
+            end
+            // pop
+            if (lb_pop_pulse && !lb_empty) begin
+                lb_rptr <= lb_rptr + 2'd1;
+            end
+            // count update (push/pop same cycle allowed)
+            case ({lb_push_pulse, (lb_pop_pulse && !lb_empty)})
+                2'b10: lb_count <= lb_count + 3'd1;
+                2'b01: lb_count <= lb_count - 3'd1;
+                default: /* no change */ ;
+            endcase
+        end else begin
+            // keep reset when not used
+            lb_rptr <= 2'd0; lb_wptr <= 2'd0; lb_count <= 3'd0;
+        end
+    end
+
+    // =========================================================================
+    // UART TX (8N1)
+    // =========================================================================
+    reg [9:0] tx_shift;
+    reg [3:0] tx_bit_cnt;      // 0..9
+    reg       tx_busy_b;
+
+    assign tx      = tx_shift[0];
+    assign tx_busy = tx_busy_b;
+
+    localparam integer TX_BYTES = (TX_WIDTH + 7) / 8;
+    reg [$clog2(TX_BYTES):0] tx_byte_idx;
+    wire [7:0] tx_curr_byte = tx_data[(tx_byte_idx*8) +: 8]; // LSB-first byte order
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx_shift     <= 10'h3FF; // idle high
+            tx_bit_cnt   <= 4'd0;
+            tx_busy_b    <= 1'b0;
+            tx_byte_idx  <= {($clog2(TX_BYTES)+1){1'b0}};
+            lb_pop_pulse <= 1'b0;
+        end else begin
+            lb_pop_pulse <= 1'b0;
+
+            // Start a transfer
+            if (!tx_busy_b) begin
+                if (!LOOPBACK) begin
+                    if (tx_valid) begin
+                        tx_busy_b   <= 1'b1;
+                        tx_byte_idx <= 0;
+                        tx_shift    <= {1'b1, tx_curr_byte, 1'b0}; // {stop, data[7:0], start}
+                        tx_bit_cnt  <= 0;
+                        if (TX_BYTES > 1) tx_byte_idx <= 1;
+                    end
                 end else begin
-                    b_counter <= b_counter + 1;
-                    baud_tick <= 0;
-                end
-            end else begin
-                os_counter      <= os_counter + 1;
-                oversample_tick <= 0;
-                baud_tick       <= 0;
-            end
-        end
-    end
-endmodule
-
-
-module uart_tx (
-    input  wire       clk,
-    input  wire       rst_n,
-    input  wire       tick,
-    input  wire [REG_WIDTH_TX-1:0] data_in,
-    input  wire       data_valid,
-    output reg        tx,
-    output reg        busy
-);
-    parameter REG_WIDTH_TX  = 8;
-    localparam CTR_WIDTH = $clog2(REG_WIDTH_TX);
-
-    // Internal registers for data buffering and state machine
-    reg [REG_WIDTH_TX-1:0] shift_reg;
-    reg [CTR_WIDTH-1:0] bit_cnt;
-    reg data_latched;  // Flag to latch data
-
-    // FSM States
-    typedef enum logic [1:0] {
-        IDLE, START, DATA, STOP
-    } state_t;
-
-    state_t state, next_state;
-
-    // FSM Transition Logic
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= IDLE;
-        else if (tick)
-            state <= next_state;
-    end
-
-    // State Transition Logic
-    always @(*) begin
-        case (state)
-            IDLE:  next_state = (data_valid && !data_latched) ? START : IDLE;
-            START: next_state = DATA;
-            DATA:  next_state = (bit_cnt == (REG_WIDTH_TX-1)) ? STOP : DATA;
-            STOP:  next_state = IDLE;
-            default: next_state = IDLE;
-        endcase
-    end
-
-    // Output Logic (TX and Busy Flags)
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            tx <= 1'b1;
-            busy <= 0;
-            shift_reg <= 0;
-            bit_cnt <= 0;
-            data_latched <= 0;
-        end else if (tick) begin
-            case (state)
-                IDLE: begin
-                    // Latch data when data_valid is high
-                    if (data_valid && !data_latched) begin
-                        shift_reg <= data_in;
-                        bit_cnt <= 0;
-                        data_latched <= 1;
-                        busy <= 1;  // Assert busy when data is latched
+                    // LOOPBACK: start when FIFO has data
+                    if (!lb_empty) begin
+                        tx_busy_b   <= 1'b1;
+                        tx_shift    <= {1'b1, lb_dout, 1'b0};
+                        tx_bit_cnt  <= 0;
+                        lb_pop_pulse<= 1'b1; // consume the byte we just loaded
                     end
                 end
-                START: begin
-                    tx <= 0;  // Start bit
-                end
-                DATA: begin
-                    tx <= shift_reg[0];  // Transmit LSB of shift register
-                    shift_reg <= shift_reg >> 1;  // Shift data right
-                    bit_cnt <= bit_cnt + 1;
-                end
-                STOP: begin
-                    tx <= 1;  // Stop bit
-                    busy <= 0;  // Clear busy flag after transmission
-                end
-            endcase
-        end
-    end
-endmodule
+            end else if (baud_tick) begin
+                // Continue shifting (fills MSB with 1's, so idle/stop stay high)
+                tx_shift   <= {1'b1, tx_shift[9:1]};
+                tx_bit_cnt <= tx_bit_cnt + 1'b1;
 
-
-module uart_rx #(
-    parameter REG_WIDTH_RX = 8,
-    parameter OVERSAMPLE = 16
-)(
-    input  wire       clk,
-    input  wire       rst_n,
-    input  wire       tick,  // tick at oversample rate
-    input  wire       rx,
-    output reg [REG_WIDTH_RX-1:0]  data_out,
-    output reg        data_valid  // single-cycle pulse
-);
-    localparam CTR_WIDTH = $clog2(REG_WIDTH_RX);
-    localparam SAMPLE_MID = OVERSAMPLE / 2;
-
-    typedef enum logic [1:0] {
-        IDLE, START, DATA, STOP
-    } state_t;
-
-    state_t state, next_state;
-    reg [CTR_WIDTH-1:0] bit_cnt;
-    reg [REG_WIDTH_RX-1:0] shift_reg;
-
-    reg [$clog2(OVERSAMPLE)-1:0] oversample_cnt;
-    reg rx_sync, rx_meta;
-
-    // Majority sampling registers
-    reg sample_early, sample_mid, sample_late;
-
-    // Internal data_valid in tick domain
-    reg data_valid_tick;
-
-    // Synchronize rx line
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            rx_meta <= 1'b1;
-            rx_sync <= 1'b1;
-        end else begin
-            rx_meta <= rx;
-            rx_sync <= rx_meta;
-        end
-    end
-
-    // FSM transition on tick
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= IDLE;
-        else if (tick)
-            state <= next_state;
-    end
-
-    always @(*) begin
-        case (state)
-            IDLE:  next_state = (rx_sync == 0) ? START : IDLE;
-            START: next_state = (oversample_cnt == OVERSAMPLE-1) ? DATA : START;
-            DATA:  next_state = (bit_cnt == (REG_WIDTH_RX-1) && oversample_cnt == OVERSAMPLE-1) ? STOP : DATA;
-            STOP:  next_state = (oversample_cnt == OVERSAMPLE-1) ? IDLE : STOP;
-            default: next_state = IDLE;
-        endcase
-    end
-
-    // Tick-domain logic
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            shift_reg       <= 0;
-            bit_cnt         <= 0;
-            oversample_cnt  <= 0;
-            data_out        <= 0;
-            data_valid_tick <= 0;
-            sample_early    <= 0;
-            sample_mid      <= 0;
-            sample_late     <= 0;
-        end else if (tick) begin
-            data_valid_tick <= 0;
-
-            case (state)
-                IDLE: begin
-                    oversample_cnt <= 0;
-                end
-                START: begin
-                    oversample_cnt <= oversample_cnt + 1;
-                end
-                DATA: begin
-                    oversample_cnt <= oversample_cnt + 1;
-
-                    // Sample three points around the bit center
-                    case (oversample_cnt)
-                        SAMPLE_MID - 1: sample_early <= rx_sync;
-                        SAMPLE_MID:     sample_mid  <= rx_sync;
-                        SAMPLE_MID + 1: sample_late <= rx_sync;
-                    endcase
-
-                    if (oversample_cnt == OVERSAMPLE - 1) begin
-                        // Majority vote
-                        shift_reg <= {
-                            (sample_early & sample_mid) |
-                            (sample_early & sample_late) |
-                            (sample_mid  & sample_late),
-                            shift_reg[REG_WIDTH_RX-1:1]
-                        };
-                        oversample_cnt <= 0;
-                        bit_cnt <= bit_cnt + 1;
-                    end
-                end
-                STOP: begin
-                    oversample_cnt <= oversample_cnt + 1;
-
-                    if (oversample_cnt == OVERSAMPLE - 1) begin
-                        data_out        <= shift_reg;
-                        data_valid_tick <= 1;  // Set flag when byte is ready
-                    end
-                end
-            endcase
-        end
-    end
-
-    // Synchronize data_valid_tick to clk domain and generate single-cycle pulse
-    reg data_valid_sync1, data_valid_sync2;
-    wire data_valid_pulse;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            data_valid_sync1 <= 0;
-            data_valid_sync2 <= 0;
-        end else begin
-            data_valid_sync1 <= data_valid_tick;
-            data_valid_sync2 <= data_valid_sync1;
-        end
-    end
-
-    assign data_valid_pulse = data_valid_sync1 & ~data_valid_sync2;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            data_valid <= 0;
-        else
-            data_valid <= data_valid_pulse;
-    end
-endmodule
-
-module word_uart_tx #(
-    parameter WORD_WIDTH = 36
-)(
-    input  wire        clk,
-    input  wire        rst_n,
-    input  wire        tick,
-    input  wire [WORD_WIDTH-1:0] word_in,
-    input  wire        word_valid,   // Single-cycle pulse
-    output wire        tx,
-    output reg         busy,
-    output reg         word_done
-);
-
-    localparam BYTE_CNT  = (WORD_WIDTH + 7) / 8;
-    localparam CNT_WIDTH = $clog2(BYTE_CNT);
-
-    reg [7:0] tx_data;
-    reg       tx_valid;
-    wire      tx_busy;
-    reg [WORD_WIDTH-1:0] word_buf;
-    reg [CNT_WIDTH-1:0] byte_index;
-
-    // Buffer and flag to safely latch a single-cycle word_valid
-    reg [WORD_WIDTH-1:0] word_in_buf;
-    reg                  pending_tx;
-
-    uart_tx #(.REG_WIDTH_TX(8)) uart_tx_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .tick(tick),
-        .data_in(tx_data),
-        .data_valid(tx_valid),
-        .tx(tx),
-        .busy(tx_busy)
-    );
-
-    typedef enum logic [1:0] {
-        IDLE, SEND, WAIT
-    } state_t;
-
-    state_t state, next_state;
-
-    // FSM transition
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= IDLE;
-        else
-            state <= next_state;
-    end
-
-    // FSM next state logic
-    always @(*) begin
-        case (state)
-            IDLE:  next_state = (pending_tx) ? SEND : IDLE;
-            SEND:  next_state = (tx_busy == 0) ? WAIT : SEND; // Wait until tx_busy is 0
-            WAIT:  next_state = (tx_busy == 0) ? ((byte_index == BYTE_CNT - 1) ? IDLE : SEND) : WAIT;
-            default: next_state = IDLE;
-        endcase
-    end
-
-    // Output logic and internal register updates
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            tx_valid     <= 0;
-            word_done    <= 0;
-            byte_index   <= 0;
-            busy         <= 0;
-            pending_tx   <= 0;
-            word_buf     <= 0;
-            word_in_buf  <= 0;
-        end else begin
-            tx_valid  <= 0;
-            word_done <= 0;
-
-            // Safely capture single-cycle word_valid pulse
-            if (word_valid && !pending_tx && !busy) begin
-                word_in_buf <= word_in;
-                pending_tx  <= 1;
-            end
-
-            case (state)
-                IDLE: begin
-                    busy <= 0;
-                    if (pending_tx) begin
-                        word_buf   <= word_in_buf;
-                        byte_index <= 0;
-                        busy       <= 1;
-                    end
-                end
-
-                SEND: begin
-                    tx_data     <= word_buf[7:0];
-                    tx_valid    <= 1; // Keep tx_valid asserted
-                    word_buf    <= word_buf >> 8;
-                    pending_tx  <= 0; // Clear after data passed to TX
-                end
-
-                WAIT: begin
-                    if (tx_busy == 0) begin
-                        byte_index <= byte_index + 1;
-                        if (byte_index == BYTE_CNT - 1) begin
-                            word_done <= 1;
-                            busy      <= 0;
+                if (tx_bit_cnt == 4'd9) begin
+                    // Finished a byte
+                    if (!LOOPBACK) begin
+                        if (tx_byte_idx < TX_BYTES) begin
+                            tx_shift    <= {1'b1, tx_data[(tx_byte_idx*8) +: 8], 1'b0};
+                            tx_bit_cnt  <= 0;
+                            tx_byte_idx <= tx_byte_idx + 1'b1;
+                        end else begin
+                            tx_busy_b <= 1'b0;
+                        end
+                    end else begin
+                        // LOOPBACK: immediately send next byte if available
+                        if (!lb_empty) begin
+                            tx_shift    <= {1'b1, lb_dout, 1'b0};
+                            tx_bit_cnt  <= 0;
+                            lb_pop_pulse<= 1'b1;
+                        end else begin
+                            tx_busy_b <= 1'b0;
                         end
                     end
                 end
-            endcase
+            end
         end
     end
-endmodule
 
-
-
-module word_uart_rx #(
-    parameter WORD_WIDTH = 16
-)(
-    input  wire        clk,
-    input  wire        rst_n,
-    input  wire        tick,
-    input  wire        rx,
-    output reg [WORD_WIDTH-1:0] word_out,
-    output reg         word_valid
-);
-    localparam BYTE_CNT  = (WORD_WIDTH + 7) / 8;
-    localparam CNT_WIDTH = $clog2(BYTE_CNT);
-
-    wire [7:0] rx_data;
-    wire       rx_data_valid;
-
-    reg [CNT_WIDTH-1:0] byte_index;
-    reg [WORD_WIDTH-1:0] word_buf;
-
-    // Instantiate 8-bit UART receiver
-    uart_rx #(.REG_WIDTH_RX(8)) uart_rx_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .tick(tick),
-        .rx(rx),
-        .data_out(rx_data),
-        .data_valid(rx_data_valid)
-    );
+    // =========================================================================
+    // Assemble RX bytes into parallel word (still active in LOOPBACK)
+    // =========================================================================
+    localparam integer RX_BYTES = (RX_WIDTH + 7) / 8;
+    reg [$clog2(RX_BYTES):0] rx_byte_idx;
+    reg [RX_WIDTH-1:0]       rx_accum;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            word_buf    <= 0;
-            word_out    <= 0;
-            byte_index  <= 0;
-            word_valid  <= 0;
+            rx_byte_idx <= 0;
+            rx_accum    <= {RX_WIDTH{1'b0}};
+            rx_data     <= {RX_WIDTH{1'b0}};
+            rx_valid    <= 1'b0;
         end else begin
-            word_valid <= 0;
+            rx_valid <= 1'b0;
+            if (rx_byte_ready) begin
+                // build next_accum to avoid NB-assign race on the last byte
+                reg [RX_WIDTH-1:0] next_accum;
+                next_accum = rx_accum;
+                next_accum[(rx_byte_idx*8) +: 8] = rx_byte; // LSB-first
 
-            if (rx_data_valid) begin
-                word_buf <= word_buf | (rx_data << (8 * byte_index));
-                byte_index <= byte_index + 1;
-
-                if (byte_index == BYTE_CNT - 1) begin
-                    word_out   <= word_buf | (rx_data << (8 * byte_index));
-                    word_valid <= 1;
-                    byte_index <= 0;
-                    word_buf   <= 0;
+                if (rx_byte_idx + 1 < RX_BYTES) begin
+                    rx_accum     <= next_accum;
+                    rx_byte_idx  <= rx_byte_idx + 1'b1;
+                end else begin
+                    rx_accum     <= {RX_WIDTH{1'b0}}; // optional clear
+                    rx_data      <= next_accum;
+                    rx_valid     <= 1'b1;
+                    rx_byte_idx  <= 0;
                 end
             end
         end
     end
-endmodule
-
-
-
-
-module uart_transceiver (
-    input  wire       clk,
-    input  wire       rst_n,
-    input  wire [REG_WIDTH_TX-1:0] tx_data,
-    input  wire       tx_valid,
-    output wire       tx,
-    input  wire       rx,
-    output wire [REG_WIDTH_RX-1:0] rx_data,
-    output wire       rx_valid,
-    output wire       tx_busy
-);
-    parameter CLK_FREQ  = {{in_clk_freq}};
-    parameter BAUD_RATE = {{baud_rate}};
-    parameter REG_WIDTH_TX  = {{reg_width_tx}};
-    parameter REG_WIDTH_RX  = {{reg_width_rx}};
-
-    wire baud_tick, oversample_tick;
-
-    baud_tick_gen_dual #(
-        .CLK_FREQ(CLK_FREQ),
-        .BAUD_RATE(BAUD_RATE),
-        .OVERSAMPLE(16)
-    ) baud_gen (
-        .clk(clk),
-        .rst_n(rst_n),
-        .baud_tick(baud_tick), //TX
-        .oversample_tick(oversample_tick) //RX
-    );
-
-    word_uart_tx #(
-        .WORD_WIDTH(REG_WIDTH_TX)
-    ) tx_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .tick(baud_tick),
-        .word_in(tx_data),
-        .word_valid(tx_valid),
-        .tx(tx),
-        .busy(tx_busy)
-    );
-
-    word_uart_rx #(
-       .WORD_WIDTH(REG_WIDTH_RX)
-    ) rx_inst (
-        .clk(clk),
-        .rst_n(rst_n),
-        .tick(oversample_tick),
-        .rx(rx),
-        .word_out(rx_data),
-        .word_valid(rx_valid)
-    );
 endmodule
