@@ -1,9 +1,10 @@
 // -----------------------------------------------------------------------------
 // uart_transceiver.v  (LOOPBACK-capable, single-writer FIFO — no multi-drivers)
 //  - 50 MHz default, 115200 baud
-//  - RX: 16x oversampling (mid-bit sampling)
+//  - RX: 16x oversampling (mid-bit sampling with optional majority-of-3)
 //  - Normal: packs tx_data -> UART; RX assembles bytes -> rx_data (pulses rx_valid)
 //  - LOOPBACK=1: ignore tx_data/tx_valid; echo each received byte
+//  - baud_tick is phase-aligned to oversample_tick (derived from it)
 // -----------------------------------------------------------------------------
 module uart_transceiver #(
     parameter integer CLK_HZ          = 50000000,
@@ -12,7 +13,8 @@ module uart_transceiver #(
     parameter integer RX_WIDTH        = 32,
     parameter bit     LOOPBACK        = 1'b1,
     parameter integer OSR             = 16,   // oversample rate (logic assumes 16)
-    parameter bit     RX_ENA_STOPCHK  = 1'b1  // gate output on a good stop bit
+    parameter bit     RX_ENA_STOPCHK  = 1'b1, // gate output on a good stop bit
+    parameter bit     RX_MAJ3         = 1'b1  // 3-sample majority around mid-bit
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -44,7 +46,6 @@ module uart_transceiver #(
     // Baud / Oversample
     // =========================================================================
     localparam integer DIV_OS_TICK  = (CLK_HZ + (BAUD*OSR)/2) / (BAUD*OSR);
-    localparam integer DIV_BAUD_TCK = (CLK_HZ + BAUD/2)       / BAUD;
 
     // 16x oversample tick
     reg [$clog2(DIV_OS_TICK)-1:0] os_div = 0;
@@ -58,20 +59,26 @@ module uart_transceiver #(
         end
     end
 
-    // 1x baud tick
-    reg [$clog2(DIV_BAUD_TCK)-1:0] bd_div = 0;
-    reg baud_tick;
+    // 1x baud tick derived from oversample tick (phase-aligned)
+    reg [3:0] osr_cnt = 0;  // 0..15
+    reg       baud_tick;
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin bd_div <= 0; baud_tick <= 1'b0; end
+        if (!rst_n) begin osr_cnt <= 0; baud_tick <= 1'b0; end
         else begin
             baud_tick <= 1'b0;
-            if (bd_div == DIV_BAUD_TCK-1) begin bd_div <= 0; baud_tick <= 1'b1; end
-            else bd_div <= bd_div + 1'b1;
+            if (os_tick) begin
+                if (osr_cnt == OSR-1) begin
+                    osr_cnt  <= 0;
+                    baud_tick<= 1'b1;
+                end else begin
+                    osr_cnt <= osr_cnt + 4'd1;
+                end
+            end
         end
     end
 
     // =========================================================================
-    // UART RX (8N1, 16x oversampling with mid-bit sample)
+    // UART RX (8N1, 16x oversampling with (optional) majority-of-3 mid-bit)
     // =========================================================================
     reg rx_s1, rx_s2;
     always @(posedge clk) begin
@@ -88,6 +95,10 @@ module uart_transceiver #(
     reg [7:0]  rx_byte;
     reg        rx_stop_ok;    // simple stop-bit check (optional)
 
+    // Majority-of-3 sampler around mid-bit (samples at 6,7,8)
+    reg [1:0]  maj_accum;     // holds sum of 3 samples (0..3)
+    wire       maj_bit = (maj_accum >= 2);
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             rx_os_cnt     <= 0;
@@ -99,12 +110,13 @@ module uart_transceiver #(
             rx_byte       <= 8'h00;
             rx_stop_ok    <= 1'b0;
             rx_ferr       <= 1'b0;
+            maj_accum     <= 0;
         end else begin
             rx_byte_ready <= 1'b0;
             rx_ferr       <= 1'b0;
 
             if (!rx_busy_b) begin
-                // look for start (line low) on an oversample tick
+                // detect start (low) on an oversample edge; arm the frame
                 if (os_tick && (rx_s2 == 1'b0)) begin
                     rx_busy_b   <= 1'b1;
                     rx_os_cnt   <= 4'd0;
@@ -112,21 +124,40 @@ module uart_transceiver #(
                     rx_bit_idx  <= 3'd0;
                     rx_shift    <= 8'h00;
                     rx_stop_ok  <= 1'b0;
+                    maj_accum   <= 0;
                 end
             end else if (os_tick) begin
                 // advance oversample counters
                 rx_os_cnt   <= rx_os_cnt + 4'd1;     // wraps naturally 15->0
                 rx_total_os <= rx_total_os + 8'd1;
 
-                // mid-bit sample points: 7, 23, 39, ..., 7 + n*16
-                if (rx_os_cnt == 4'd7) begin
-                    if (rx_total_os >= 8'd16 && rx_total_os < 8'd144) begin
-                        // data bits window (8 bits @ 16 ticks each), LSB-first
-                        rx_shift[rx_bit_idx] <= rx_s2; // <<< FIXED (indexed write)
-                        rx_bit_idx           <= rx_bit_idx + 3'd1;
-                    end else if (rx_total_os == 8'd151) begin
-                        // mid stop-bit sample (near end)
-                        rx_stop_ok <= rx_s2; // expect high
+                // Majority-of-3 around mid-bit (ticks 6,7,8 of each bit cell)
+                if (RX_MAJ3) begin
+                    if (rx_os_cnt == 4'd6)      maj_accum <= {1'b0, rx_s2};           // = rx_s2
+                    else if (rx_os_cnt == 4'd7) maj_accum <= maj_accum + {1'b0, rx_s2};
+                    else if (rx_os_cnt == 4'd8) maj_accum <= maj_accum + {1'b0, rx_s2};
+                end
+
+                // sampling events
+                if (!RX_MAJ3) begin
+                    // single mid-bit sample points: 7, 23, ..., 7 + n*16
+                    if (rx_os_cnt == 4'd7) begin
+                        if (rx_total_os >= 8'd16 && rx_total_os < 8'd144) begin
+                            rx_shift[rx_bit_idx] <= rx_s2; // LSB-first
+                            rx_bit_idx           <= rx_bit_idx + 3'd1;
+                        end else if (rx_total_os == 8'd151) begin
+                            rx_stop_ok <= rx_s2; // expect high
+                        end
+                    end
+                end else begin
+                    // majority sample is latched on tick 8 (after collecting 6,7,8)
+                    if (rx_os_cnt == 4'd8) begin
+                        if (rx_total_os >= 8'd17 && rx_total_os < 8'd145) begin
+                            rx_shift[rx_bit_idx] <= maj_bit; // LSB-first
+                            rx_bit_idx           <= rx_bit_idx + 3'd1;
+                        end else if (rx_total_os == 8'd152) begin
+                            rx_stop_ok <= maj_bit; // expect high
+                        end
                     end
                 end
 
@@ -155,16 +186,15 @@ module uart_transceiver #(
     wire lb_empty = (lb_count == 3'd0);
     wire [7:0] lb_dout = lb_mem[lb_rptr];
 
-    // Push/pop pulses (generated by RX/TX logic)
-    wire lb_push_pulse = LOOPBACK && rx_byte_ready && !lb_full;
-    reg  lb_pop_pulse;  // set by TX state machine when it consumes a byte
+    // Pop pulse (generated by TX state machine)
+    reg  lb_pop_pulse;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             lb_rptr <= 2'd0; lb_wptr <= 2'd0; lb_count <= 3'd0;
             lb_overflow <= 1'b0;
         end else if (LOOPBACK) begin
-            // push
+            // push from RX
             if (rx_byte_ready) begin
                 if (!lb_full) begin
                     lb_mem[lb_wptr] <= rx_byte;
@@ -173,7 +203,7 @@ module uart_transceiver #(
                     lb_overflow <= 1'b1; // sticky; clear externally if you add a CSR
                 end
             end
-            // pop
+            // pop from TX
             if (lb_pop_pulse && !lb_empty) begin
                 lb_rptr <= lb_rptr + 2'd1;
             end
