@@ -1,0 +1,137 @@
+// uart_prbs7_tx_test.sv
+// Sends a PRBS7 byte stream every PERIOD_MS (default 500 ms) when enable=1.
+// Built from split UART blocks: uart_baud_gen + uart_tx_8n1.
+
+module uart_prbs7_tx_test #(
+    parameter int CLK_HZ     = 50_000_000,
+    parameter int BAUD       = 115_200,
+    parameter int PERIOD_MS  = 500,      // period between bursts
+    parameter int BURST_BYTES= 256       // how many PRBS bytes per burst
+)(
+    input  logic clk,
+    input  logic rst_n,
+    input  logic enable,     // drive with sw[1]
+    output logic tx,         // UART TX output (to board-level mux)
+    output logic active      // 1 while a burst is being transmitted
+);
+
+    // --------------------- Baud gen ---------------------
+    logic os_tick, baud_tick;
+    uart_baud_gen #(
+        .CLK_HZ(CLK_HZ),
+        .BAUD  (BAUD),
+        .OSR   (16)
+    ) u_baud (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .os_tick  (os_tick),     // unused
+        .baud_tick(baud_tick)
+    );
+
+    // --------------------- TX engine -------------------
+    logic       tx_busy_b;
+    logic       tx_start_b;
+    logic [7:0] tx_byte_b;
+
+    uart_tx_8n1 u_tx (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .baud_tick(baud_tick),
+        .tx_byte  (tx_byte_b),
+        .tx_start (tx_start_b),
+        .tx       (tx),
+        .tx_busy  (tx_busy_b)
+    );
+
+    // --------------------- PRBS7 -----------------------
+    // Polynomial x^7 + x^6 + 1 (taps at bits 6 and 5), 7-bit LFSR
+    logic [6:0] lfsr;     // must never be 0
+    function automatic [6:0] prbs7_next(input [6:0] s);
+        prbs7_next = {s[5:0], s[6] ^ s[5]};
+    endfunction
+
+    // --------------------- Period timer ----------------
+    localparam longint PERIOD_TICKS = (CLK_HZ/1000) * PERIOD_MS;
+    logic [$clog2(PERIOD_TICKS+1)-1:0] tmr;
+    logic                              tmr_expired;
+
+    // --------------------- Control FSM -----------------
+    typedef enum logic [1:0] {IDLE, WAIT_GAP, BURST} state_e;
+    state_e state;
+
+    logic [$clog2(BURST_BYTES+1)-1:0] bytes_left;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= IDLE;
+            active      <= 1'b0;
+            tmr         <= '0;
+            tmr_expired <= 1'b0;
+            bytes_left  <= '0;
+            lfsr        <= 7'h7F;  // non-zero seed
+            tx_start_b  <= 1'b0;
+            tx_byte_b   <= 8'h00;
+        end else begin
+            tx_start_b  <= 1'b0;
+            tmr_expired <= 1'b0;
+
+            // gap timer
+            if (state == WAIT_GAP) begin
+                if (tmr == PERIOD_TICKS - 1) begin
+                    tmr <= '0;
+                    tmr_expired <= 1'b1;
+                end else begin
+                    tmr <= tmr + 1'b1;
+                end
+            end else begin
+                tmr <= '0;
+            end
+
+            unique case (state)
+                IDLE: begin
+                    active <= 1'b0;
+                    if (enable) begin
+                        // start immediately, then go into periodic WAIT_GAP
+                        bytes_left <= BURST_BYTES[$clog2(BURST_BYTES+1)-1:0];
+                        state      <= BURST;
+                        active     <= 1'b1;
+                    end
+                end
+
+                WAIT_GAP: begin
+                    active <= 1'b0;
+                    if (!enable) begin
+                        state <= IDLE;
+                    end else if (tmr_expired) begin
+                        bytes_left <= BURST_BYTES[$clog2(BURST_BYTES+1)-1:0];
+                        state      <= BURST;
+                        active     <= 1'b1;
+                    end
+                end
+
+                BURST: begin
+                    active <= 1'b1;
+                    if (!enable) begin
+                        state <= IDLE;
+                    end else if (!tx_busy_b) begin
+                        // load next PRBS byte when TX is free
+                        tx_byte_b  <= {1'b0, lfsr}; // 7-bit PRBS in bits[6:0]
+                        tx_start_b <= 1'b1;
+                        lfsr       <= prbs7_next(lfsr);
+                        if (bytes_left == 0) begin
+                            // just in case: should not happen
+                            state <= WAIT_GAP;
+                        end else if (bytes_left == 1) begin
+                            bytes_left <= '0;
+                            state      <= WAIT_GAP;
+                        end else begin
+                            bytes_left <= bytes_left - 1'b1;
+                        end
+                    end
+                end
+
+                default: state <= IDLE;
+            endcase
+        end
+    end
+endmodule

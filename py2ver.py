@@ -7,6 +7,7 @@ This version emits the UART split modules and appends QSF assignments:
   - uart/uart_rx_8n1.sv
   - uart/uart_tx_8n1.sv
   - uart/uart_fifo4x8.sv
+  - uart/uart_prbs7_tx_test.sv   <-- NEW
   - uart_transceiver.sv
 """
 
@@ -162,10 +163,9 @@ class Py2ver:
         )
 
         qsf_path = project_dir / f"{project_name}.qsf"
-        self.get_template("hw/de0_nano_qsf.txt") \
-            .stream({}).dump(str(qsf_path))
+        self.get_template("hw/de0_nano_qsf.txt").stream({}).dump(str(qsf_path))
 
-        # Emit UART split modules
+        # ---------------------- Emit UART split modules ----------------------
         uart_dir = project_dir / "uart"
         uart_dir.mkdir(exist_ok=True)
 
@@ -177,6 +177,11 @@ class Py2ver:
             .stream({}).dump(str(uart_dir / "uart_tx_8n1.sv"))
         self.get_template("hw/uart/uart_fifo4x8.txt") \
             .stream({}).dump(str(uart_dir / "uart_fifo4x8.sv"))
+        # NEW: PRBS7 TX test leaf
+        self.get_template("hw/uart/uart_prbs7_tx_test.txt") \
+            .stream({}).dump(str(uart_dir / "uart_prbs7_tx_test.sv"))
+
+        # Top-level transceiver that wires submodules + bus packing
         self.get_template("hw/uart/uart_transceiver_top.txt").stream({
             "in_clk_freq": DEFAULT_CLK_FREQ,
             "baud_rate":   DEFAULT_BAUD_RATE,
@@ -191,21 +196,23 @@ class Py2ver:
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_rx_8n1.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_tx_8n1.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fifo4x8.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_prbs7_tx_test.sv\n')  # NEW
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart_transceiver.sv\n')
 
+        # SDC / wrappers / board top
         self.get_template("hw/de0_nano_sdc.txt") \
             .stream({}).dump(str(project_dir / "DE0_Nano.SDC"))
-
         self.get_template("hw/delayed_registers.txt") \
             .stream(self.syn_data).dump(str(project_dir / "delayed_registers.sv"))
-
         self.get_template("hw/de0_nano_top.txt") \
             .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
 
+        # Copy generated core HDL
         shutil.copy(self.hdl_dir / "main.v", project_dir / f"{project_name}.v")
 
         log.info("Quartus project created at %s", project_dir)
 
+        # ---- Compile ----
         log.info("Running Quartus compile...")
         result = subprocess.run(
             [quartus_sh, "--flow", "compile", project_name],
