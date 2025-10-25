@@ -149,6 +149,8 @@ wire [{{outputs_size - 1}}:0]tx_data_int;
 wire uart_tx_core;     // TX from uart_transceiver
 wire prbs_tx;          // TX from PRBS7 tester
 wire prbs_active;      // optional activity flag (unused here)
+wire pat_tx;           // TX from fixed-pattern generator
+wire pat_active;       // optional activity flag (unused here)
 
 //=======================================================
 //  Structural coding
@@ -205,10 +207,28 @@ uart_prbs7_tx_test #(
     .active (prbs_active)
 );
 
-// ------------------------- TX pin mux -----------------------------------
-assign GPIO_0_TX = SW[1] ? prbs_tx : uart_tx_core;
+// --------------------- Fixed Pattern generator (SW[2]) ------------------
+uart_fixed_pattern_tx #(
+    .CLK_HZ(50_000_000),
+    .BAUD  (115200),
+    .PERIOD_MS(200),
+    .NUM_BYTES(32)
+) u_pat_tx (
+    .clk    (CLOCK_50),
+    .rst_n  (KEY[0]),
+    .enable (SW[2]),
+    .tx     (pat_tx),
+    .active (pat_active)
+);
 
-// (Optional) expose PRBS activity on LED[1]; uncomment if desired
+// ------------------------- TX pin mux -----------------------------------
+// Priority: SW[2] (fixed pattern) > SW[1] (PRBS) > core
+assign GPIO_0_TX = SW[2] ? pat_tx :
+                   SW[1] ? prbs_tx :
+                           uart_tx_core;
+
+// (Optional) expose activity on LEDs; uncomment if desired
+// assign LED[2] = pat_active;
 // assign LED[1] = prbs_active;
 
 // Keep LEDs otherwise unchanged/unused by this template

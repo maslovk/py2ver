@@ -1,0 +1,124 @@
+// uart_fixed_pattern_tx.sv
+// Sends a repeating known 8-bit test pattern at ~PERIOD_MS interval when enable=1.
+// Useful for wiring & baud validation (no PRBS decode required).
+
+module uart_fixed_pattern_tx #(
+    parameter int CLK_HZ     = 50_000_000,
+    parameter int BAUD       = 115_200,
+    parameter int PERIOD_MS  = 200,      // period of bursts
+    parameter int NUM_BYTES  = 32        // number of bytes per burst
+)(
+    input  logic clk,
+    input  logic rst_n,
+    input  logic enable,     // control by SW bit in top
+    output logic tx,         // connect to TX mux
+    output logic active      // high during transmission of burst
+);
+
+    // --------------------- Baud gen ---------------------
+    logic os_tick, baud_tick;
+    uart_baud_gen #(
+        .CLK_HZ(CLK_HZ),
+        .BAUD  (BAUD),
+        .OSR   (16)
+    ) u_baud (
+        .clk(clk),
+        .rst_n(rst_n),
+        .os_tick(os_tick),
+        .baud_tick(baud_tick)
+    );
+
+    // --------------------- TX engine -------------------
+    logic       tx_busy_b;
+    logic       tx_start_b;
+    logic [7:0] tx_byte_b;
+
+    uart_tx_8n1 u_tx (
+        .clk(clk),
+        .rst_n(rst_n),
+        .baud_tick(baud_tick),
+        .tx_byte(tx_byte_b),
+        .tx_start(tx_start_b),
+        .tx(tx),
+        .tx_busy(tx_busy_b)
+    );
+
+    // --------------------- Pattern ROM -----------------
+    // (modify to your heart's content)
+    localparam logic [7:0] PATTERN [0:NUM_BYTES-1] = '{
+        8'h55, 8'hAA, 8'h33, 8'hCC, 8'hF0, 8'h0F, 8'h69, 8'h96,
+        8'h00, 8'hFF, 8'h77, 8'h88, 8'h3C, 8'hC3, 8'h5A, 8'hA5,
+        8'h12, 8'h34, 8'h56, 8'h78, 8'h9A, 8'hBC, 8'hDE, 8'hEF,
+        8'h13, 8'h37, 8'h7B, 8'hDB, 8'hF5, 8'hAF, 8'hC1, 8'h1C
+    };
+
+    logic [$clog2(NUM_BYTES)-1:0] idx;
+
+    // --------------------- Timer -----------------------
+    localparam longint PERIOD_TICKS = (CLK_HZ/1000) * PERIOD_MS;
+    logic [$clog2(PERIOD_TICKS+1)-1:0] tmr;
+    logic                              tmr_expired;
+
+    typedef enum logic [1:0] {IDLE, WAIT_GAP, BURST} state_e;
+    state_e state;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state       <= IDLE;
+            active      <= 1'b0;
+            tx_start_b  <= 1'b0;
+            idx         <= '0;
+            tmr         <= '0;
+            tmr_expired <= 1'b0;
+        end else begin
+            tx_start_b  <= 1'b0;
+            tmr_expired <= 1'b0;
+
+            // gap timer
+            if (state == WAIT_GAP) begin
+                if (tmr == PERIOD_TICKS - 1) begin
+                    tmr <= '0;
+                    tmr_expired <= 1'b1;
+                end else tmr <= tmr + 1'b1;
+            end else tmr <= '0;
+
+            case (state)
+                IDLE: begin
+                    active <= 1'b0;
+                    if (enable) begin
+                        idx   <= '0;
+                        state <= BURST;
+                        active <= 1'b1;
+                    end
+                end
+
+                WAIT_GAP: begin
+                    active <= 1'b0;
+                    if (!enable) begin
+                        state <= IDLE;
+                    end else if (tmr_expired) begin
+                        idx   <= '0;
+                        state <= BURST;
+                        active <= 1'b1;
+                    end
+                end
+
+                BURST: begin
+                    active <= 1'b1;
+                    if (!enable)
+                        state <= IDLE;
+                    else if (!tx_busy_b) begin
+                        tx_byte_b  <= PATTERN[idx];
+                        tx_start_b <= 1'b1;
+
+                        if (idx == NUM_BYTES - 1) begin
+                            state <= WAIT_GAP;
+                        end else begin
+                            idx <= idx + 1'b1;
+                        end
+                    end
+                end
+            endcase
+        end
+    end
+endmodule

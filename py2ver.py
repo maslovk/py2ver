@@ -7,7 +7,8 @@ This version emits the UART split modules and appends QSF assignments:
   - uart/uart_rx_8n1.sv
   - uart/uart_tx_8n1.sv
   - uart/uart_fifo4x8.sv
-  - uart/uart_prbs7_tx_test.sv   <-- NEW
+  - uart/uart_prbs7_tx_test.sv
+  - uart/uart_fixed_pattern_tx.sv   <-- NEW
   - uart_transceiver.sv
 """
 
@@ -177,9 +178,12 @@ class Py2ver:
             .stream({}).dump(str(uart_dir / "uart_tx_8n1.sv"))
         self.get_template("hw/uart/uart_fifo4x8.txt") \
             .stream({}).dump(str(uart_dir / "uart_fifo4x8.sv"))
-        # NEW: PRBS7 TX test leaf
+        # PRBS7 TX test leaf
         self.get_template("hw/uart/uart_prbs7_tx_test.txt") \
             .stream({}).dump(str(uart_dir / "uart_prbs7_tx_test.sv"))
+        # NEW: Fixed-pattern TX generator
+        self.get_template("hw/uart/uart_fixed_pattern_tx.txt") \
+            .stream({}).dump(str(uart_dir / "uart_fixed_pattern_tx.sv"))
 
         # Top-level transceiver that wires submodules + bus packing
         self.get_template("hw/uart/uart_transceiver_top.txt").stream({
@@ -196,7 +200,8 @@ class Py2ver:
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_rx_8n1.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_tx_8n1.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fifo4x8.sv\n')
-            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_prbs7_tx_test.sv\n')  # NEW
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_prbs7_tx_test.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fixed_pattern_tx.sv\n')  # NEW
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart_transceiver.sv\n')
 
         # SDC / wrappers / board top
