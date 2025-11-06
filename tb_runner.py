@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from cocotb.runner import get_runner
+from cocotb_tools.runner import get_runner
 
 
 LANGUAGE = os.getenv("HDL_TOPLEVEL_LANG", "verilog").lower().strip()

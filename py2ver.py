@@ -8,7 +8,8 @@ This version emits the UART split modules and appends QSF assignments:
   - uart/uart_tx_8n1.sv
   - uart/uart_fifo4x8.sv
   - uart/uart_prbs7_tx_test.sv
-  - uart/uart_fixed_pattern_tx.sv   <-- NEW
+  - uart/uart_fixed_pattern_tx.sv
+  - uart/uart_loopback.sv           <-- NEW
   - uart_transceiver.sv
 """
 
@@ -95,6 +96,7 @@ class Py2ver:
         self._tpl_cache: Dict[str, Any] = {}
         self.template_dir = template_dir
 
+        # Base synthesis data for Jinja tops
         self.syn_data = {
             "top_name": self.t_name,
             "inputs": [
@@ -107,6 +109,12 @@ class Py2ver:
                 for n, w in zip(self.output_args_list, self.output_args_width_list)
             ],
             "outputs_size": self.output_bits,
+            # NEW: common UART params + loopback toggles for templates
+            "CLK_HZ": DEFAULT_CLK_FREQ,
+            "BAUD": DEFAULT_BAUD_RATE,
+            "include_loopback": True,                 # render wrapper + wires
+            "loopback_enable_expr": "SW[1] & SW[2]",  # condition for LB mux
+            "force_core_loopback_off": True,          # transceiver in normal mode
         }
 
     @property
@@ -181,16 +189,24 @@ class Py2ver:
         # PRBS7 TX test leaf
         self.get_template("hw/uart/uart_prbs7_tx_test.txt") \
             .stream({}).dump(str(uart_dir / "uart_prbs7_tx_test.sv"))
-        # NEW: Fixed-pattern TX generator
+        # Fixed-pattern TX generator
         self.get_template("hw/uart/uart_fixed_pattern_tx.txt") \
             .stream({}).dump(str(uart_dir / "uart_fixed_pattern_tx.sv"))
+        # NEW: Loopback wrapper (instantiates uart_transceiver with LOOPBACK=1)
+        self.get_template("hw/uart/uart_loopback.txt") \
+            .stream({
+                "CLK_HZ": DEFAULT_CLK_FREQ,
+                "BAUD": DEFAULT_BAUD_RATE
+            }).dump(str(uart_dir / "uart_loopback.sv"))
 
         # Top-level transceiver that wires submodules + bus packing
+        # (Template must set .LOOPBACK(1'b0) when force_core_loopback_off==True)
         self.get_template("hw/uart/uart_transceiver_top.txt").stream({
             "in_clk_freq": DEFAULT_CLK_FREQ,
             "baud_rate":   DEFAULT_BAUD_RATE,
             "reg_width_tx": self.output_bits,
-            "reg_width_rx": self.input_args_bits
+            "reg_width_rx": self.input_args_bits,
+            "force_core_loopback_off": self.syn_data["force_core_loopback_off"]
         }).dump(str(project_dir / "uart_transceiver.sv"))
 
         # ✅ Append UART leafs to QSF
@@ -201,14 +217,18 @@ class Py2ver:
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_tx_8n1.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fifo4x8.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_prbs7_tx_test.sv\n')
-            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fixed_pattern_tx.sv\n')  # NEW
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fixed_pattern_tx.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_loopback.sv\n')  # NEW
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart_transceiver.sv\n')
 
         # SDC / wrappers / board top
         self.get_template("hw/de0_nano_sdc.txt") \
             .stream({}).dump(str(project_dir / "DE0_Nano.SDC"))
+
         self.get_template("hw/delayed_registers.txt") \
             .stream(self.syn_data).dump(str(project_dir / "delayed_registers.sv"))
+
+        # Top with switch-controlled loopback (lb → pat → prbs → core)
         self.get_template("hw/de0_nano_top.txt") \
             .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
 

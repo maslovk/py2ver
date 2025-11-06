@@ -1,10 +1,5 @@
 // -----------------------------------------------------------------------------
 // uart_transceiver.sv  (LOOPBACK-capable, single-writer FIFO — no multi-drivers)
-//  - 50 MHz default, 115200 baud
-//  - RX: 16x oversampling (mid-bit sampling with optional majority-of-3)
-//  - Normal: packs tx_data -> UART; RX assembles bytes -> rx_data (pulses rx_valid)
-//  - LOOPBACK=1: ignore tx_data/tx_valid; echo each received byte
-//  - baud_tick is phase-aligned to oversample_tick (derived from it)
 // -----------------------------------------------------------------------------
 module uart_transceiver #(
     parameter int CLK_HZ          = 50000000,
@@ -14,7 +9,10 @@ module uart_transceiver #(
     parameter bit LOOPBACK        = 1'b1,
     parameter int OSR             = 16,   // fixed-OSR variant assumes 16
     parameter bit RX_ENA_STOPCHK  = 1'b1, // gate output on a good stop bit
-    parameter bit RX_MAJ3         = 1'b1  // 3-sample majority around mid-bit
+    parameter bit RX_MAJ3         = 1'b1, // 3-sample majority around mid-bit
+    // >>> ADD: expose RX tuning knobs <<<
+    parameter int unsigned RX_CENTER     = 10,
+    parameter int unsigned RX_START_QUAL = 0    // 0..n os_ticks low to qualify start
 )(
     input  logic                   clk,
     input  logic                   rst_n,
@@ -43,9 +41,13 @@ module uart_transceiver #(
     // ------------------------------- RX ---------------------------------
     logic [7:0] rx_byte;
     logic       rx_byte_ready;
+
+    // >>> CHANGE: pass CENTER/START_QUAL into RX <<<
     uart_rx_8n1 #(
         .RX_ENA_STOPCHK(RX_ENA_STOPCHK),
-        .RX_MAJ3(RX_MAJ3)
+        .RX_MAJ3(RX_MAJ3),
+        .CENTER(RX_CENTER),
+        .START_QUAL(RX_START_QUAL)
     ) u_rx (
         .clk, .rst_n, .os_tick, .rx,
         .rx_byte, .rx_byte_ready, .rx_ferr
@@ -67,9 +69,6 @@ module uart_transceiver #(
     );
 
     // ------------------------------- TX ---------------------------------
-    // Byte serializer (always used). Top selects source:
-    //   - Normal: slices tx_data into bytes
-    //   - LOOPBACK: pops from FIFO
     logic       tx_start_b;
     logic [7:0] tx_byte_b;
     logic       tx_busy_b;
@@ -99,7 +98,6 @@ module uart_transceiver #(
             tx_byte_b    <= 8'h00;
             tx_byte_idx  <= '0;
             lb_pop       <= 1'b0;
-
             // RX path
             rx_byte_idx  <= '0;
             rx_accum     <= '0;
@@ -114,26 +112,23 @@ module uart_transceiver #(
             if (!tx_busy_b) begin
                 if (!LOOPBACK) begin
                     if (tx_valid) begin
-                        // load first byte
                         tx_byte_idx <= (TX_BYTES > 1) ? 1 : '0;
                         tx_byte_b   <= tx_data[7:0];          // LSB-first byte
                         tx_start_b  <= 1'b1;
                     end else if (tx_byte_idx != 0) begin
-                        // continuing multi-byte packet
                         tx_byte_b   <= tx_data[(tx_byte_idx*8) +: 8];
                         tx_start_b  <= 1'b1;
-                        if (tx_byte_idx + 1 < TX_BYTES) begin
+                        if (tx_byte_idx + 1 < TX_BYTES)
                             tx_byte_idx <= tx_byte_idx + 1'b1;
-                        end else begin
+                        else
                             tx_byte_idx <= '0;
-                        end
                     end
                 end else begin
                     // LOOPBACK: consume from FIFO whenever available
                     if (!lb_empty) begin
                         tx_byte_b  <= lb_dout;
                         tx_start_b <= 1'b1;
-                        lb_pop     <= 1'b1;  // pop the byte we just loaded
+                        lb_pop     <= 1'b1;
                     end
                 end
             end
@@ -146,8 +141,8 @@ module uart_transceiver #(
                     rx_accum    <= next_accum;
                     rx_byte_idx <= rx_byte_idx + 1'b1;
                 end else begin
-                    rx_accum    <= '0;          // optional clear
-                    rx_data     <= next_accum;  // full word ready
+                    rx_accum    <= '0;
+                    rx_data     <= next_accum;
                     rx_valid    <= 1'b1;
                     rx_byte_idx <= '0;
                 end

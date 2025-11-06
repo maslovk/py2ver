@@ -1,0 +1,56 @@
+// uart_loopback.sv — Minimal loopback wrapper around uart_transceiver
+// - Uses internal FIFO echo path (LOOPBACK=1)
+// - Exposes last received byte and a 1-clk strobe for easy probing
+module uart_loopback #(
+    parameter int CLK_HZ          = 50_000_000,
+    parameter int BAUD            = 115_200,
+    parameter bit RX_ENA_STOPCHK  = 1'b1,
+    parameter bit RX_MAJ3         = 1'b1
+)(
+    input  logic clk,
+    input  logic rst_n,
+
+    // UART pins
+    output logic tx,
+    input  logic rx,
+
+    // Optional observability
+    output logic [7:0] last_rx_byte,   // mirrors RX path output
+    output logic       last_rx_strobe, // 1-clk pulse when a byte arrives
+    output logic       rx_ferr,        // framing error pulse (bad stop)
+    output logic       lb_overflow     // loopback FIFO overflow (latched)
+);
+    // Tie-offs for unused normal TX path (ignored when LOOPBACK=1)
+    logic        tx_busy_unused;
+
+    uart_transceiver #(
+        .CLK_HZ(CLK_HZ),
+        .BAUD(BAUD),
+        .TX_WIDTH(8),     // byte-wide monitoring is convenient
+        .RX_WIDTH(8),
+        .LOOPBACK(1'b1),  // <-- enable echo
+        .OSR(16),
+        .RX_ENA_STOPCHK(RX_ENA_STOPCHK),
+        .RX_MAJ3(RX_MAJ3)
+    ) u_uart_lb (
+        .clk,
+        .rst_n,
+
+        // Normal TX path (ignored in LOOPBACK mode)
+        .tx_data      (8'h00),
+        .tx_valid     (1'b0),
+        .tx_busy      (tx_busy_unused),
+
+        // Pins
+        .tx,
+        .rx,
+
+        // RX parallel (we surface these for visibility)
+        .rx_data      (last_rx_byte),
+        .rx_valid     (last_rx_strobe),
+
+        // Status
+        .rx_ferr,
+        .lb_overflow
+    );
+endmodule

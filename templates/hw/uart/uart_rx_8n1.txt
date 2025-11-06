@@ -1,101 +1,208 @@
-// uart_rx_8n1.sv — 8N1 RX with 16× oversampling and optional maj3 mid-bit
+// -----------------------------------------------------------------------------
+// uart_rx_8n1.sv — 8N1 RX with 16× oversampling (simplified phase logic, safe guards)
+//  • Start-bit qualification (optional, level-based, safe for back-to-back frames)
+//  • CENTER tap (2..13) with optional majority-of-3
+//  • Optional polarity inversion
+//  • Emits 1-clk rx_byte_ready at end of stop bit
+//  • Parameter validity checks (fatal on misconfig)
+//  • Majority-of-3 implemented as a simple 3-sample window (rx_hist)
+// -----------------------------------------------------------------------------
 module uart_rx_8n1 #(
     parameter bit RX_ENA_STOPCHK = 1'b1,
-    parameter bit RX_MAJ3        = 1'b1
+    parameter bit RX_MAJ3        = 1'b1,   // majority disabled by default
+    parameter int unsigned CENTER = 8,     // safe range 2..13
+    parameter int unsigned START_QUAL = 0,
+    parameter bit RX_INVERT      = 1'b0
 )(
     input  logic clk,
     input  logic rst_n,
     input  logic os_tick,           // 16× oversample tick
-    input  logic rx,                // async pin
+    input  logic rx,                // async RX pin
 
-    output logic [7:0] rx_byte,     // received byte
-    output logic       rx_byte_ready, // 1-clk pulse
-    output logic       rx_ferr        // framing error pulse (bad stop)
+    output logic [7:0] rx_byte,
+    output logic       rx_byte_ready,
+    output logic       rx_ferr,
+
+    // Debug
+    output logic       commit_pulse_dbg,
+    output logic [3:0] phase_dbg,
+    output logic [3:0] bitnum_dbg
 );
-    // double-sync
+
+    // ------------------ Parameter safety checks ------------------
+    initial begin
+        if (CENTER < 2 || CENTER > 13) begin
+            $fatal(1, "uart_rx_8n1: CENTER=%0d out of safe range 2..13", CENTER);
+        end
+        if (RX_MAJ3 && (CENTER < 2 || CENTER > 13)) begin
+            $fatal(1, "uart_rx_8n1: RX_MAJ3=1 requires CENTER in [2..13], got %0d", CENTER);
+        end
+    end
+
+    // ------------------ Synchronize RX ------------------
     logic rx_s1, rx_s2;
     always_ff @(posedge clk) begin
         rx_s1 <= rx;
         rx_s2 <= rx_s1;
     end
 
-    logic [3:0] rx_os_cnt;     // 0..15
-    logic [7:0] rx_total_os;   // 0..159 over frame (10*16)
-    logic [2:0] rx_bit_idx;    // 0..7
-    logic [7:0] rx_shift;
-    logic       rx_busy_b;
-    logic       rx_stop_ok;
+    // Optional inversion
+    wire rx_eff = RX_INVERT ? ~rx_s2 : rx_s2;
 
-    // majority-of-3 around mid-bit
-    logic [1:0] maj_accum;     // 0..3
-    wire        maj_bit = (maj_accum >= 2);
+    // ------------------ State ------------------
+    logic       busy;
+    logic       arm_start;
+    logic [3:0] phase;     // 0..15 within bit
+    logic [3:0] bit_num;   // 0=start, 1..8=data, 9=stop
+    logic [7:0] shift;
+    logic       stop_ok;
 
+    // Start qualifier counter
+    localparam int SQW = (START_QUAL > 0) ? $clog2(START_QUAL+1) : 1;
+    logic [SQW-1:0] start_low_cnt;
+
+    // 3-sample history for majority-of-3
+    logic [2:0] rx_hist;
+
+    // CENTER tap as 4-bit
+    localparam logic [3:0] CENTER_4 = logic'(CENTER & 4'hF);
+
+    // ------------------ Combinational helpers ------------------
+    logic [3:0] phase_next;
+    logic       commit_en_w;
+    logic       sample_bit_w;
+    logic [3:0] bit_idx_this_tick;
+
+    always_comb begin
+        phase_next = (phase == 4'd15) ? 4'd0 : (phase + 4'd1);
+
+        // Default sample is raw rx_eff
+        if (!RX_MAJ3) begin
+            sample_bit_w = rx_eff;
+        end else begin
+            // Majority of last 3 samples in rx_hist
+            int unsigned sum;
+            sum = rx_hist[0] + rx_hist[1] + rx_hist[2];
+            sample_bit_w = (sum >= 2);
+        end
+
+        // Commit in the middle of the bit
+        commit_en_w = (phase == CENTER_4);
+
+        // Stable data index
+        if (bit_num >= 4'd1 && bit_num <= 4'd8)
+            bit_idx_this_tick = bit_num - 4'd1;
+        else
+            bit_idx_this_tick = 4'd0;
+    end
+
+    // ------------------ Sequential ------------------
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            rx_os_cnt      <= '0;
-            rx_total_os    <= '0;
-            rx_bit_idx     <= '0;
-            rx_shift       <= 8'h00;
-            rx_busy_b      <= 1'b0;
-            rx_byte_ready  <= 1'b0;
-            rx_byte        <= 8'h00;
-            rx_stop_ok     <= 1'b0;
-            rx_ferr        <= 1'b0;
-            maj_accum      <= '0;
+            busy          <= 1'b0;
+            arm_start     <= 1'b0;
+            phase         <= 4'd0;
+            bit_num       <= 4'd0;
+            shift         <= 8'h00;
+            stop_ok       <= 1'b0;
+            rx_byte       <= 8'h00;
+            rx_byte_ready <= 1'b0;
+            rx_ferr       <= 1'b0;
+            start_low_cnt <= '0;
+            rx_hist       <= 3'b000;
         end else begin
             rx_byte_ready <= 1'b0;
             rx_ferr       <= 1'b0;
 
-            if (!rx_busy_b) begin
-                if (os_tick && (rx_s2 == 1'b0)) begin
-                    rx_busy_b   <= 1'b1;
-                    rx_os_cnt   <= '0;
-                    rx_total_os <= '0;
-                    rx_bit_idx  <= '0;
-                    rx_shift    <= 8'h00;
-                    rx_stop_ok  <= 1'b0;
-                    maj_accum   <= '0;
-                end
-            end else if (os_tick) begin
-                rx_os_cnt   <= rx_os_cnt + 4'd1;
-                rx_total_os <= rx_total_os + 8'd1;
-
-                if (RX_MAJ3) begin
-                    if (rx_os_cnt == 4'd6)      maj_accum <= {1'b0, rx_s2};
-                    else if (rx_os_cnt == 4'd7) maj_accum <= maj_accum + {1'b0, rx_s2};
-                    else if (rx_os_cnt == 4'd8) maj_accum <= maj_accum + {1'b0, rx_s2};
-                end
-
-                if (!RX_MAJ3) begin
-                    if (rx_os_cnt == 4'd7) begin
-                        if (rx_total_os >= 8'd16 && rx_total_os < 8'd144) begin
-                            rx_shift[rx_bit_idx] <= rx_s2;
-                            rx_bit_idx           <= rx_bit_idx + 3'd1;
-                        end else if (rx_total_os == 8'd151) begin
-                            rx_stop_ok <= rx_s2;
-                        end
-                    end
-                end else begin
-                    if (rx_os_cnt == 4'd8) begin
-                        if (rx_total_os >= 8'd17 && rx_total_os < 8'd145) begin
-                            rx_shift[rx_bit_idx] <= maj_bit;
-                            rx_bit_idx           <= rx_bit_idx + 3'd1;
-                        end else if (rx_total_os == 8'd152) begin
-                            rx_stop_ok <= maj_bit;
-                        end
-                    end
-                end
-
-                if (rx_total_os == (16*10 - 1)) begin
-                    rx_busy_b <= 1'b0;
-                    if (!RX_ENA_STOPCHK || rx_stop_ok) begin
-                        rx_byte       <= rx_shift;
-                        rx_byte_ready <= 1'b1;
+            // ---------- Start detection / qualification (level-based) ----------
+            if (!busy) begin
+                // Count consecutive low samples on os_tick
+                if (os_tick) begin
+                    if (!rx_eff) begin
+                        if (start_low_cnt != START_QUAL[SQW-1:0])
+                            start_low_cnt <= start_low_cnt + 1'b1;
                     end else begin
-                        rx_ferr       <= 1'b1;
+                        start_low_cnt <= '0;
                     end
                 end
+
+                // Arm when RX has been low long enough (for START_QUAL=0: first low os_tick)
+                if (os_tick && !rx_eff && (start_low_cnt == START_QUAL[SQW-1:0]))
+                    arm_start <= 1'b1;
+
+                // If line returns high before we lock, abort
+                if (rx_eff)
+                    arm_start <= 1'b0;
+
+                // Align start to next os_tick
+                if (arm_start && os_tick) begin
+                    busy          <= 1'b1;
+                    arm_start     <= 1'b0;
+                    phase         <= 4'd0;    // start of start-bit
+                    bit_num       <= 4'd0;
+                    shift         <= 8'h00;
+                    stop_ok       <= 1'b0;
+                    start_low_cnt <= '0;
+                    // Seed history with current level for a clean start
+                    rx_hist       <= {3{rx_eff}};
+                end
+            end
+
+            // ---------- In-frame 16× sampling ----------
+            if (busy && os_tick) begin
+                // Update history for majority-of-3
+                if (RX_MAJ3) begin
+                    if (phase == 4'd0) begin
+                        // New bit: seed history with current level
+                        rx_hist <= {3{rx_eff}};
+                    end else begin
+                        // Shift in new sample
+                        rx_hist <= {rx_hist[1:0], rx_eff};
+                    end
+                end
+
+                // Commit mid-bit
+                if (commit_en_w) begin
+                    unique case (bit_num)
+                        4'd0: begin
+                            // Start bit must be 0
+                            if (sample_bit_w) begin
+                                busy      <= 1'b0;
+                                arm_start <= 1'b0;
+                            end
+                        end
+                        4'd1,4'd2,4'd3,4'd4,4'd5,4'd6,4'd7,4'd8:
+                            shift[bit_idx_this_tick] <= sample_bit_w; // LSB-first
+                        4'd9:
+                            stop_ok <= sample_bit_w; // stop bit must be 1
+                        default: ;
+                    endcase
+                end
+
+                // End-of-bit at phase==15
+                if (phase == 4'd15) begin
+                    if (bit_num == 4'd9) begin
+                        // Finished stop bit -> end frame
+                        busy <= 1'b0;
+                        if (!RX_ENA_STOPCHK || stop_ok) begin
+                            rx_byte       <= shift;
+                            rx_byte_ready <= 1'b1;
+                        end else
+                            rx_ferr       <= 1'b1;
+                    end else begin
+                        bit_num <= bit_num + 4'd1;
+                    end
+                end
+
+                // Advance phase
+                phase <= phase_next;
             end
         end
     end
+
+    // ------------------ Debug ------------------
+    assign commit_pulse_dbg = busy && os_tick && commit_en_w;
+    assign phase_dbg        = phase;
+    assign bitnum_dbg       = bit_num;
+
 endmodule

@@ -14,25 +14,35 @@ module uart_baud_gen #(
     initial if (OSR != 16) $error("uart_baud_gen: OSR must be 16 in this variant.");
     // synthesis translate_on
 
-    localparam int DIV_OS_TICK = (CLK_HZ + (BAUD*OSR)/2) / (BAUD*OSR);
+    // ---------------- Fractional divider (Bresenham) ----------------
+    // Each clk: acc += INC; if acc >= MOD -> os_tick=1 and acc -= MOD.
+    // Average tick rate = (INC / MOD) * fclk = (BAUD*OSR) exactly (on average).
+    localparam int unsigned INC = BAUD * OSR;   // e.g. 115200*16 = 1_843_200
+    localparam int unsigned MOD = CLK_HZ;       // e.g. 50_000_000
 
-    logic [$clog2(DIV_OS_TICK)-1:0] os_div = '0;
+    // State
+    logic [31:0] acc;            // accumulator
+    logic [32:0] sum;            // adder temp (declared outside always for Quartus)
+    logic [3:0]  osr_cnt = '0;   // 0..15 for OSR=16
+
+    // Generate oversample tick (os_tick) using fractional divider
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            os_div  <= '0;
+            acc     <= '0;
             os_tick <= 1'b0;
         end else begin
             os_tick <= 1'b0;
-            if (os_div == DIV_OS_TICK-1) begin
-                os_div  <= '0;
-                os_tick <= 1'b1;
+            sum = acc + INC;               // 33-bit add
+            if (sum >= MOD) begin
+                acc     <= sum - MOD;      // subtract modulus
+                os_tick <= 1'b1;           // 1-cycle oversample tick
             end else begin
-                os_div <= os_div + 1'b1;
+                acc <= sum[31:0];
             end
         end
     end
 
-    logic [3:0] osr_cnt = '0; // 0..15
+    // Divide os_tick by OSR to make aligned baud_tick
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             osr_cnt   <= '0;
