@@ -5,6 +5,7 @@ module uart_loopback #(
     parameter int CLK_HZ          = 50_000_000,
     parameter int BAUD            = 115_200,
     parameter bit RX_ENA_STOPCHK  = 1'b1,
+    // NOTE: we'll override RX_MAJ3 below, but keep the parameter for flexibility
     parameter bit RX_MAJ3         = 1'b1
 )(
     input  logic clk,
@@ -20,37 +21,47 @@ module uart_loopback #(
     output logic       rx_ferr,        // framing error pulse (bad stop)
     output logic       lb_overflow     // loopback FIFO overflow (latched)
 );
+
     // Tie-offs for unused normal TX path (ignored when LOOPBACK=1)
-    logic        tx_busy_unused;
+    logic tx_busy_unused;
 
     uart_transceiver #(
-        .CLK_HZ(CLK_HZ),
-        .BAUD(BAUD),
-        .TX_WIDTH(8),     // byte-wide monitoring is convenient
-        .RX_WIDTH(8),
-        .LOOPBACK(1'b1),  // <-- enable echo
-        .OSR(16),
-        .RX_ENA_STOPCHK(RX_ENA_STOPCHK),
-        .RX_MAJ3(RX_MAJ3)
+        .CLK_HZ         (CLK_HZ),
+        .BAUD           (BAUD),
+        .TX_WIDTH       (8),       // byte-wide
+        .RX_WIDTH       (8),
+        .LOOPBACK       (1'b1),    // use internal FIFO echo
+        .OSR            (16),
+
+        // RX tuning for real USB-UART host
+        .RX_ENA_STOPCHK (RX_ENA_STOPCHK),
+
+        // *** IMPORTANT CHANGES ***
+        //  - Disable majority-of-3: a late sample + majority can pull in stop bit '1's
+        //  - Sample roughly in the middle of the bit, not too far into the stop region
+        .RX_MAJ3        (1'b0),
+        .RX_CENTER      (8),   // for OSR=16: sample at 8 (mid bit)
+        .RX_START_QUAL  (2)    // require 2 os_ticks of low for start
     ) u_uart_lb (
         .clk,
         .rst_n,
 
         // Normal TX path (ignored in LOOPBACK mode)
-        .tx_data      (8'h00),
-        .tx_valid     (1'b0),
-        .tx_busy      (tx_busy_unused),
+        .tx_data  (8'h00),
+        .tx_valid (1'b0),
+        .tx_busy  (tx_busy_unused),
 
         // Pins
         .tx,
         .rx,
 
         // RX parallel (we surface these for visibility)
-        .rx_data      (last_rx_byte),
-        .rx_valid     (last_rx_strobe),
+        .rx_data  (last_rx_byte),
+        .rx_valid (last_rx_strobe),
 
         // Status
         .rx_ferr,
         .lb_overflow
     );
+
 endmodule

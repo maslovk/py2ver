@@ -37,7 +37,8 @@ def main():
                     help="do not send/wait preamble (start immediately)")
     ap.add_argument("--lock-timeout", type=float, default=0.5,
                     help="fallback to transmit if preamble echo not seen in this many seconds")
-    ap.add_argument("--rate", type=float, default=0.0, help="limit TX rate to N bytes/sec (0=unlimited)")
+    ap.add_argument("--rate", type=float, default=0.0,
+                    help="limit TX rate to N bytes/sec (0=unlimited, uses burst writes)")
     ap.add_argument("--bytes", type=int, default=0, help="stop after N bytes (0=forever)")
     ap.add_argument("--seconds", type=float, default=0.0, help="stop after N seconds (0=forever)")
     ap.add_argument("--progress", type=int, default=512, help="print progress every N sent bytes")
@@ -48,6 +49,8 @@ def main():
     ap.add_argument("--resync-scan", type=int, default=32,
                     help="on mismatch, scan ahead this many expected bytes to re-align (0=off)")
     ap.add_argument("--start", type=int, default=0, help="initial value for 'inc' pattern")
+    ap.add_argument("--quiet", action="store_true",
+                    help="do not print each TX/RX byte (only progress + summary)")
     ap.set_defaults(preamble=True)
     a = ap.parse_args()
 
@@ -56,7 +59,8 @@ def main():
                             bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
                             stopbits=serial.STOPBITS_ONE, rtscts=False, dsrdtr=False, xonxoff=False)
     except Exception as e:
-        print(f"Error opening {a.port} @ {a.baud}: {e}", file=sys.stderr); sys.exit(2)
+        print(f"Error opening {a.port} @ {a.baud}: {e}", file=sys.stderr)
+        sys.exit(2)
 
     print(f"Loopback test on {a.port} @ {a.baud} (8N1), pattern={a.pattern}, "
           f"preamble={'ON' if a.preamble else 'OFF'} — CTRL+C to stop")
@@ -64,10 +68,15 @@ def main():
     gen = PATTERNS[a.pattern](a.start) if a.pattern == "inc" else PATTERNS[a.pattern]()
     interval = (1.0 / a.rate) if a.rate > 0 else 0.0
 
+    # When rate==0 (unlimited), we send bursts of this many bytes per write()
+    BURST = 32
+
     expected = deque()      # (byte, t_send)
     sent = rcvd = mism = missed = 0
     lat_hist = deque(maxlen=2000)
-    t0 = _now(); last_tx_time = 0.0; last_rx_time = t0
+    t0 = _now()
+    last_tx_time = 0.0
+    last_rx_time = t0
     stop_at = t0 + a.seconds if a.seconds > 0 else None
 
     locked = not a.preamble
@@ -76,20 +85,24 @@ def main():
 
     if a.preamble:
         ser.reset_input_buffer()
-        ser.write(bytes([0x55, 0xAA])); ser.flush()
+        ser.write(bytes([0x55, 0xAA]))
+        ser.flush()
         print(f"Waiting for preamble echo (55 AA)… timeout {a.lock_timeout:.3f}s")
 
     def read_some():
         nonlocal last_rx_time
         rb = ser.read(ser.in_waiting or 1)
-        if rb: last_rx_time = _now()
+        if rb:
+            last_rx_time = _now()
         return rb
 
     try:
         while True:
             now = _now()
-            if stop_at and now >= stop_at: break
-            if a.bytes and sent >= a.bytes: break
+            if stop_at and now >= stop_at:
+                break
+            if a.bytes and sent >= a.bytes:
+                break
 
             # Lock fallback
             if not locked and a.preamble and lock_deadline and now >= lock_deadline:
@@ -98,13 +111,44 @@ def main():
                 expected.clear()
                 last_tx_time = now
 
-            # TX
+            # ---------------------- TX side ----------------------
             if locked and (interval == 0.0 or (now - last_tx_time) >= interval):
-                txb = next(gen) & 0xFF
-                ser.write(bytes([txb])); last_tx_time = now
-                expected.append((txb, now)); sent += 1
-                print(f"TX: 0x{txb:02X}")
+                if interval == 0.0:
+                    # Unlimited rate: send a small burst per loop to minimize inter-byte delay
+                    # but still respect the --bytes limit.
+                    if a.bytes:
+                        remaining = a.bytes - sent
+                        if remaining <= 0:
+                            pass  # will break next loop
+                        else:
+                            burst_len = min(BURST, remaining)
+                    else:
+                        burst_len = BURST
 
+                    if burst_len > 0:
+                        t_send = now
+                        buf = []
+                        for _ in range(burst_len):
+                            txb = next(gen) & 0xFF
+                            buf.append(txb)
+                            expected.append((txb, t_send))
+                            sent += 1
+                            if not a.quiet:
+                                print(f"TX: 0x{txb:02X}")
+
+                        ser.write(bytes(buf))
+                        last_tx_time = t_send
+                else:
+                    # Rate-limited mode: one byte every 'interval'
+                    txb = next(gen) & 0xFF
+                    ser.write(bytes([txb]))
+                    last_tx_time = now
+                    expected.append((txb, now))
+                    sent += 1
+                    if not a.quiet:
+                        print(f"TX: 0x{txb:02X}")
+
+                # Progress print (shared for both modes)
                 if a.progress > 0 and (sent % a.progress == 0):
                     rate_bps = sent / max(now - t0, 1e-9)
                     err = mism + missed
@@ -114,53 +158,70 @@ def main():
                     print(f"Progress: sent={sent}, recv={rcvd}, errs={err} "
                           f"(mism={mism}, missed={missed}, {err_pct:.4f}%), "
                           f"tx_rate={rate_bps:.0f} B/s, avg_rtt={lat_ms:.2f} ms, "
-                          f"{'LOCK' if locked else 'UNLOCK'}{'' if nxt is None else f', next=0x{nxt:02X}'}")
+                          f"{'LOCK' if locked else 'UNLOCK'}"
+                          f"{'' if nxt is None else f', next=0x{nxt:02X}'}")
 
-            # RX
+            # ---------------------- RX side ----------------------
             rb = read_some()
             for b in rb:
                 b = b if isinstance(b, int) else b[0]
-                print(f"RX: 0x{b:02X}")
+                if not a.quiet:
+                    print(f"RX: 0x{b:02X}")
 
                 if not locked:
                     if preamble_seq and b == preamble_seq[0]:
                         preamble_seq.popleft()
                         if not preamble_seq:
-                            locked = True; expected.clear(); last_tx_time = _now()
+                            locked = True
+                            expected.clear()
+                            last_tx_time = _now()
                             print("LOCKED on preamble.")
                     continue
 
                 if not expected:
-                    mism += 1; continue
+                    mism += 1
+                    continue
 
                 exp_b, t_send = expected[0]
                 if b == exp_b:
-                    expected.popleft(); rcvd += 1; lat_hist.append(_now() - t_send)
+                    expected.popleft()
+                    rcvd += 1
+                    lat_hist.append(_now() - t_send)
                 else:
                     if a.resync_scan > 0:
-                        idx = -1; limit = min(a.resync_scan, len(expected))
+                        idx = -1
+                        limit = min(a.resync_scan, len(expected))
                         for i in range(limit):
-                            if expected[i][0] == b: idx = i; break
+                            if expected[i][0] == b:
+                                idx = i
+                                break
                         if idx >= 0:
                             missed += idx
-                            for _ in range(idx): expected.popleft()
-                            _, t2 = expected.popleft(); rcvd += 1; lat_hist.append(_now() - t2)
+                            for _ in range(idx):
+                                expected.popleft()
+                            _, t2 = expected.popleft()
+                            rcvd += 1
+                            lat_hist.append(_now() - t2)
                             continue
                     mism += 1
 
             # Gap-based resync
+            now = _now()
             if a.gap_reset > 0 and (now - last_rx_time) > a.gap_reset:
                 if expected:
-                    missed += len(expected); expected.clear()
+                    missed += len(expected)
+                    expected.clear()
                 if a.preamble:
-                    locked = False; preamble_seq = deque([0x55, 0xAA])
+                    locked = False
+                    preamble_seq = deque([0x55, 0xAA])
                     lock_deadline = _now() + a.lock_timeout
                     print("RX gap: re-locking on preamble…")
                 last_rx_time = now
 
             # Timeout cull
             while expected and (now - expected[0][1]) > a.echo_timeout:
-                expected.popleft(); missed += 1
+                expected.popleft()
+                missed += 1
 
         # small drain
         end_wait = _now() + 0.25
@@ -168,11 +229,16 @@ def main():
             rb = read_some()
             for b in rb:
                 b = b if isinstance(b, int) else b[0]
-                print(f"RX: 0x{b:02X}")
-                if not expected: mism += 1; continue
+                if not a.quiet:
+                    print(f"RX: 0x{b:02X}")
+                if not expected:
+                    mism += 1
+                    continue
                 exp_b, t_send = expected[0]
                 if b == exp_b:
-                    expected.popleft(); rcvd += 1; lat_hist.append(_now() - t_send)
+                    expected.popleft()
+                    rcvd += 1
+                    lat_hist.append(_now() - t_send)
                 else:
                     mism += 1
 
@@ -182,11 +248,14 @@ def main():
         total_time = max(_now() - t0, 1e-9)
         err = mism + missed
         err_pct = (err * 100.0 / max(sent, 1))
-        tx_rate = sent / total_time; rx_rate = rcvd / total_time
+        tx_rate = sent / total_time
+        rx_rate = rcvd / total_time
         if lat_hist:
-            lat_avg_ms = sum(lat_hist)/len(lat_hist)*1000.0
+            lat_avg_ms = sum(lat_hist) / len(lat_hist) * 1000.0
             l = sorted(lat_hist); n = len(l)
-            p50 = l[int(0.50*(n-1))]*1000.0; p95 = l[int(0.95*(n-1))]*1000.0; p99 = l[int(0.99*(n-1))]*1000.0
+            p50 = l[int(0.50 * (n-1))] * 1000.0
+            p95 = l[int(0.95 * (n-1))] * 1000.0
+            p99 = l[int(0.99 * (n-1))] * 1000.0
         else:
             lat_avg_ms = p50 = p95 = p99 = 0.0
 
@@ -198,8 +267,10 @@ def main():
         print(f"Error rate: {err_pct:.6f}%")
         print(f"TX rate: {tx_rate:.1f} B/s, RX rate: {rx_rate:.1f} B/s")
         print(f"Latency (ms): avg={lat_avg_ms:.3f}, p50={p50:.3f}, p95={p95:.3f}, p99={p99:.3f}")
-        try: ser.close()
-        except Exception: pass
+        try:
+            ser.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()

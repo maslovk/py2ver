@@ -108,6 +108,7 @@ input       [1:0]  GPIO_1_IN;
 wire input_valid;
 wire ready;
 
+// Core-side ports
 {% for input in inputs %}
 wire [{{input.width - 1}}:0] {{ input.name }}_int;
 {% endfor %}
@@ -117,8 +118,28 @@ wire [{{output.width - 1}}:0] {{ output.name }}_int;
 wire [{{output.width - 1}}:0] {{ output.name }}_out_int;
 {% endfor %}
 
-wire [{{inputs_size - 1}}:0]  rx_data_int;
-wire [{{outputs_size - 1}}:0] tx_data_int;
+// ------------------------------------------------------
+//  Per-signal byte-aligned UART segment widths
+//  Each segment = ceil(width/8)*8 bits, with MSB padding.
+// ------------------------------------------------------
+{% for input in inputs %}
+localparam {{input.name|upper}}_SEG_WIDTH = (({{input.width}} + 7) / 8) * 8;
+{% endfor %}
+{% for output in outputs %}
+localparam {{output.name|upper}}_SEG_WIDTH = (({{output.width}} + 7) / 8) * 8;
+{% endfor %}
+
+// Total UART widths
+localparam RX_WIDTH = {% if inputs|length == 0 %}0{% else %}{% for input in inputs %}{{input.name|upper}}_SEG_WIDTH{% if not loop.last %} + {% endif %}{% endfor %}{% endif %};
+localparam TX_WIDTH = {% if outputs|length == 0 %}0{% else %}{% for output in outputs %}{{output.name|upper}}_SEG_WIDTH{% if not loop.last %} + {% endif %}{% endfor %}{% endif %};
+
+wire [RX_WIDTH-1:0] rx_data_int;
+wire [TX_WIDTH-1:0] tx_data_int;
+
+// RX segment wires (one per input)
+{% for input in inputs %}
+wire [{{input.name|upper}}_SEG_WIDTH-1:0] {{ input.name }}_seg;
+{% endfor %}
 
 // UART TX mux paths
 wire uart_tx_core;
@@ -128,7 +149,7 @@ wire pat_tx;
 wire pat_active;
 
 // ---------------- Loopback wires ----------------------
-wire lb_tx;
+wire       lb_tx;
 wire [7:0] lb_last_rx_byte;
 wire       lb_last_rx_strobe;
 wire       lb_rx_ferr;
@@ -150,93 +171,111 @@ wire en_pat  = sw2_on & ~lb_en;
 //  Structural logic
 //=======================================================
 delayed_registers delayed_registers_inst (
-    .clk(CLOCK_50),
-    .rst_n(KEY[0]),
+    .clk        (CLOCK_50),
+    .rst_n      (KEY[0]),
     .input_valid(input_valid),
 {% for output in outputs %}
-    .{{ output.name }}({{ output.name }}_int),
+    .{{ output.name }}    ({{ output.name }}_int),
     .{{ output.name }}_out({{ output.name }}_out_int),
 {% endfor %}
-    .ready(ready)
+    .ready      (ready)
 );
 
+// ------------------------------------------------------
+//  TX data packing: each output in its own byte-aligned
+//  segment, LSB bits are the value, MSB bits are zero.
+//  Segment order on UART (low -> high bits):
+//    segment0 = outputs[0], segment1 = outputs[1], ...
+// ------------------------------------------------------
 assign tx_data_int = {
-{% for output in outputs %}
-    {{ output.name }}_out_int{{ "," if not loop.last }}
+{% for output in outputs|reverse %}
+    { ({{output.name|upper}}_SEG_WIDTH-{{output.width}}){1'b0} }, {{ output.name }}_out_int{% if not loop.last %},{% endif %}
 {% endfor %}
 };
 
-assign rx_data_int = {
-{% for input in inputs %}
-    {{ input.name }}_int{{ "," if not loop.last }}
+// ------------------------------------------------------
+//  RX data unpacking: each input has its own segment.
+//  Segment order on UART (low -> high bits):
+//    segment0 = inputs[0], segment1 = inputs[1], ...
+// ------------------------------------------------------
+
+// First split into per-input segments
+assign {
+{% for input in inputs|reverse %}
+    {{ input.name }}_seg{% if not loop.last %},{% endif %}
 {% endfor %}
-};
+} = rx_data_int;
+
+// Then trim each segment's LSBs to the core input width
+{% for input in inputs %}
+assign {{ input.name }}_int = {{ input.name }}_seg[{{input.width - 1}}:0];
+{% endfor %}
 
 // ---------------- UART core transceiver ----------------
 // Normal mode only — loopback disabled here
 uart_transceiver #(
-    .CLK_HZ(50_000_000),
-    .BAUD(115200),
-    .TX_WIDTH({{outputs_size}}),
-    .RX_WIDTH({{inputs_size}}),
-    .LOOPBACK(1'b0),
-    .OSR(16)
+    .CLK_HZ   (50_000_000),
+    .BAUD     (115200),
+    .TX_WIDTH (TX_WIDTH),
+    .RX_WIDTH (RX_WIDTH),
+    .LOOPBACK (1'b0),
+    .OSR      (16)
 ) uart_transceiver_inst(
-    .clk(CLOCK_50),
-    .rst_n(KEY[0]),
-    .tx_data(tx_data_int),
-    .tx_valid(ready),
-    .tx(uart_tx_core),
-    .rx(GPIO_0_RX),
-    .rx_data(rx_data_int),
-    .rx_valid(input_valid),
-    .tx_busy()
+    .clk      (CLOCK_50),
+    .rst_n    (KEY[0]),
+    .tx_data  (tx_data_int),
+    .tx_valid (ready),
+    .tx       (uart_tx_core),
+    .rx       (GPIO_0_RX),
+    .rx_data  (rx_data_int),
+    .rx_valid (input_valid),
+    .tx_busy  ()
 );
 
 // ---------------- Standalone LOOPBACK core -------------
 uart_loopback #(
-    .CLK_HZ(50_000_000),
-    .BAUD(115200),
+    .CLK_HZ        (50_000_000),
+    .BAUD          (115200),
     .RX_ENA_STOPCHK(1'b1),
-    .RX_MAJ3(1'b1)
+    .RX_MAJ3       (1'b1)
 ) u_uart_lb (
-    .clk(CLOCK_50),
-    .rst_n(KEY[0]),
-    .tx(lb_tx),
-    .rx(GPIO_0_RX),
-    .last_rx_byte(lb_last_rx_byte),
+    .clk           (CLOCK_50),
+    .rst_n         (KEY[0]),
+    .tx            (lb_tx),
+    .rx            (GPIO_0_RX),
+    .last_rx_byte  (lb_last_rx_byte),
     .last_rx_strobe(lb_last_rx_strobe),
-    .rx_ferr(lb_rx_ferr),
-    .lb_overflow(lb_overflow)
+    .rx_ferr       (lb_rx_ferr),
+    .lb_overflow   (lb_overflow)
 );
 
 // ---------------- PRBS7 TX tester ----------------------
 uart_prbs7_tx_test #(
-    .CLK_HZ(50_000_000),
-    .BAUD(115200),
-    .PERIOD_MS(500),
+    .CLK_HZ     (50_000_000),
+    .BAUD       (115200),
+    .PERIOD_MS  (500),
     .BURST_BYTES(256),
-    .PREAMBLE(1'b1)
+    .PREAMBLE   (1'b1)
 ) u_prbs_tx (
-    .clk(CLOCK_50),
-    .rst_n(KEY[0]),
-    .enable(en_prbs),        // gated by loopback
-    .tx(prbs_tx),
-    .active(prbs_active)
+    .clk    (CLOCK_50),
+    .rst_n  (KEY[0]),
+    .enable (en_prbs),        // gated by loopback
+    .tx     (prbs_tx),
+    .active (prbs_active)
 );
 
 // -------------- Fixed Pattern TX generator -------------
 uart_fixed_pattern_tx #(
-    .CLK_HZ(50_000_000),
-    .BAUD(115200),
-    .PERIOD_MS(200),
-    .NUM_BYTES(32)
+    .CLK_HZ    (50_000_000),
+    .BAUD      (115200),
+    .PERIOD_MS (200),
+    .NUM_BYTES (32)
 ) u_pat_tx (
-    .clk(CLOCK_50),
-    .rst_n(KEY[0]),
-    .enable(en_pat),         // gated by loopback
-    .tx(pat_tx),
-    .active(pat_active)
+    .clk    (CLOCK_50),
+    .rst_n  (KEY[0]),
+    .enable (en_pat),         // gated by loopback
+    .tx     (pat_tx),
+    .active (pat_active)
 );
 
 // ---------------- TX output mux ------------------------
@@ -249,21 +288,21 @@ assign GPIO_0_TX = lb_en   ? lb_tx    :
 // ---------------- LED status ---------------------------
 // LED[0]=loopback selected, [1]=PRBS selected, [2]=PAT selected
 // LED[3]=RX pin activity,  [4]=TX pin activity
-assign LED[0] = lb_en;
-assign LED[1] = en_prbs;
-assign LED[2] = en_pat;
-assign LED[3] = GPIO_0_RX;
-assign LED[4] = GPIO_0_TX;
+assign LED[0]   = lb_en;
+assign LED[1]   = en_prbs;
+assign LED[2]   = en_pat;
+assign LED[3]   = GPIO_0_RX;
+assign LED[4]   = GPIO_0_TX;
 assign LED[7:5] = 3'b000;
 
 // ---------------- Main Core ----------------------------
 {{ top_name }} {{ top_name }}_inst(
     .clk(CLOCK_50),
 {% for input in inputs %}
-    .{{ input.name }}({{ input.name }}_int){{ "," if not loop.last or outputs|length > 0 }}
+    .{{ input.name }}({{ input.name }}_int){% if not loop.last or outputs|length > 0 %},{% endif %}
 {% endfor %}
 {% for output in outputs %}
-    .{{ output.name }}({{ output.name }}_int){{ "," if not loop.last }}
+    .{{ output.name }}({{ output.name }}_int){% if not loop.last %},{% endif %}
 {% endfor %}
 );
 

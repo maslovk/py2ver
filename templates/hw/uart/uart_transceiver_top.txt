@@ -10,9 +10,11 @@ module uart_transceiver #(
     parameter int OSR             = 16,   // fixed-OSR variant assumes 16
     parameter bit RX_ENA_STOPCHK  = 1'b1, // gate output on a good stop bit
     parameter bit RX_MAJ3         = 1'b1, // 3-sample majority around mid-bit
-    // >>> ADD: expose RX tuning knobs <<<
-    parameter int unsigned RX_CENTER     = 10,
-    parameter int unsigned RX_START_QUAL = 0    // 0..n os_ticks low to qualify start
+    // RX tuning knobs
+    // For OSR=16, center 7–8 is a more typical mid-bit sampling region.
+    parameter int unsigned RX_CENTER     = 8,
+    // Require a few consecutive low samples to qualify start bit
+    parameter int unsigned RX_START_QUAL = 2    // 0..n os_ticks low to qualify start
 )(
     input  logic                   clk,
     input  logic                   rst_n,
@@ -28,8 +30,24 @@ module uart_transceiver #(
     output logic                   rx_valid,
     // Status (optional)
     output logic                   rx_ferr,      // framing error (bad stop) pulse
-    output logic                   lb_overflow   // loopback FIFO overflow latched
+    output logic                   lb_overflow,  // loopback FIFO overflow latched
+    // Debug bus for cocotb + SignalTap
+    (* keep = "true" *) output logic [31:0]      dbg_bus
 );
+
+    // -------------------- Debug banner (version check) --------------------
+    localparam int TX_BYTES = (TX_WIDTH + 7) / 8;
+    localparam int RX_BYTES = (RX_WIDTH + 7) / 8;
+
+    initial begin
+        $display("------------------------------------------------------------");
+        $display(" UART_TRANSCEIVER DEBUG:");
+        $display("   TX_WIDTH=%0d, TX_BYTES=%0d", TX_WIDTH, TX_BYTES);
+        $display("   RX_WIDTH=%0d, RX_BYTES=%0d", RX_WIDTH, RX_BYTES);
+        $display("   LOOPBACK=%0b", LOOPBACK);
+        $display("------------------------------------------------------------");
+    end
+
     // ------------------------- Baud / Oversample -------------------------
     logic os_tick, baud_tick;
     uart_baud_gen #(
@@ -38,11 +56,31 @@ module uart_transceiver #(
         .clk, .rst_n, .os_tick, .baud_tick
     );
 
+    // -------------------------- 1 MHz sample enable ----------------------
+    // Divide system clock down to ~1 MHz sample enable (for SignalTap qualifier)
+    localparam int SAMPLE_DIV = (CLK_HZ / 1_000_000);  // 50_000_000 / 1_000_000 = 50
+    logic [$clog2(SAMPLE_DIV)-1:0] samp_cnt;
+    logic                          samp_ce;   // 1-cycle pulse at ~1 MHz
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            samp_cnt <= '0;
+            samp_ce  <= 1'b0;
+        end else begin
+            if (samp_cnt == SAMPLE_DIV-1) begin
+                samp_cnt <= '0;
+                samp_ce  <= 1'b1;
+            end else begin
+                samp_cnt <= samp_cnt + 1'b1;
+                samp_ce  <= 1'b0;
+            end
+        end
+    end
+
     // ------------------------------- RX ---------------------------------
     logic [7:0] rx_byte;
     logic       rx_byte_ready;
 
-    // >>> CHANGE: pass CENTER/START_QUAL into RX <<<
     uart_rx_8n1 #(
         .RX_ENA_STOPCHK(RX_ENA_STOPCHK),
         .RX_MAJ3(RX_MAJ3),
@@ -71,7 +109,7 @@ module uart_transceiver #(
     // ------------------------------- TX ---------------------------------
     logic       tx_start_b;
     logic [7:0] tx_byte_b;
-    logic       tx_busy_b;
+    logic       tx_busy_b;   // byte-level busy from uart_tx_8n1
 
     uart_tx_8n1 u_tx (
         .clk, .rst_n, .baud_tick,
@@ -79,14 +117,25 @@ module uart_transceiver #(
         .tx, .tx_busy(tx_busy_b)
     );
 
-    assign tx_busy = tx_busy_b;
+    // Word-level TX state
+    logic       tx_word_busy;        // busy for an entire TX word
+    logic [TX_WIDTH-1:0]           tx_shift;
+    logic [$clog2(TX_BYTES+1)-1:0] tx_bytes_left;
 
-    // ---------------------- Normal-mode byte slicer ----------------------
-    localparam int TX_BYTES = (TX_WIDTH + 7) / 8;
-    logic [$clog2(TX_BYTES):0] tx_byte_idx;
+    // Previous byte-level busy to detect "byte done" edge
+    logic tx_busy_q;
+    logic tx_done_edge;
+
+    always_comb begin
+        tx_done_edge = tx_busy_q && !tx_busy_b;  // 1->0 edge of tx_busy_b
+    end
+
+    // Exported busy:
+    //  - In normal mode: whole-word busy
+    //  - In loopback mode: raw byte-level busy (as before)
+    assign tx_busy = LOOPBACK ? tx_busy_b : tx_word_busy;
 
     // ---------------------- RX parallel assembler -----------------------
-    localparam int RX_BYTES = (RX_WIDTH + 7) / 8;
     logic [$clog2(RX_BYTES):0] rx_byte_idx;
     logic [RX_WIDTH-1:0]       rx_accum, next_accum;
 
@@ -94,49 +143,76 @@ module uart_transceiver #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             // TX path
-            tx_start_b   <= 1'b0;
-            tx_byte_b    <= 8'h00;
-            tx_byte_idx  <= '0;
-            lb_pop       <= 1'b0;
+            tx_start_b    <= 1'b0;
+            tx_byte_b     <= 8'h00;
+            tx_word_busy  <= 1'b0;
+            tx_shift      <= '0;
+            tx_bytes_left <= '0;
+            tx_busy_q     <= 1'b0;
+            lb_pop        <= 1'b0;
             // RX path
-            rx_byte_idx  <= '0;
-            rx_accum     <= '0;
-            rx_data      <= '0;
-            rx_valid     <= 1'b0;
+            rx_byte_idx   <= '0;
+            rx_accum      <= '0;
+            rx_data       <= '0;
+            rx_valid      <= 1'b0;
         end else begin
+            // defaults
             tx_start_b <= 1'b0;
             lb_pop     <= 1'b0;
             rx_valid   <= 1'b0;
 
-            // ----------------------- TX producer ------------------------
-            if (!tx_busy_b) begin
-                if (!LOOPBACK) begin
+            // track previous byte-level busy
+            tx_busy_q <= tx_busy_b;
+
+            // ----------------------- TX (normal mode) -------------------
+            if (!LOOPBACK) begin
+                // If we're idle at the word level, accept a new word when tx_valid pulses
+                if (!tx_word_busy) begin
                     if (tx_valid) begin
-                        tx_byte_idx <= (TX_BYTES > 1) ? 1 : '0;
-                        tx_byte_b   <= tx_data[7:0];          // LSB-first byte
-                        tx_start_b  <= 1'b1;
-                    end else if (tx_byte_idx != 0) begin
-                        tx_byte_b   <= tx_data[(tx_byte_idx*8) +: 8];
-                        tx_start_b  <= 1'b1;
-                        if (tx_byte_idx + 1 < TX_BYTES)
-                            tx_byte_idx <= tx_byte_idx + 1'b1;
-                        else
-                            tx_byte_idx <= '0;
+                        // Start a new word: send LSB byte first
+                        tx_byte_b     <= tx_data[7:0];
+                        tx_start_b    <= 1'b1;
+                        tx_word_busy  <= 1'b1;
+
+                        if (TX_BYTES > 1) begin
+                            tx_shift      <= tx_data >> 8;
+                            tx_bytes_left <= TX_BYTES - 1;
+                        end else begin
+                            tx_shift      <= '0;
+                            tx_bytes_left <= '0;
+                        end
                     end
+
                 end else begin
-                    // LOOPBACK: consume from FIFO whenever available
-                    if (!lb_empty) begin
-                        tx_byte_b  <= lb_dout;
-                        tx_start_b <= 1'b1;
-                        lb_pop     <= 1'b1;
+                    // Word in progress: on each completed byte, send the next one (if any)
+                    if (tx_done_edge) begin
+                        if (tx_bytes_left != '0) begin
+                            tx_byte_b     <= tx_shift[7:0];
+                            tx_start_b    <= 1'b1;
+                            tx_shift      <= tx_shift >> 8;
+                            tx_bytes_left <= tx_bytes_left - 1;
+                        end else begin
+                            // All bytes of this word have been sent
+                            tx_word_busy  <= 1'b0;
+                        end
                     end
+                end
+
+            end else begin
+                // ----------------------- TX (loopback mode) -------------
+                // Old behavior: stream bytes from the RX FIFO whenever TX is idle
+                if (!tx_busy_b && !lb_empty) begin
+                    tx_byte_b  <= lb_dout;
+                    tx_start_b <= 1'b1;
+                    lb_pop     <= 1'b1;
                 end
             end
 
             // ----------------------- RX assembler -----------------------
             if (rx_byte_ready) begin
                 next_accum = rx_accum;
-                next_accum[(rx_byte_idx*8) +: 8] = rx_byte; // LSB-first
+                // LSB-first byte packing
+                next_accum[(rx_byte_idx*8) +: 8] = rx_byte;
                 if (rx_byte_idx + 1 < RX_BYTES) begin
                     rx_accum    <= next_accum;
                     rx_byte_idx <= rx_byte_idx + 1'b1;
@@ -149,4 +225,49 @@ module uart_transceiver #(
             end
         end
     end
+
+    // ---------------------------- Debug bus -----------------------------
+
+    // Use these to avoid out-of-range slicing warnings
+    localparam int RX_IDX_BITS   = $bits(rx_byte_idx);
+    localparam int TX_LEFT_BITS  = $bits(tx_bytes_left);
+
+    always_comb begin
+        dbg_bus = '0;
+
+        // basic I/O + status
+        dbg_bus[0]  = rx;
+        dbg_bus[1]  = tx;
+        dbg_bus[2]  = rx_valid;
+        dbg_bus[3]  = rx_ferr;
+
+        // TX state
+        dbg_bus[4]  = tx_busy_b;
+        dbg_bus[5]  = tx_word_busy;
+        dbg_bus[6]  = tx_start_b;
+
+        // Loopback FIFO
+        dbg_bus[7]    = lb_push;
+        dbg_bus[8]    = lb_pop;
+        dbg_bus[11:9] = lb_count;   // 3 bits
+        dbg_bus[12]   = lb_empty;
+        dbg_bus[13]   = lb_full;
+        dbg_bus[14]   = lb_overflow;
+
+        // Baud / oversample ticks
+        dbg_bus[15] = os_tick;
+        dbg_bus[16] = baud_tick;
+
+        // RX byte index: pack using its *actual* width; zero-extend to 4 bits
+        dbg_bus[20:17] = { {(4-RX_IDX_BITS){1'b0}}, rx_byte_idx };
+
+        // TX bytes left: likewise zero-extend to 4 bits
+        dbg_bus[24:21] = { {(4-TX_LEFT_BITS){1'b0}}, tx_bytes_left };
+
+        // 1 MHz sample enable for SignalTap qualifier
+        dbg_bus[25] = samp_ce;
+
+        // dbg_bus[31:26] remain free for future debug taps
+    end
+
 endmodule

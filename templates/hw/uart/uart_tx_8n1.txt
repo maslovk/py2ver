@@ -1,32 +1,41 @@
-// uart_tx_8n1.sv — 8N1 TX byte serializer (loads on tx_start)
 module uart_tx_8n1 (
     input  logic       clk,
     input  logic       rst_n,
     input  logic       baud_tick,      // 1× baud tick
     input  logic [7:0] tx_byte,        // byte to send
-    input  logic       tx_start,       // 1-clk strobe to start this byte
+    input  logic       tx_start,       // 1-clk strobe to request this byte
 
     output logic       tx,             // UART TX pin
     output logic       tx_busy         // high while shifting 10 bits
 );
     logic [9:0] shifter;    // {stop(1), data[7:0], start(0)}
     logic [3:0] bit_cnt;    // 0..9
+    logic       pending;    // latched request
 
     assign tx = shifter[0];
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            shifter <= 10'h3FF; // idle high
+            shifter <= 10'h3FF;  // idle high
             bit_cnt <= '0;
             tx_busy <= 1'b0;
+            pending <= 1'b0;
         end else begin
+            // Latch a start request whenever we're idle.
+            // (If you ever accidentally stretch tx_start, this still behaves.)
+            if (!tx_busy && tx_start)
+                pending <= 1'b1;
+
             if (!tx_busy) begin
-                if (tx_start) begin
+                // Only actually start sending on a baud_tick
+                if (baud_tick && pending) begin
                     shifter <= {1'b1, tx_byte, 1'b0};
                     bit_cnt <= 4'd0;
                     tx_busy <= 1'b1;
+                    pending <= 1'b0;
                 end
             end else if (baud_tick) begin
+                // In-frame bit shifting, all edges aligned to baud_tick
                 shifter <= {1'b1, shifter[9:1]};
                 bit_cnt <= bit_cnt + 1'b1;
                 if (bit_cnt == 4'd9) begin
