@@ -297,7 +297,7 @@ assign LED[7:5] = 3'b000;
 
 // ---------------- Main Core ----------------------------
 {{ top_name }} {{ top_name }}_inst(
-    .clk(CLOCK_50),
+    //.clk(CLOCK_50),
 {% for input in inputs %}
     .{{ input.name }}({{ input.name }}_int){% if not loop.last or outputs|length > 0 %},{% endif %}
 {% endfor %}

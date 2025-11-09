@@ -11,26 +11,25 @@ def foo(arg1, arg2):
     d = arg1 / arg2
     return a, b, c, d
 
-e = foo(3,1)
-print (e)
-
-attr = {'arg1': {'signed': 0, 'width': 8},
-        'arg2': {'signed': 0, 'width': 8},
-        'a': {'signed': 0, 'width': 9, 'type' : 'reg'},
-        'b': {'signed': 1, 'width': 9},
-        'c': {'signed': 0, 'width': 9},
-        'd': {'signed': 0, 'width': 9},
-        }
-
-foo_tb = Py2ver(foo, attr).TB()
-
-syn_attr ={'QUARTUS_DIR':'/opt/intelFPGA/22.1std/quartus/bin'
-
+attr = {
+    'arg1': {'signed': 0, 'width': 8},
+    'arg2': {'signed': 0, 'width': 8},
+    'a':    {'signed': 0, 'width': 9},
+    'b':    {'signed': 1, 'width': 9},
+    'c':    {'signed': 0, 'width': 9},
+    'd':    {'signed': 0, 'width': 9},
 }
 
-foo_hw = Py2ver(foo, attr).HW(syn_attr)
+syn_attr = {
+    'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'
+}
 
-g = foo_tb(4,4)
-foo_hw()
-print(g)
+p = Py2ver(foo, attr)
 
+foo_tb = p.TB()
+foo_hw = p.HW(syn_attr)
+
+g = foo_tb(4, 4)   # simulation result
+h = foo_hw(4, 4)   # "hardware" result (currently same as TB)
+print("TB:", g)
+print("HW:", h)

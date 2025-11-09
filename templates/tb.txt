@@ -18,10 +18,6 @@ async def save_results(ret_val):
 # Start a testcase
 @cocotb.test()
 async def tb_test(dut):
-{% if period > 0 %}
-    cocotb.start_soon(Clock(dut.clk, {{ period }}, units="ms").start())
-    await RisingEdge(dut.clk)
-{% endif %}
 {% for arg in in_args %}
     dut.{{ arg[0] }}.value = {{ arg[1] }}
 {% endfor %}

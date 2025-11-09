@@ -9,8 +9,15 @@ This version emits the UART split modules and appends QSF assignments:
   - uart/uart_fifo4x8.sv
   - uart/uart_prbs7_tx_test.sv
   - uart/uart_fixed_pattern_tx.sv
-  - uart/uart_loopback.sv           <-- NEW
-  - uart_transceiver.sv
+  - uart/uart_loopback.sv
+  - uart/uart_transceiver.sv
+
+Top-level:
+  - DE0_Nano.v (template you provided) instantiates:
+      * delayed_registers
+      * uart_transceiver (LOOPBACK=0, TX_WIDTH/RX_WIDTH from SEG_WIDTH sums)
+      * uart_loopback + PRBS + pattern generators
+      * your generated core: <top_name>
 """
 
 from __future__ import annotations
@@ -31,6 +38,11 @@ import tb_runner
 from renderer import Renderer
 from visitor import FunctionVisitor
 
+try:
+    import serial  # pyserial
+except Exception:
+    serial = None  # handled gracefully later
+
 # --------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------
@@ -44,7 +56,7 @@ log = logging.getLogger(__name__)
 
 
 class Py2ver:
-    """Main pipeline for Python → Verilog + optional testbench + Quartus."""
+    """Main pipeline for Python → Verilog + optional testbench + Quartus + UART HW I/O."""
 
     t_name: str = ""
 
@@ -67,16 +79,31 @@ class Py2ver:
         self.input_args_width_list = [p.width for p in ir.inputs if p.kind != "clk"]
         self.output_args_width_list = [p.width for p in ir.outputs]
 
+        # Raw IR bit widths (core widths)
         self.input_args_bits = sum(self.input_args_width_list)
         self.output_bits = sum(self.output_args_width_list)
         self.attr = attr
 
+        # ---------------------- Segment widths (UART) ----------------------
+        # Match DE0_Nano.v:
+        #   localparam FOO_SEG_WIDTH = ((FOO_WIDTH + 7)/8)*8;
+        #   RX_WIDTH = sum of *_SEG_WIDTH for inputs
+        #   TX_WIDTH = sum of *_SEG_WIDTH for outputs
+        self.input_seg_widths = [((w + 7) // 8) * 8 for w in self.input_args_width_list]
+        self.output_seg_widths = [((w + 7) // 8) * 8 for w in self.output_args_width_list]
+
+        self.rx_width = sum(self.input_seg_widths)
+        self.tx_width = sum(self.output_seg_widths)
+
         log.info(
-            "IR built: module=%s, inputs=%s (%d bits), outputs=%s (%d bits)",
-            self.t_name, self.input_args_list, self.input_args_bits,
-            self.output_args_list, self.output_bits
+            "IR built: module=%s, inputs=%s (%d bits core, %d bits UART), "
+            "outputs=%s (%d bits core, %d bits UART)",
+            self.t_name,
+            self.input_args_list, self.input_args_bits, self.rx_width,
+            self.output_args_list, self.output_bits, self.tx_width
         )
 
+        # ------------------------ Generate core HDL ------------------------
         renderer = Renderer(template_dir)
         verilog_text = renderer.render_module(ir)
 
@@ -88,6 +115,7 @@ class Py2ver:
         hdl_path.write_text(verilog_text, encoding="utf-8")
         log.info("Generated HDL written to %s", hdl_path)
 
+        # ---------------------- Jinja env & syn_data -----------------------
         self.env = Environment(
             loader=FileSystemLoader(str(template_dir)),
             undefined=StrictUndefined,
@@ -96,7 +124,6 @@ class Py2ver:
         self._tpl_cache: Dict[str, Any] = {}
         self.template_dir = template_dir
 
-        # Base synthesis data for Jinja tops
         self.syn_data = {
             "top_name": self.t_name,
             "inputs": [
@@ -109,13 +136,22 @@ class Py2ver:
                 for n, w in zip(self.output_args_list, self.output_args_width_list)
             ],
             "outputs_size": self.output_bits,
-            # NEW: common UART params + loopback toggles for templates
+            # UART / loopback params for DE0_Nano template
             "CLK_HZ": DEFAULT_CLK_FREQ,
             "BAUD": DEFAULT_BAUD_RATE,
             "include_loopback": True,                 # render wrapper + wires
             "loopback_enable_expr": "SW[1] & SW[2]",  # condition for LB mux
-            "force_core_loopback_off": True,          # transceiver in normal mode
+            "force_core_loopback_off": True,          # transceiver in normal mode (LOOPBACK=0)
         }
+
+        # HW / UART state
+        self._hw_ok: bool = False
+        self.syn_attr: Dict[str, Any] = {}
+        self._uart = None  # type: ignore
+
+    # --------------------------------------------------------------------
+    # Helpers
+    # --------------------------------------------------------------------
 
     @property
     def _hw_root(self) -> Path:
@@ -138,27 +174,211 @@ class Py2ver:
         return (n ^ sign_bit) - sign_bit
 
     # ------------------------------------------------------------------------
+    # Bit packing helpers for UART protocol (matches DE0_Nano + uart_transceiver)
+    # ------------------------------------------------------------------------
+
+    def _pack_inputs(self, *in_arg: Any) -> bytes:
+        """
+        Pack input arguments into a little-endian bit-vector with per-signal
+        byte-aligned segments.
+
+        Matches DE0_Nano.v RX side:
+
+          localparam FOO_SEG_WIDTH = ((FOO_WIDTH+7)/8)*8;
+
+          // RX_WIDTH is sum of FOO_SEG_WIDTH
+          assign { ..., input1_seg, input0_seg } = rx_data_int;
+          assign input0_int = input0_seg[FOO0_WIDTH-1:0];
+          assign input1_int = input1_seg[FOO1_WIDTH-1:0];
+
+        So we do:
+          - For each input i:
+              * segment width SEG_WIDTH[i]
+              * write value into lower 'width[i]' bits of that segment
+              * upper bits remain 0
+          - Concatenate segments in order inputs[0] (LSB) .. inputs[N-1] (MSB).
+        """
+        acc = 0
+        bit_offset = 0
+
+        for idx, (name, width, seg_width) in enumerate(
+            zip(self.input_args_list,
+                self.input_args_width_list,
+                self.input_seg_widths)
+        ):
+            v = in_arg[idx] if idx < len(in_arg) else 0
+            v = int(v) & ((1 << width) - 1)
+            # Place v in the LSBs of this segment
+            acc |= (v << bit_offset)
+            bit_offset += seg_width  # move by SEG_WIDTH, not raw width
+
+        num_bytes = (self.rx_width + 7) // 8  # should already be multiple of 8
+        return acc.to_bytes(num_bytes, byteorder="little")
+
+    def _unpack_outputs(self, data: bytes) -> Tuple[int, ...]:
+        """
+        Unpack output bytes (little-endian) into a tuple of ints in the
+        order of self.output_args_list, applying signedness.
+
+        Matches DE0_Nano.v TX side:
+
+          localparam FOO_SEG_WIDTH = ((FOO_WIDTH+7)/8)*8;
+
+          assign tx_data_int = {
+              { (FOO_N_SEG_WIDTH-FOO_N_WIDTH){1'b0} }, foo_n_out_int,
+              ...
+              { (FOO_0_SEG_WIDTH-FOO_0_WIDTH){1'b0} }, foo_0_out_int
+          };
+
+        i.e., segments concatenated outputs[0] at LSB, outputs[1] above, etc.
+        """
+        if not data:
+            return tuple(0 for _ in self.output_args_list)
+
+        acc = int.from_bytes(data, byteorder="little")
+        outs: List[int] = []
+        bit_offset = 0
+
+        for name, width, seg_width in zip(
+            self.output_args_list,
+            self.output_args_width_list,
+            self.output_seg_widths
+        ):
+            seg_mask = (1 << seg_width) - 1 if seg_width > 0 else 0
+            seg = (acc >> bit_offset) & seg_mask
+            bit_offset += seg_width
+
+            # Extract the actual value from the LSB bits of the segment
+            mask_val = (1 << width) - 1 if width > 0 else 0
+            v = seg & mask_val
+
+            if self.attr.get(name, {}).get("signed") == 1:
+                v = self.tosigned(v, width)
+            outs.append(v)
+
+        return tuple(outs)
+
+    # ------------------------------------------------------------------------
     # Hardware flow
     # ------------------------------------------------------------------------
 
-    def HW(self, syn_attr: Dict[str, Any]) -> Callable[..., int]:
+    def HW(self, syn_attr: Dict[str, Any]) -> Callable[..., Tuple[int, ...]]:
+        """
+        Synthesis / hardware flow.
+
+        syn_attr must contain:
+            'QUARTUS_DIR': path to quartus/bin
+        and may contain:
+            'UART_PORT':    serial port (default '/dev/ttyUSB0')
+            'UART_BAUD':    baud rate (default DEFAULT_BAUD_RATE)
+            'UART_TIMEOUT': read timeout in seconds (default 1.0)
+
+        Returns:
+            hw_fun(*args) -> tuple of outputs (same shape as TB()).
+        """
         self.syn_attr = syn_attr
-        self.createHWproject()
-        return self.hw_run
+        self._hw_ok = self.createHWproject()
+        return self.hw_fun
+
+    def hw_fun(self, *in_arg: Any) -> Tuple[int, ...]:
+        """
+        Hardware runner.
+
+        Flow:
+          - If Quartus or UART is unavailable, fall back to tb_fun().
+          - Otherwise:
+              * pack inputs into RX_WIDTH bits (byte-aligned segments)
+              * write RX_BYTES to UART
+              * read back TX_BYTES
+              * unpack to tuple of outputs
+        """
+        if not getattr(self, "_hw_ok", False):
+            log.error("HW() called but Quartus project/compile failed; "
+                      "falling back to simulation result.")
+            return self.tb_fun(*in_arg)
+
+        if serial is None:
+            log.error("pyserial not available; falling back to simulation result.")
+            return self.tb_fun(*in_arg)
+
+        port = self.syn_attr.get("UART_PORT", "/dev/ttyUSB0")
+        baud = int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE))
+        timeout = float(self.syn_attr.get("UART_TIMEOUT", 1.0))
+
+        input_bytes = self._pack_inputs(*in_arg)
+        output_bytes_expected = (self.tx_width + 7) // 8
+
+        try:
+            with serial.Serial(port, baudrate=baud, timeout=timeout) as ser:
+                log.info("Opened UART port %s @ %d baud", port, baud)
+
+                try:
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
+
+                # --- Send input payload ---
+                log.debug("Sending %d input bytes: %s",
+                          len(input_bytes), input_bytes.hex(" "))
+                ser.write(input_bytes)
+                ser.flush()
+
+                # --- Read response ---
+                resp = b""
+                while len(resp) < output_bytes_expected:
+                    chunk = ser.read(output_bytes_expected - len(resp))
+                    if not chunk:
+                        break
+                    resp += chunk
+
+                # ✅ NEW: raw byte logging
+                if len(resp) == 0:
+                    log.error("UART: No data received.")
+                else:
+                    log.info("Received %d bytes: %s",
+                             len(resp), resp.hex(" "))
+
+                if len(resp) != output_bytes_expected:
+                    log.error("UART: expected %d bytes, got %d; "
+                              "falling back to simulation result.",
+                              output_bytes_expected, len(resp))
+                    return self.tb_fun(*in_arg)
+
+                # --- Decode ---
+                outs = self._unpack_outputs(resp)
+                log.info("Decoded HW outputs: %s", outs)
+                return outs
+
+        except Exception as e:
+            log.error("UART communication failed (%s); falling back to simulation.", e)
+            return self.tb_fun(*in_arg)
 
     def hw_run(self) -> int:
+        """
+        Legacy HW runner placeholder (kept for compatibility).
+        Not used by the new HW()/hw_fun path.
+        """
         return 1
 
-    def createHWproject(self) -> None:
+    def createHWproject(self) -> bool:
+        """
+        Create Quartus project, emit all HDL, run compile, and attempt
+        to program the FPGA.
+
+        Returns:
+            True on successful compile (programming errors are logged but
+            do not flip this to False), False on any early/compile error.
+        """
         syn_tool_dir = self.syn_attr.get("QUARTUS_DIR")
         if not syn_tool_dir:
             log.error("Missing 'QUARTUS_DIR'")
-            return
+            return False
 
         quartus_sh = os.path.join(syn_tool_dir, "quartus_sh")
         if not os.path.exists(quartus_sh):
             log.error("quartus_sh not found: %s", quartus_sh)
-            return
+            return False
 
         if self._hw_root.is_dir():
             shutil.rmtree(self._hw_root)
@@ -192,24 +412,19 @@ class Py2ver:
         # Fixed-pattern TX generator
         self.get_template("hw/uart/uart_fixed_pattern_tx.txt") \
             .stream({}).dump(str(uart_dir / "uart_fixed_pattern_tx.sv"))
-        # NEW: Loopback wrapper (instantiates uart_transceiver with LOOPBACK=1)
+        # Loopback wrapper
         self.get_template("hw/uart/uart_loopback.txt") \
             .stream({
                 "CLK_HZ": DEFAULT_CLK_FREQ,
                 "BAUD": DEFAULT_BAUD_RATE
             }).dump(str(uart_dir / "uart_loopback.sv"))
 
-        # Top-level transceiver that wires submodules + bus packing
-        # (Template must set .LOOPBACK(1'b0) when force_core_loopback_off==True)
-        self.get_template("hw/uart/uart_transceiver_top.txt").stream({
-            "in_clk_freq": DEFAULT_CLK_FREQ,
-            "baud_rate":   DEFAULT_BAUD_RATE,
-            "reg_width_tx": self.output_bits,
-            "reg_width_rx": self.input_args_bits,
-            "force_core_loopback_off": self.syn_data["force_core_loopback_off"]
-        }).dump(str(project_dir / "uart_transceiver.sv"))
+        # uart_transceiver module (the one you pasted)
+        # Template can be plain SV; extra params here are ignored if unused.
+        self.get_template("hw/uart/uart_transceiver_top.txt") \
+            .stream({}).dump(str(uart_dir / "uart_transceiver.sv"))
 
-        # ✅ Append UART leafs to QSF
+        # Append UART leafs to QSF
         with qsf_path.open("a", encoding="utf-8") as qsf:
             qsf.write("\n# UART split modules\n")
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_baud_gen.sv\n')
@@ -218,8 +433,8 @@ class Py2ver:
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fifo4x8.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_prbs7_tx_test.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fixed_pattern_tx.sv\n')
-            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_loopback.sv\n')  # NEW
-            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart_transceiver.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_loopback.sv\n')
+            qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_transceiver.sv\n')
 
         # SDC / wrappers / board top
         self.get_template("hw/de0_nano_sdc.txt") \
@@ -228,7 +443,7 @@ class Py2ver:
         self.get_template("hw/delayed_registers.txt") \
             .stream(self.syn_data).dump(str(project_dir / "delayed_registers.sv"))
 
-        # Top with switch-controlled loopback (lb → pat → prbs → core)
+        # DE0_Nano top you provided
         self.get_template("hw/de0_nano_top.txt") \
             .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
 
@@ -246,7 +461,7 @@ class Py2ver:
         )
         if result.returncode != 0:
             log.error("Quartus compile failed: rc=%d", result.returncode)
-            return
+            return False
 
         out_dir = project_dir / "output_files"
         if out_dir.exists():
@@ -256,6 +471,7 @@ class Py2ver:
             log.warning("No output_files/ directory found.")
 
         self._program_fpga(syn_tool_dir, project_dir, project_name)
+        return True
 
     # ------------------------------------------------------------------------
     # Testbench
@@ -294,7 +510,7 @@ class Py2ver:
         else:
             d = {}
 
-        outs = []
+        outs: List[int] = []
         for n, w in zip(self.output_args_list, self.output_args_width_list):
             v = d.get(n, 0)
             if self.attr.get(n, {}).get("signed") == 1:
