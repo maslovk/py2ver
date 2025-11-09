@@ -1,30 +1,40 @@
 import cocotb
 import os
 from pathlib import Path
-from cocotb_tools.runner import get_runner
 from cocotb.triggers import Timer
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
 import pickle
+
 
 async def save_results(ret_val):
     proj_path = Path(__file__).resolve().parent
-    if not os.path.isdir(proj_path.joinpath('results')):
-        os.mkdir(proj_path.joinpath('results'))
+    results_dir = proj_path / "results"
+    results_dir.mkdir(exist_ok=True)
 
-    with open(proj_path.joinpath('results').joinpath('results.pickle'), 'wb') as handle:
+    results_file = results_dir / "results.pickle"
+    with open(results_file, "wb") as handle:
         pickle.dump(ret_val, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-# Start a testcase
+
 @cocotb.test()
 async def tb_test(dut):
+    # Drive DUT inputs from Jinja-generated constants
 {% for arg in in_args %}
     dut.{{ arg[0] }}.value = {{ arg[1] }}
 {% endfor %}
-    await Timer(10)
+
+    # Debug: show which stimulus is active for this run
+    dut._log.info(
+        "Stimulus: {% for arg in in_args -%}{{ arg[0] }}={{ arg[1] }}{% if not loop.last %}, {% endif %}{%- endfor %}"
+    )
+
+    # Wait for combinational logic to settle
+    await Timer(10, unit="ns")
+
+    # Capture DUT outputs
     return_val = {
     {% for arg in out_args %}
-    '{{ arg }}' : int(dut.{{ arg }}.value),
+        "{{ arg }}": int(dut.{{ arg }}.value),
     {% endfor %}
     }
-    await save_results(str(return_val))
+
+    await save_results(return_val)

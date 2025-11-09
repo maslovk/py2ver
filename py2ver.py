@@ -332,7 +332,6 @@ class Py2ver:
                         break
                     resp += chunk
 
-                # ✅ NEW: raw byte logging
                 if len(resp) == 0:
                     log.error("UART: No data received.")
                 else:
@@ -419,8 +418,7 @@ class Py2ver:
                 "BAUD": DEFAULT_BAUD_RATE
             }).dump(str(uart_dir / "uart_loopback.sv"))
 
-        # uart_transceiver module (the one you pasted)
-        # Template can be plain SV; extra params here are ignored if unused.
+        # uart_transceiver module
         self.get_template("hw/uart/uart_transceiver_top.txt") \
             .stream({}).dump(str(uart_dir / "uart_transceiver.sv"))
 
@@ -481,28 +479,61 @@ class Py2ver:
         return self.tb_fun
 
     def gen_tb(self, *in_arg: Any) -> None:
+        # Map input names to argument values
         key_val = [
             (name, in_arg[i] if i < len(in_arg) else 0)
             for i, name in enumerate(self.input_args_list)
         ]
+        log.info("gen_tb: generating tb.py with in_args=%s", key_val)
 
         tb_out = self.get_template("tb.txt").render({
             "period": DEFAULT_TB_PERIOD,
             "in_args": key_val,
             "out_args": self.output_args_list
         })
+
+        # Optional: tiny snippet to confirm what ended up in the file
+        first_line = tb_out.splitlines()[0] if tb_out else ""
+        log.debug("gen_tb: first line of tb.py: %s", first_line)
+
         Path("tb.py").write_text(tb_out, encoding="utf-8")
 
     def tb_fun(self, *in_arg: Any) -> Tuple[int, ...]:
+        # Log TB invocation so we can see arguments clearly
+        log.info("TB called with args: %s", in_arg)
+
+        # Clean previous results
         if RESULTS_PATH.exists():
             try:
                 RESULTS_PATH.unlink()
             except OSError as e:
                 log.warning(e)
 
+        # Ensure a clean sim build directory so tb.py isn't stale
+        sim_build = Path("sim_build")
+        if sim_build.exists():
+            try:
+                shutil.rmtree(sim_build)
+            except OSError as e:
+                log.warning("Failed to remove sim_build: %s", e)
+
+        # 🔥 Remove stale compiled tb.py so Python can't reuse old bytecode
+        pycache_dir = Path("__pycache__")
+        if pycache_dir.exists():
+            for p in pycache_dir.glob("tb.*.pyc"):
+                try:
+                    log.debug("Removing stale pycache file: %s", p)
+                    p.unlink()
+                except OSError as e:
+                    log.warning("Failed to remove %s: %s", p, e)
+
+        # Generate testbench for this specific input set
         self.gen_tb(*in_arg)
+
+        # Run cocotb-based simulation
         tb_runner.test_runner(self.t_name)
 
+        # Load results written by tb.py
         if RESULTS_PATH.exists():
             with RESULTS_PATH.open("rb") as handle:
                 payload = pickle.load(handle)
