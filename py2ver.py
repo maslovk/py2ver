@@ -82,7 +82,9 @@ class Py2ver:
         # Raw IR bit widths (core widths)
         self.input_args_bits = sum(self.input_args_width_list)
         self.output_bits = sum(self.output_args_width_list)
-        self.attr = attr
+
+        # IMPORTANT: use visitor's attr (includes acc_0, acc_1, ...)
+        self.attr = f_visitor.attr
 
         # ---------------------- Segment widths (UART) ----------------------
         # Match DE0_Nano.v:
@@ -105,7 +107,8 @@ class Py2ver:
 
         # ------------------------ Generate core HDL ------------------------
         renderer = Renderer(template_dir)
-        verilog_text = renderer.render_module(ir)
+        # pass full attr (with SSA temps) into renderer
+        verilog_text = renderer.render_module(ir, self.attr)
 
         self.outdir = Path(os.getcwd())
         self.hdl_dir = self.outdir / "hdl"

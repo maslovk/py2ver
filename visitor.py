@@ -73,9 +73,17 @@ class FunctionVisitor(ast.NodeVisitor):
         self.input_bit_count = 0
         self.output_bit_count = 0
 
+        # stack of name substitutions (for loops / SSA)
+        # each entry is a dict {var_name: replacement_str}
+        self._name_env_stack: List[Dict[str, str]] = []
+
     # ---------- helpers ----------
     def _attrs(self, name: str) -> Dict[str, Any]:
         return self.attr.get(name, {'signed': 0, 'width': 1, 'type': 'wire'})
+
+    def _clone_attr(self, src: str, dst: str):
+        meta = dict(self._attrs(src))
+        self.attr[dst] = meta
 
     def _any_reg_outputs(self) -> bool:
         """Detect if any output port is a reg (requires clk)."""
@@ -84,6 +92,77 @@ class FunctionVisitor(ast.NodeVisitor):
             if isinstance(meta, dict) and meta.get('type') == 'reg':
                 return True
         return False
+
+    def _resolve_name(self, name: str) -> str:
+        """
+        Resolve a variable name through the substitution stack.
+        The most recent binding wins.
+        """
+        for env in reversed(self._name_env_stack):
+            if name in env:
+                return env[name]
+        return name
+
+    def _eval_int(self, node: ast.expr) -> int:
+        """
+        Evaluate an expression node as a compile-time integer.
+
+        Supported:
+          * integer Constant / Num
+          * unary +/- on those
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, ast.Num):  # <3.8
+            return int(node.n)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            val = self._eval_int(node.operand)
+            return -val if isinstance(node.op, ast.USub) else val
+        raise NotImplementedError(f"Only integer literals are allowed in range(): {ast.dump(node)}")
+
+    def _parse_range(self, iter_node: ast.expr) -> tuple[int, int, int]:
+        """
+        Parse a range(...) call into (start, stop, step) integers.
+
+        Only supports range with 1–3 integer-literal arguments.
+        """
+        if not isinstance(iter_node, ast.Call):
+            raise NotImplementedError("for-loops must iterate over range(...).")
+        func = iter_node.func
+        if not (isinstance(func, ast.Name) and func.id == "range"):
+            raise NotImplementedError("for-loops must iterate over range(...).")
+
+        args = iter_node.args
+        if len(args) == 1:
+            start, stop, step = 0, self._eval_int(args[0]), 1
+        elif len(args) == 2:
+            start, stop, step = self._eval_int(args[0]), self._eval_int(args[1]), 1
+        elif len(args) == 3:
+            start, stop, step = (
+                self._eval_int(args[0]),
+                self._eval_int(args[1]),
+                self._eval_int(args[2]),
+            )
+        else:
+            raise NotImplementedError("range() with 1–3 integer arguments is supported.")
+
+        if step == 0:
+            raise NotImplementedError("range() step cannot be 0.")
+        return start, stop, step
+
+    def _expr_uses_name(self, node: ast.AST, name: str) -> bool:
+        """Return True if the expression AST uses the given variable name."""
+        found = False
+
+        class _Visitor(ast.NodeVisitor):
+            def visit_Name(self, n: ast.Name):
+                nonlocal found
+                if n.id == name:
+                    found = True
+                self.generic_visit(n)
+
+        _Visitor().visit(node)
+        return found
 
     # ---------- visitors ----------
     def visit_Module(self, node: ast.Module):
@@ -116,6 +195,8 @@ class FunctionVisitor(ast.NodeVisitor):
                 self._visit_assign(item)
             elif isinstance(item, ast.If):
                 self._visit_if(item)
+            elif isinstance(item, ast.For):
+                self.visit_For(item)
             elif isinstance(item, ast.Return):
                 if seen_return:
                     raise NotImplementedError("Multiple return statements are not supported.")
@@ -186,7 +267,7 @@ class FunctionVisitor(ast.NodeVisitor):
 
     # ---- expressions ----
     def visit_Name(self, node: ast.Name):
-        return node.id
+        return self._resolve_name(node.id)
 
     def visit_Constant(self, node: ast.Constant):
         if isinstance(node.value, bool):
@@ -249,6 +330,148 @@ class FunctionVisitor(ast.NodeVisitor):
         parts = [self.visit(v) for v in node.values]
         return "(" + op_str.join(parts) + ")"
 
+    # ---- for-loops ----
+    def visit_For(self, node: ast.For):
+        """
+        Handle two cases:
+
+        (A) Accumulator pattern (SSA-style):
+
+            acc = <init>      # already seen earlier in self.assigns
+            for i in range(...):
+                acc = acc + f(i, ...)
+            ...
+
+        -> emit acc_0, acc_1, ..., acc_N and final acc = acc_N.
+
+        (B) Fallback: generic unrolling (no self-updates),
+            as before, for "simple" loops.
+        """
+        if not isinstance(node.target, ast.Name):
+            raise NotImplementedError("Only 'for <var> in range(...)' loops are supported.")
+        loop_var = node.target.id
+
+        start, stop, step = self._parse_range(node.iter)
+
+        # --- Try to detect accumulator pattern (A) ---
+
+        if (
+            len(node.body) == 1
+            and isinstance(node.body[0], ast.Assign)
+            and len(node.body[0].targets) == 1
+            and isinstance(node.body[0].targets[0], ast.Name)
+        ):
+            assign_node = node.body[0]
+            acc_name = assign_node.targets[0].id
+
+            # RHS must use acc_name (acc = acc + ...)
+            if self._expr_uses_name(assign_node.value, acc_name):
+                self._lower_accumulating_for(node, loop_var, acc_name, start, stop, step)
+                return
+
+        # --- Otherwise, fallback to plain unrolling (B) ---
+
+        for val in range(start, stop, step):
+            env = {loop_var: str(val)}
+            self._name_env_stack.append(env)
+            try:
+                for stmt in node.body:
+                    if isinstance(stmt, ast.Assign):
+                        self._visit_assign(stmt)
+                    elif isinstance(stmt, ast.If):
+                        self._visit_if(stmt)
+                    elif isinstance(stmt, ast.For):
+                        self.visit_For(stmt)
+                    else:
+                        self.generic_visit(stmt)
+            finally:
+                self._name_env_stack.pop()
+
+    def _lower_accumulating_for(
+        self,
+        node: ast.For,
+        loop_var: str,
+        acc_name: str,
+        start: int,
+        stop: int,
+        step: int
+    ):
+        """
+        Lower accumulator-style loop into a chain:
+
+            acc_0 = <init>
+            acc_1 = f(acc_0, ...)
+            ...
+            acc_N = f(acc_{N-1}, ...)
+            acc   = acc_N
+        """
+        assign_node = node.body[0]
+
+        # Find initial assignment to acc_name in self.assigns (last one wins)
+        init_idx = None
+        for idx in range(len(self.assigns) - 1, -1, -1):
+            if self.assigns[idx].left == acc_name:
+                init_idx = idx
+                break
+
+        if init_idx is not None:
+            init_assign = self.assigns.pop(init_idx)
+            init_rhs = init_assign.right
+            is_reg = init_assign.is_reg
+        else:
+            # No explicit init seen; use acc itself as initial value.
+            init_rhs = acc_name
+            is_reg = (self._attrs(acc_name).get('type') == 'reg')
+
+        # Declare acc_0
+        prev_name = f"{acc_name}_0"
+        self._clone_attr(acc_name, prev_name)
+        self.assigns.append(
+            Assignment(
+                left=prev_name,
+                right=init_rhs,
+                is_reg=is_reg
+            )
+        )
+
+        curr_name = prev_name
+        iter_values = list(range(start, stop, step))
+
+        for idx, val in enumerate(iter_values):
+            next_name = f"{acc_name}_{idx + 1}"
+            self._clone_attr(acc_name, next_name)
+
+            # For this iteration, acc -> curr_name, loop_var -> val
+            env = {
+                loop_var: str(val),
+                acc_name: curr_name,
+            }
+            self._name_env_stack.append(env)
+            try:
+                rhs_expr = self.visit(assign_node.value)
+            finally:
+                self._name_env_stack.pop()
+
+            self.assigns.append(
+                Assignment(
+                    left=next_name,
+                    right=rhs_expr,
+                    is_reg=is_reg
+                )
+            )
+
+            curr_name = next_name
+
+        # Final acc assignment: acc = acc_N (or acc_0 if loop empty)
+        final_rhs = curr_name
+        self.assigns.append(
+            Assignment(
+                left=acc_name,
+                right=final_rhs,
+                is_reg=is_reg
+            )
+        )
+
     # ---- assignments ----
     def _visit_assign(self, node: ast.Assign):
         rhs = self.visit(node.value)
@@ -298,8 +521,8 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def _eval_if_expr(self, node: ast.If) -> Dict[str, str]:
         """
-        Turn an if/elif/else *expression tree* into a mapping var -> nested
-        ternary expression (as a string).
+        Turn an if/elif/else *expression tree* into a mapping
+        var -> nested ternary expression (as a string).
 
         Each branch body is evaluated via _eval_stmt_block, so nested if's are
         fully supported.
@@ -361,17 +584,6 @@ class FunctionVisitor(ast.NodeVisitor):
         """
         Lower a restricted if/elif/else (with possible nested ifs) into
         per-variable nested ternary expressions.
-
-        High-level pattern:
-
-            if cond0:
-                ...
-            elif cond1:
-                ...
-            else:
-                ...
-
-        where each branch body is a *combinational block* of Assign / nested If.
         """
         env = self._eval_if_expr(node)
         for lhs, rhs in env.items():
@@ -387,3 +599,49 @@ class FunctionVisitor(ast.NodeVisitor):
     # ---- default ----
     def generic_visit(self, node):
         raise NotImplementedError(f"Unsupported AST node: {type(node).__name__}")
+
+
+# ------------------------------------------------------------
+# Helper: emit internal wire/reg declarations
+# ------------------------------------------------------------
+def emit_internal_declarations(module_ir: ModuleIR,
+                               attr: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Emit Verilog declarations for internal nets:
+      - Anything that appears as an assignment LHS
+      - BUT is not a port name
+
+    Uses 'attr' for width/signed/type (wire/reg).
+    """
+    # 1) All port names (inputs + outputs)
+    port_names = {p.name for p in (module_ir.inputs + module_ir.outputs)}
+
+    # 2) All LHS names from assignments
+    lhs_names = {a.left for a in module_ir.assigns}
+
+    # 3) Internal = assigned but not a port
+    internal_names = sorted(lhs_names - port_names)
+
+    lines: List[str] = []
+
+    for name in internal_names:
+        meta = attr.get(name, {'width': 1, 'signed': 0, 'type': 'wire'})
+        width = int(meta.get('width', 1))
+        signed = bool(meta.get('signed', 0))
+        vtype = str(meta.get('type', 'wire'))  # 'wire' or 'reg'
+
+        if width <= 1:
+            range_str = ""
+        else:
+            range_str = f"[{width-1}:0] "
+
+        signed_str = "signed " if signed else ""
+
+        if vtype == 'reg':
+            decl_kw = 'reg'
+        else:
+            decl_kw = 'wire'
+
+        lines.append(f"{decl_kw} {signed_str}{range_str}{name};")
+
+    return "\n".join(lines)
