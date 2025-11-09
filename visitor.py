@@ -263,99 +263,79 @@ class FunctionVisitor(ast.NodeVisitor):
                 )
             )
 
-    def _visit_if(self, node: ast.If):
+    # ---------- nested if/elif/else lowering ----------
+    def _eval_stmt_block(self, stmts: List[ast.stmt]) -> Dict[str, str]:
         """
-        Lower a restricted if/elif/else ladder with multiple assignments per branch
-        into per-variable cascaded ternary assignments.
+        Evaluate a *purely combinational* statement block into a mapping
+        var -> expression string.
 
-        Supported pattern:
+        Supported statements:
+          * Assign (single target)
+          * If / elif / else (recursively lowered to nested ternaries)
 
-            if cond0:
-                a = expr_a0
-                b = expr_b0
-            elif cond1:
-                a = expr_a1
-                b = expr_b1
-            ...
+        Statement order is respected: later assignments override earlier ones.
+        """
+        env: Dict[str, str] = {}
+        for s in stmts:
+            if isinstance(s, ast.Assign):
+                if len(s.targets) != 1:
+                    raise NotImplementedError(
+                        "Multiple assignment targets are not supported."
+                    )
+                lhs = self.visit(s.targets[0])
+                rhs = self.visit(s.value)
+                env[lhs] = rhs
+            elif isinstance(s, ast.If):
+                # Recursively lower nested if/elif/else into expressions
+                nested_env = self._eval_if_expr(s)
+                # Later statements override earlier ones
+                env.update(nested_env)
             else:
-                a = expr_aN
-                b = expr_bN
+                raise NotImplementedError(
+                    f"Unsupported statement type in combinational block: {type(s).__name__}"
+                )
+        return env
 
-        Requirements (for all branches):
+    def _eval_if_expr(self, node: ast.If) -> Dict[str, str]:
+        """
+        Turn an if/elif/else *expression tree* into a mapping var -> nested
+        ternary expression (as a string).
+
+        Each branch body is evaluated via _eval_stmt_block, so nested if's are
+        fully supported.
+
+        Requirements:
           * final 'else' branch is present (no latches)
-          * bodies contain only simple Assign statements (single target)
-          * each branch assigns to the same set of variables exactly once
+          * all branches assign to the same set of variables
         """
         branches: List[tuple[str, Dict[str, str]]] = []
-        else_map = None  # type: ignore[assignment]
+        else_env: Dict[str, str] | None = None
 
         cur = node
         while True:
-            # Require some form of orelse; otherwise we'd infer a latch.
             if not cur.orelse:
                 raise NotImplementedError(
                     "if/elif without final else is not supported (would infer a latch)."
                 )
 
-            # Process current 'if' / 'elif' body
-            then_stmts = cur.body
-            then_map: Dict[str, str] = {}
-
-            for s in then_stmts:
-                if not isinstance(s, ast.Assign):
-                    raise NotImplementedError(
-                        "if/elif branches must contain only simple assignments."
-                    )
-                if len(s.targets) != 1:
-                    raise NotImplementedError(
-                        "Multiple assignment targets in if/elif branches are not supported."
-                    )
-
-                lhs = self.visit(s.targets[0])
-                rhs = self.visit(s.value)
-                if lhs in then_map:
-                    raise NotImplementedError(
-                        f"Variable '{lhs}' assigned multiple times in the same if/elif branch."
-                    )
-                then_map[lhs] = rhs
-
             cond = self.visit(cur.test)
-            branches.append((cond, then_map))
+            then_env = self._eval_stmt_block(cur.body)
+            branches.append((cond, then_env))
 
-            # Decide if this orelse is another 'elif' or the final 'else'
+            # Chained elif?
             if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
-                # Chained elif
                 cur = cur.orelse[0]
                 continue
             else:
                 # Final else
-                else_stmts = cur.orelse
-                em: Dict[str, str] = {}
-                for s in else_stmts:
-                    if not isinstance(s, ast.Assign):
-                        raise NotImplementedError(
-                            "else branch must contain only simple assignments."
-                        )
-                    if len(s.targets) != 1:
-                        raise NotImplementedError(
-                            "Multiple assignment targets in else branch are not supported."
-                        )
-
-                    lhs = self.visit(s.targets[0])
-                    rhs = self.visit(s.value)
-                    if lhs in em:
-                        raise NotImplementedError(
-                            f"Variable '{lhs}' assigned multiple times in 'else' branch."
-                        )
-                    em[lhs] = rhs
-                else_map = em
+                else_env = self._eval_stmt_block(cur.orelse)
                 break
 
-        if else_map is None:
+        if else_env is None:
             raise NotImplementedError("if/elif chain ended without a final else branch.")
 
-        # Check that all branches assign to the same set of variables
-        key_sets = [set(m.keys()) for _, m in branches] + [set(else_map.keys())]
+        # All branches must assign to the same set of variables
+        key_sets = [set(env.keys()) for _, env in branches] + [set(else_env.keys())]
         first_keys = key_sets[0]
         for ks in key_sets[1:]:
             if ks != first_keys:
@@ -364,16 +344,37 @@ class FunctionVisitor(ast.NodeVisitor):
                     f"(got {[sorted(ks) for ks in key_sets]})."
                 )
 
-        # Deterministic variable order: order of the first branch
+        # Deterministic variable order: that of the first branch
         var_order = list(branches[0][1].keys())
 
-        # For each variable, build nested ternary from the bottom (else) up:
-        # rhs = cond0 ? expr0 : (cond1 ? expr1 : (... else_expr ...))
+        result_env: Dict[str, str] = {}
         for lhs in var_order:
-            rhs = else_map[lhs]
+            # Build nested ternary from bottom (else) up
+            rhs = else_env[lhs]
             for cond, then_map in reversed(branches):
                 rhs = f"({cond}) ? ({then_map[lhs]}) : ({rhs})"
+            result_env[lhs] = rhs
 
+        return result_env
+
+    def _visit_if(self, node: ast.If):
+        """
+        Lower a restricted if/elif/else (with possible nested ifs) into
+        per-variable nested ternary expressions.
+
+        High-level pattern:
+
+            if cond0:
+                ...
+            elif cond1:
+                ...
+            else:
+                ...
+
+        where each branch body is a *combinational block* of Assign / nested If.
+        """
+        env = self._eval_if_expr(node)
+        for lhs, rhs in env.items():
             meta = self._attrs(lhs)
             self.assigns.append(
                 Assignment(
