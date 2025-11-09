@@ -265,79 +265,114 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def _visit_if(self, node: ast.If):
         """
-        Lower a restricted if/else with multiple assignments per branch into
-        per-variable ternary assignments.
+        Lower a restricted if/elif/else ladder with multiple assignments per branch
+        into per-variable cascaded ternary assignments.
 
         Supported pattern:
 
-            if cond:
-                a = expr_a_then
-                b = expr_b_then
-                ...
+            if cond0:
+                a = expr_a0
+                b = expr_b0
+            elif cond1:
+                a = expr_a1
+                b = expr_b1
+            ...
             else:
-                a = expr_a_else
-                b = expr_b_else
-                ...
+                a = expr_aN
+                b = expr_bN
 
-        Requirements:
-          * else branch is present (no latches)
-          * all statements in both branches are simple Assign
-          * each Assign has exactly one target
-          * both branches assign to the same set of variables
+        Requirements (for all branches):
+          * final 'else' branch is present (no latches)
+          * bodies contain only simple Assign statements (single target)
+          * each branch assigns to the same set of variables exactly once
         """
-        if not node.orelse:
-            raise NotImplementedError("if without else is not supported (latch).")
+        branches: List[tuple[str, Dict[str, str]]] = []
+        else_map = None  # type: ignore[assignment]
 
-        then_stmts = node.body
-        else_stmts = node.orelse
+        cur = node
+        while True:
+            # Require some form of orelse; otherwise we'd infer a latch.
+            if not cur.orelse:
+                raise NotImplementedError(
+                    "if/elif without final else is not supported (would infer a latch)."
+                )
 
-        # Enforce simple assignment-only branches
-        for stmt_list in (then_stmts, else_stmts):
-            for s in stmt_list:
+            # Process current 'if' / 'elif' body
+            then_stmts = cur.body
+            then_map: Dict[str, str] = {}
+
+            for s in then_stmts:
                 if not isinstance(s, ast.Assign):
                     raise NotImplementedError(
-                        "if/else branches must contain only simple assignments."
+                        "if/elif branches must contain only simple assignments."
                     )
                 if len(s.targets) != 1:
                     raise NotImplementedError(
-                        "Multiple assignment targets in if/else are not supported."
+                        "Multiple assignment targets in if/elif branches are not supported."
                     )
 
-        # Build mapping: var -> RHS for each branch
-        then_map: Dict[str, str] = {}
-        else_map: Dict[str, str] = {}
+                lhs = self.visit(s.targets[0])
+                rhs = self.visit(s.value)
+                if lhs in then_map:
+                    raise NotImplementedError(
+                        f"Variable '{lhs}' assigned multiple times in the same if/elif branch."
+                    )
+                then_map[lhs] = rhs
 
-        for s in then_stmts:
-            lhs = self.visit(s.targets[0])
-            rhs = self.visit(s.value)
-            if lhs in then_map:
+            cond = self.visit(cur.test)
+            branches.append((cond, then_map))
+
+            # Decide if this orelse is another 'elif' or the final 'else'
+            if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
+                # Chained elif
+                cur = cur.orelse[0]
+                continue
+            else:
+                # Final else
+                else_stmts = cur.orelse
+                em: Dict[str, str] = {}
+                for s in else_stmts:
+                    if not isinstance(s, ast.Assign):
+                        raise NotImplementedError(
+                            "else branch must contain only simple assignments."
+                        )
+                    if len(s.targets) != 1:
+                        raise NotImplementedError(
+                            "Multiple assignment targets in else branch are not supported."
+                        )
+
+                    lhs = self.visit(s.targets[0])
+                    rhs = self.visit(s.value)
+                    if lhs in em:
+                        raise NotImplementedError(
+                            f"Variable '{lhs}' assigned multiple times in 'else' branch."
+                        )
+                    em[lhs] = rhs
+                else_map = em
+                break
+
+        if else_map is None:
+            raise NotImplementedError("if/elif chain ended without a final else branch.")
+
+        # Check that all branches assign to the same set of variables
+        key_sets = [set(m.keys()) for _, m in branches] + [set(else_map.keys())]
+        first_keys = key_sets[0]
+        for ks in key_sets[1:]:
+            if ks != first_keys:
                 raise NotImplementedError(
-                    f"Variable '{lhs}' assigned multiple times in 'then' branch."
+                    "All branches of if/elif/else must assign to the same set of variables "
+                    f"(got {[sorted(ks) for ks in key_sets]})."
                 )
-            then_map[lhs] = rhs
 
-        for s in else_stmts:
-            lhs = self.visit(s.targets[0])
-            rhs = self.visit(s.value)
-            if lhs in else_map:
-                raise NotImplementedError(
-                    f"Variable '{lhs}' assigned multiple times in 'else' branch."
-                )
-            else_map[lhs] = rhs
+        # Deterministic variable order: order of the first branch
+        var_order = list(branches[0][1].keys())
 
-        if set(then_map.keys()) != set(else_map.keys()):
-            raise NotImplementedError(
-                "If/else branches must assign to the same set of variables "
-                f"(then: {sorted(then_map.keys())}, else: {sorted(else_map.keys())})."
-            )
-
-        cond = self.visit(node.test)
-
-        # Preserve some determinism by iterating in the 'then' branch key order
-        for lhs in then_map.keys():
-            rhs_then = then_map[lhs]
-            rhs_else = else_map[lhs]
-            rhs = f"({cond}) ? ({rhs_then}) : ({rhs_else})"
+        # For each variable, build nested ternary from the bottom (else) up:
+        # rhs = cond0 ? expr0 : (cond1 ? expr1 : (... else_expr ...))
+        for lhs in var_order:
+            rhs = else_map[lhs]
+            for cond, then_map in reversed(branches):
+                rhs = f"({cond}) ? ({then_map[lhs]}) : ({rhs})"
 
             meta = self._attrs(lhs)
             self.assigns.append(

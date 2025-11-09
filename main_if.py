@@ -10,6 +10,11 @@ def foo(arg1, arg2, arg3):
         b = arg1 - arg2
         c = arg1 * arg2
         d = arg1 / arg2
+    elif arg3 == 1:
+        b = arg1 + arg2
+        c = arg1 - arg2
+        d = arg1 * arg2
+        a = arg1 / arg2
     else:
         d = arg1 + arg2
         c = arg1 - arg2
@@ -36,12 +41,17 @@ p = Py2ver(foo, attr)
 foo_tb = p.TB()
 foo_hw = p.HW(syn_attr)
 
+g = foo_tb(4, 4, 2)   # simulation result
+h = foo_hw(4, 4, 2)   # hardware
+print("TB:", g)
+print("HW:", h)
+
 g = foo_tb(4, 4, 1)   # simulation result
-h = foo_hw(4, 4, 1)   # "hardware" result (currently same as TB)
+h = foo_hw(4, 4, 1)   # hardware
 print("TB:", g)
 print("HW:", h)
 
 g = foo_tb(4, 4, 0)   # simulation result
-h = foo_hw(4, 4, 0)   # "hardware" result (currently same as TB)
+h = foo_hw(4, 4, 0)   # hardware
 print("TB:", g)
 print("HW:", h)
