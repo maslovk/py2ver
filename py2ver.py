@@ -36,7 +36,8 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 import tb_runner
 from renderer import Renderer
-from visitor import FunctionVisitor
+# use new visitor package structure (re-exports in visitor/__init__.py)
+from visitor import FunctionVisitor  # , emit_internal_declarations, normalize_attr, BINOP_TOKENS
 
 try:
     import serial  # pyserial

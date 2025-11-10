@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.DEBUG,
 # ==========================================================
 def sum_loop(x):
     acc = 0
-    for i in range(0, 5):       # unrolled by FunctionVisitor
+    for i in range(0, 10):       # unrolled by FunctionVisitor
         acc = acc + (x + i)
     return acc
 
