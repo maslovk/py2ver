@@ -76,6 +76,7 @@ class Renderer:
         port_name_set = set(input_port_names + output_port_names)
         lhs_names = {a.left for a in ir.assigns}
         internal_names = sorted(lhs_names - port_name_set)
+        reg_lhs_names = {a.left for a in ir.assigns if a.is_reg}
 
         internal_decls: List[str] = []
 
@@ -114,8 +115,9 @@ class Renderer:
             width = int(meta.get('width', 1))
             signed = int(meta.get('signed', 0))
 
+            decl_tpl = 'reg.txt' if name in reg_lhs_names else 'wire.txt'
             internal_decls.append(
-                self._tpl('wire.txt').render({
+                self._tpl(decl_tpl).render({
                     'name': name,
                     'width': width,
                     'signed': signed,

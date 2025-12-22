@@ -17,7 +17,7 @@ attr = {
     'a':    {'signed': 0, 'width': 9},
     'b':    {'signed': 1, 'width': 9},
     'c':    {'signed': 0, 'width': 9},
-    'd':    {'signed': 0, 'width': 9},
+    'd':    {'signed': 0, 'width': 9, "type": "reg"},
 }
 
 syn_attr = {

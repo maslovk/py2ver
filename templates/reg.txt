@@ -1,0 +1,5 @@
+{% if width > 1 -%}
+reg{% if signed %} signed{% endif %} [{{ width-1 }}:0] {{ name }}{{ dimensions }};
+{% else -%}
+reg{% if signed %} signed{% endif %} {{ name }}{{ dimensions }};
+{% endif %}

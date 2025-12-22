@@ -1,7 +1,6 @@
 import cocotb
-import os
 from pathlib import Path
-from cocotb.triggers import Timer
+from cocotb.triggers import Timer, RisingEdge
 import pickle
 
 
@@ -15,25 +14,44 @@ async def save_results(ret_val):
         pickle.dump(ret_val, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
+async def _clock_gen(sig, period_ns={{ period }}):
+    sig.value = 0
+    while True:
+        await Timer(period_ns // 2, unit="ns")
+        sig.value = 1
+        await Timer(period_ns // 2, unit="ns")
+        sig.value = 0
+
+
 @cocotb.test()
 async def tb_test(dut):
-    # Drive DUT inputs from Jinja-generated constants
+    {% if has_clk %}
+    cocotb.start_soon(_clock_gen(dut.clk, period_ns={{ period }}))
+    {% endif %}
+
 {% for arg in in_args %}
     dut.{{ arg[0] }}.value = {{ arg[1] }}
 {% endfor %}
 
-    # Debug: show which stimulus is active for this run
     dut._log.info(
         "Stimulus: {% for arg in in_args -%}{{ arg[0] }}={{ arg[1] }}{% if not loop.last %}, {% endif %}{%- endfor %}"
     )
 
-    # Wait for combinational logic to settle
     await Timer(10, unit="ns")
 
-    # Capture DUT outputs
+    {% if has_clk %}
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="ns")
+    {% endif %}
+
     return_val = {
     {% for arg in out_args %}
+        {% set meta = out_meta.get(arg, {}) %}
+        {% if meta.get("signed", 0) == 1 %}
+        "{{ arg }}": int(dut.{{ arg }}.value.signed_integer),
+        {% else %}
         "{{ arg }}": int(dut.{{ arg }}.value),
+        {% endif %}
     {% endfor %}
     }
 

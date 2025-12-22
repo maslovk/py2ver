@@ -74,6 +74,8 @@ class Py2ver:
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 
+        self.has_clk = bool(ir.has_clk)
+
         self.t_name = ir.name
         self.input_args_list = [p.name for p in ir.inputs if p.kind != "clk"]
         self.output_args_list = [p.name for p in ir.outputs]
@@ -86,6 +88,8 @@ class Py2ver:
 
         # IMPORTANT: use visitor's attr (includes acc_0, acc_1, ...)
         self.attr = f_visitor.attr
+
+        self.out_meta = {n: dict(self.attr.get(n, {})) for n in self.output_args_list}
 
         # ---------------------- Segment widths (UART) ----------------------
         # Match DE0_Nano.v:
@@ -211,7 +215,8 @@ class Py2ver:
                 self.input_seg_widths)
         ):
             v = in_arg[idx] if idx < len(in_arg) else 0
-            v = int(v) & ((1 << width) - 1)
+            mask = (1 << width) - 1 if width > 0 else 0
+            v = int(v) & mask
             # Place v in the LSBs of this segment
             acc |= (v << bit_offset)
             bit_offset += seg_width  # move by SEG_WIDTH, not raw width
@@ -459,10 +464,13 @@ class Py2ver:
         result = subprocess.run(
             [quartus_sh, "--flow", "compile", project_name],
             cwd=project_dir,
+            capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             log.error("Quartus compile failed: rc=%d", result.returncode)
+            log.error("quartus_sh stdout:\n%s", result.stdout)
+            log.error("quartus_sh stderr:\n%s", result.stderr)
             return False
 
         out_dir = project_dir / "output_files"
@@ -493,7 +501,9 @@ class Py2ver:
         tb_out = self.get_template("tb.txt").render({
             "period": DEFAULT_TB_PERIOD,
             "in_args": key_val,
-            "out_args": self.output_args_list
+            "out_args": self.output_args_list,
+            "has_clk": self.has_clk,
+            "out_meta": self.out_meta,
         })
 
         # Optional: tiny snippet to confirm what ended up in the file
