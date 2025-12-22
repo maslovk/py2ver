@@ -23,6 +23,7 @@ Top-level:
 from __future__ import annotations
 
 import ast
+import re
 import inspect
 import logging
 import os
@@ -73,6 +74,7 @@ class Py2ver:
         tree = ast.parse(source_foo)
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
+        self.ir = ir
 
         self.has_clk = bool(ir.has_clk)
 
@@ -90,6 +92,9 @@ class Py2ver:
         self.attr = f_visitor.attr
 
         self.out_meta = {n: dict(self.attr.get(n, {})) for n in self.output_args_list}
+
+        self.tb_latency_cycles, self.out_latency = self._compute_tb_latency()
+        log.info("TB latency: %d cycles; per-output: %s", self.tb_latency_cycles, self.out_latency)
 
         # ---------------------- Segment widths (UART) ----------------------
         # Match DE0_Nano.v:
@@ -180,6 +185,81 @@ class Py2ver:
         n &= mask
         sign_bit = 1 << (nbits - 1)
         return (n ^ sign_bit) - sign_bit
+
+    @staticmethod
+    def _extract_idents(expr: str) -> List[str]:
+        # verilog-ish identifiers
+        return re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", expr)
+
+    def _compute_latencies(self) -> Dict[str, int]:
+        """
+        Conservative pipeline latency in *cycles* for each signal.
+
+        wire assign: lat(lhs) = max(lat(deps))
+        reg  assign: lat(lhs) = 1 + max(lat(deps))
+
+        This correctly yields:
+          d <= expr(inputs)  => lat(d)=1
+          e <= d             => lat(e)=2
+        """
+        ir = getattr(self, "ir", None)
+        if ir is None:
+            return {n: 0 for n in self.output_args_list}
+
+        # Known names: ports + anything ever assigned
+        input_names = set(self.input_args_list)
+        output_names = set(self.output_args_list)
+        lhs_names = {a.left for a in ir.assigns}
+        known = input_names | output_names | lhs_names
+
+        # Seed: inputs are 0 cycles
+        lat: Dict[str, int] = {n: 0 for n in known}
+        for n in input_names:
+            lat[n] = 0
+
+        # Precompute deps per assignment
+        assigns: List[tuple[str, bool, List[str]]] = []
+        for a in ir.assigns:
+            deps = []
+            for ident in self._extract_idents(a.right):
+                if ident.startswith("$"):
+                    continue
+                if ident == "clk":
+                    continue
+                if ident in known:
+                    deps.append(ident)
+            assigns.append((a.left, bool(a.is_reg), deps))
+
+        # Fixed-point relaxation.
+        # Works even if assigns are out-of-order.
+        # Safe even with self-references from guarded updates (we ignore d==lhs).
+        max_iters = len(known) + 10
+        for _ in range(max_iters):
+            changed = False
+            for left, is_reg, deps in assigns:
+                dep_lat = 0
+                for d in deps:
+                    if d == left:
+                        continue  # guarded update pattern: lhs = cond ? rhs : lhs
+                    dep_lat = max(dep_lat, lat.get(d, 0))
+                new_lat = dep_lat + (1 if is_reg else 0)
+                if new_lat > lat.get(left, 0):
+                    lat[left] = new_lat
+                    changed = True
+            if not changed:
+                break
+
+        return lat
+
+    def _compute_tb_latency(self) -> Tuple[int, Dict[str, int]]:
+        """
+        Returns:
+          (cycles_to_wait, per_output_latency)
+        """
+        per_sig = self._compute_latencies()
+        per_out = {n: int(per_sig.get(n, 0)) for n in self.output_args_list}
+        cycles = max(per_out.values(), default=0)
+        return cycles, per_out
 
     # ------------------------------------------------------------------------
     # Bit packing helpers for UART protocol (matches DE0_Nano + uart_transceiver)
@@ -504,6 +584,8 @@ class Py2ver:
             "out_args": self.output_args_list,
             "has_clk": self.has_clk,
             "out_meta": self.out_meta,
+            "latency_cycles": int(getattr(self, "tb_latency_cycles", 0)),
+            "out_latency": dict(getattr(self, "out_latency", {})),
         })
 
         # Optional: tiny snippet to confirm what ended up in the file

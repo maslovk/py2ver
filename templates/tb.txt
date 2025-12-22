@@ -25,6 +25,9 @@ async def _clock_gen(sig, period_ns={{ period }}):
 
 @cocotb.test()
 async def tb_test(dut):
+    {% set lc = latency_cycles|default(0)|int %}
+    latency_cycles = {{ lc }}
+
     {% if has_clk %}
     cocotb.start_soon(_clock_gen(dut.clk, period_ns={{ period }}))
     {% endif %}
@@ -40,7 +43,11 @@ async def tb_test(dut):
     await Timer(10, unit="ns")
 
     {% if has_clk %}
-    await RisingEdge(dut.clk)
+    dut._log.info(
+        "Pipeline latency: {{ lc }} cycles (per-out: {{ out_latency }})"
+    )
+    for _ in range(latency_cycles):
+        await RisingEdge(dut.clk)
     await Timer(1, unit="ns")
     {% endif %}
 
