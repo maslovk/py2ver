@@ -50,3 +50,29 @@ def foo(a):
     assert any('acc_0' in assign.left for assign in ir.assigns)
     assert any('acc_1' in assign.left for assign in ir.assigns)
     assert any('acc_2' in assign.left for assign in ir.assigns)
+
+def test_while_loop_not_supported():
+    """Test that while loops raise NotImplementedError."""
+    src = """
+def foo(a):
+    acc = 0
+    i = 0
+    while i < 3:
+        acc = acc + a
+        i = i + 1
+    return acc
+"""
+    attr = {
+        'a': {'width': 8, 'signed': 0, 'type': 'reg'},
+        'acc': {'width': 10, 'signed': 0, 'type': 'reg'},
+        'i': {'width': 8, 'signed': 0, 'type': 'reg'},
+    }
+
+    tree = ast.parse(src)
+    
+    # While loops should raise NotImplementedError
+    try:
+        ir = FunctionVisitor(attr).visit(tree)
+        assert False, "Expected NotImplementedError for while loops"
+    except NotImplementedError as e:
+        assert "while-loops are not supported" in str(e)
