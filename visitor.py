@@ -85,6 +85,16 @@ class FunctionVisitor(ast.NodeVisitor):
         meta = dict(self._attrs(src))
         self.attr[dst] = meta
 
+    def _complex_parts(self, name: str) -> tuple[str, str]:
+        return f"{name}_re", f"{name}_im"
+
+    def _ensure_complex_part_attrs(self, name: str):
+        re_name, im_name = self._complex_parts(name)
+        if re_name not in self.attr:
+            self._clone_attr(name, re_name)
+        if im_name not in self.attr:
+            self._clone_attr(name, im_name)
+
     def _any_reg_outputs(self) -> bool:
         """Detect if any output port is a reg (requires clk)."""
         for name in self.output_args_list:
@@ -474,6 +484,68 @@ class FunctionVisitor(ast.NodeVisitor):
 
     # ---- assignments ----
     def _visit_assign(self, node: ast.Assign):
+        # Special-case complex constructor:
+        #   z = complex(a, b)  ->  z_re = a; z_im = b
+        if (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "complex"
+        ):
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                raise NotImplementedError("complex(...) assignment supports a single name target.")
+            if len(node.value.args) != 2:
+                raise NotImplementedError("complex(...) requires exactly 2 arguments.")
+
+            base = node.targets[0].id
+            self._ensure_complex_part_attrs(base)
+            re_name, im_name = self._complex_parts(base)
+            re_rhs = self.visit(node.value.args[0])
+            im_rhs = self.visit(node.value.args[1])
+            re_meta = self._attrs(re_name)
+            im_meta = self._attrs(im_name)
+
+            self.assigns.append(
+                Assignment(
+                    left=re_name,
+                    right=re_rhs,
+                    is_reg=(re_meta.get('type') == 'reg')
+                )
+            )
+            self.assigns.append(
+                Assignment(
+                    left=im_name,
+                    right=im_rhs,
+                    is_reg=(im_meta.get('type') == 'reg')
+                )
+            )
+            return
+
+        # Special-case absolute value of a complex temporary:
+        #   mag = abs(z)  ->  mag = $sqrt((z_re*z_re) + (z_im*z_im))
+        if (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "abs"
+        ):
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                raise NotImplementedError("abs(...) assignment supports a single name target.")
+            if len(node.value.args) != 1 or not isinstance(node.value.args[0], ast.Name):
+                raise NotImplementedError("abs(...) currently supports a single complex variable argument.")
+
+            z_name = node.value.args[0].id
+            re_name, im_name = self._complex_parts(z_name)
+            rhs = f"$sqrt(({re_name})*({re_name}) + ({im_name})*({im_name}))"
+            left = node.targets[0].id
+            meta = self._attrs(left)
+            self.assigns.append(
+                Assignment(
+                    left=left,
+                    right=rhs,
+                    is_reg=(meta.get('type') == 'reg')
+                )
+            )
+            return
+
         rhs = self.visit(node.value)
         for tgt in node.targets:
             left = self.visit(tgt)
