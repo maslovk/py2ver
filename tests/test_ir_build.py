@@ -1,6 +1,12 @@
 import ast
 from visitor import FunctionVisitor
 
+def unit_add_xor(a, b):
+    x = (a & 0xF) + (b & 0xF)
+    y = (a ^ b) << 1
+    return x, y
+
+
 def test_ir_from_simple_function(toy_src_add_xor, attr_simple):
     tree = ast.parse(toy_src_add_xor)
     ir = FunctionVisitor(attr_simple).visit(tree)
@@ -22,3 +28,7 @@ def test_ir_from_simple_function(toy_src_add_xor, attr_simple):
     assert ("y", "((a) ^ (b)) << (1)", False) in assigns
 
     assert ir.has_clk is False
+
+
+def test_ir_from_simple_function_py_vs_sim(attr_simple, assert_python_matches_sim):
+    assert_python_matches_sim(unit_add_xor, attr_simple, [(1, 2), (15, 7), (8, 3)])

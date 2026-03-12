@@ -207,6 +207,8 @@ class FunctionVisitor(ast.NodeVisitor):
                 self._visit_if(item)
             elif isinstance(item, ast.For):
                 self.visit_For(item)
+            elif isinstance(item, ast.While):
+                self.visit_While(item)
             elif isinstance(item, ast.Return):
                 if seen_return:
                     raise NotImplementedError("Multiple return statements are not supported.")
@@ -339,6 +341,14 @@ class FunctionVisitor(ast.NodeVisitor):
             raise NotImplementedError(f"Unsupported boolean operator: {type(node.op).__name__}")
         parts = [self.visit(v) for v in node.values]
         return "(" + op_str.join(parts) + ")"
+
+    def visit_While(self, node: ast.While):
+        raise NotImplementedError("while-loops are not supported")
+
+    def visit_List(self, node: ast.List):
+        if len(node.elts) > 0:
+            raise NotImplementedError("Non-empty list literals are not supported")
+        raise NotImplementedError("List literals are not supported")
 
     # ---- for-loops ----
     def visit_For(self, node: ast.For):

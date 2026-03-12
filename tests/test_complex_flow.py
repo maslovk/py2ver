@@ -1,6 +1,21 @@
 import ast
 from visitor import FunctionVisitor
 
+def unit_if_else(a, b, c):
+    if c == 0:
+        x = a + b
+    else:
+        x = a - b
+    return x
+
+
+def unit_for_unroll(a):
+    acc = 0
+    for i in range(3):
+        acc = acc + a
+    return acc
+
+
 def test_if_else_function():
     """Test if/else control flow handling."""
     src = """
@@ -50,6 +65,24 @@ def foo(a):
     assert any('acc_0' in assign.left for assign in ir.assigns)
     assert any('acc_1' in assign.left for assign in ir.assigns)
     assert any('acc_2' in assign.left for assign in ir.assigns)
+
+
+def test_if_else_py_vs_sim(assert_python_matches_sim):
+    attr = {
+        'a': {'width': 8, 'signed': 0, 'type': 'wire'},
+        'b': {'width': 8, 'signed': 0, 'type': 'wire'},
+        'c': {'width': 8, 'signed': 0, 'type': 'wire'},
+        'x': {'width': 9, 'signed': 0, 'type': 'wire'},
+    }
+    assert_python_matches_sim(unit_if_else, attr, [(8, 3, 0), (8, 3, 1), (4, 7, 0)])
+
+
+def test_for_loop_py_vs_sim(assert_python_matches_sim):
+    attr = {
+        'a': {'width': 8, 'signed': 0, 'type': 'reg'},
+        'acc': {'width': 10, 'signed': 0, 'type': 'reg'},
+    }
+    assert_python_matches_sim(unit_for_unroll, attr, [(1,), (7,), (15,)])
 
 def test_while_loop_not_supported():
     """Test that while loops raise NotImplementedError."""
