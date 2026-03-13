@@ -175,6 +175,80 @@ class FunctionVisitor(ast.NodeVisitor):
         _Visitor().visit(node)
         return found
 
+    @staticmethod
+    def _int_meta(v: int) -> Dict[str, int]:
+        if v < 0:
+            width = max(1, abs(v).bit_length() + 1)
+            return {"width": width, "signed": 1}
+        width = max(1, v.bit_length())
+        return {"width": width, "signed": 0}
+
+    def _expr_meta(self, node: ast.AST) -> Dict[str, int]:
+        """
+        Best-effort width/signed inference for undeclared temporaries.
+        Conservative widths are preferred over underestimation.
+        """
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return self._int_meta(int(node.value))
+        if isinstance(node, ast.Num):
+            return self._int_meta(int(node.n))
+        if isinstance(node, ast.Name):
+            name = self._resolve_name(node.id)
+            # Loop unroll may resolve to literal text.
+            if isinstance(name, str) and name.lstrip("-").isdigit():
+                return self._int_meta(int(name))
+            m = self._attrs(name)
+            return {"width": int(m.get("width", 1)), "signed": int(m.get("signed", 0))}
+        if isinstance(node, ast.UnaryOp):
+            em = self._expr_meta(node.operand)
+            if isinstance(node.op, ast.USub):
+                return {"width": int(em["width"]) + 1, "signed": 1}
+            if isinstance(node.op, ast.UAdd):
+                return em
+            if isinstance(node.op, ast.Invert):
+                return em
+            return em
+        if isinstance(node, ast.BoolOp):
+            return {"width": 1, "signed": 0}
+        if isinstance(node, ast.Compare):
+            return {"width": 1, "signed": 0}
+        if isinstance(node, ast.BinOp):
+            l = self._expr_meta(node.left)
+            r = self._expr_meta(node.right)
+            lw, rw = int(l["width"]), int(r["width"])
+            ls, rs = int(l["signed"]), int(r["signed"])
+
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                return {"width": max(lw, rw) + 1, "signed": 1 if (ls or rs) else 0}
+            if isinstance(node.op, ast.Mult):
+                return {"width": lw + rw, "signed": 1 if (ls or rs) else 0}
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+                return {"width": lw, "signed": 1 if (ls or rs) else 0}
+            if isinstance(node.op, (ast.BitAnd, ast.BitOr, ast.BitXor)):
+                return {"width": max(lw, rw), "signed": 1 if (ls or rs) else 0}
+            if isinstance(node.op, ast.LShift):
+                sh = 0
+                try:
+                    sh = max(0, int(self._eval_int(node.right)))
+                except Exception:
+                    sh = rw
+                return {"width": lw + sh, "signed": ls}
+            if isinstance(node.op, ast.RShift):
+                return {"width": lw, "signed": ls}
+
+        # Unknown expressions fallback to minimal safe default.
+        return {"width": 1, "signed": 0}
+
+    def _ensure_target_attr(self, left: str, value_node: ast.AST):
+        if left in self.attr:
+            return
+        meta = self._expr_meta(value_node)
+        self.attr[left] = {
+            "signed": int(meta.get("signed", 0)),
+            "width": max(1, int(meta.get("width", 1))),
+            "type": "wire",
+        }
+
     # ---------- visitors ----------
     def visit_Module(self, node: ast.Module):
         if not node.body:
@@ -560,6 +634,7 @@ class FunctionVisitor(ast.NodeVisitor):
         rhs = self.visit(node.value)
         for tgt in node.targets:
             left = self.visit(tgt)
+            self._ensure_target_attr(left, node.value)
             meta = self._attrs(left)
             self.assigns.append(
                 Assignment(
@@ -589,6 +664,7 @@ class FunctionVisitor(ast.NodeVisitor):
                         "Multiple assignment targets are not supported."
                     )
                 lhs = self.visit(s.targets[0])
+                self._ensure_target_attr(lhs, s.value)
                 rhs = self.visit(s.value)
                 env[lhs] = rhs
             elif isinstance(s, ast.If):
