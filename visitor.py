@@ -50,7 +50,8 @@ BINOP_TOKENS = {
     ast.BitOr: " | ",
     ast.BitXor: " ^ ",
     ast.LShift: " << ",
-    ast.RShift: " >> ",
+    # Python right shift is arithmetic for negative integers; match with Verilog >>>.
+    ast.RShift: " >>> ",
 }
 
 
