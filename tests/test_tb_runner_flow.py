@@ -40,8 +40,7 @@ def test_test_runner_verilog_defaults(monkeypatch, tmp_path):
     assert build_kwargs["always"] is True
     assert build_kwargs["build_args"] == []
     assert build_kwargs["build_dir"] == str(proj_path / "sim_build")
-    assert build_kwargs["verilog_sources"] == [proj_path / "hdl" / "main.v"]
-    assert build_kwargs["vhdl_sources"] == []
+    assert build_kwargs["sources"] == [proj_path / "hdl" / "main.v"]
 
     test_kwargs = fake.test_calls[0]
     assert test_kwargs["hdl_toplevel"] == "foo"
@@ -63,8 +62,7 @@ def test_test_runner_vhdl_xcelium_args(monkeypatch, tmp_path):
 
     proj_path = tmp_path.parent
     build_kwargs = fake.build_calls[0]
-    assert build_kwargs["verilog_sources"] == []
-    assert build_kwargs["vhdl_sources"] == [proj_path / "hdl" / "main.vhdl"]
+    assert build_kwargs["sources"] == [proj_path / "hdl" / "main.vhdl"]
     assert build_kwargs["build_args"] == ["-v93"]
 
     test_kwargs = fake.test_calls[0]

@@ -20,13 +20,12 @@ def test_runner(top_name: str):
     if build_dir.exists():
         shutil.rmtree(build_dir)
 
-    verilog_sources = []
-    vhdl_sources = []
+    sources = []
 
     if hdl_toplevel_lang == "verilog":
-        verilog_sources = [proj_path / "hdl" / "main.v"]
+        sources = [proj_path / "hdl" / "main.v"]
     else:
-        vhdl_sources = [proj_path / "hdl" / "main.vhdl"]
+        sources = [proj_path / "hdl" / "main.vhdl"]
 
     build_test_args = []
     if hdl_toplevel_lang == "vhdl" and sim == "xcelium":
@@ -36,8 +35,7 @@ def test_runner(top_name: str):
 
     # Build DUT with a clean build_dir
     runner.build(
-        verilog_sources=verilog_sources,
-        vhdl_sources=vhdl_sources,
+        sources=sources,
         hdl_toplevel=top_name,
         build_dir=str(build_dir),
         always=True,
