@@ -1,13 +1,27 @@
 # py2ver
-## Simple verilog code generator from python source
+## Simple Verilog code generator from Python source
 
-### Example:
+py2ver turns a plain Python function into a Verilog module and gives you back
+callables with the same signature that run it in simulation (cocotb + Icarus)
+or on an FPGA (DE0-Nano, over UART).
+
+### Setup
 
 ```
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
 
+Simulation also needs [Icarus Verilog](https://steveicarus.github.io/iverilog/)
+(`iverilog`, `vvp`) on `PATH`. The hardware path needs Intel Quartus and a
+DE0-Nano board with a USB-UART adapter.
+
+### Example
+
+```python
 from py2ver import Py2ver
 
-#Standard Python function
+# Standard Python function
 def foo(arg1, arg2):
     a = arg1 + arg2
     b = arg1 - arg2
@@ -15,20 +29,53 @@ def foo(arg1, arg2):
     d = arg1 / arg2
     return a, b, c, d
 
-e = foo(3,1)
-print (e)
-
-#Attributes for verilog generation
+# Attributes for Verilog generation
 attr = {'arg1': {'signed': 0, 'width': 8},
         'arg2': {'signed': 0, 'width': 8},
-        'a': {'signed': 0, 'width': 9, 'type' : 'reg'},
+        'a': {'signed': 0, 'width': 9, 'type': 'reg'},
         'b': {'signed': 1, 'width': 9},
         'c': {'signed': 0, 'width': 9},
-        'd': {'signed': 0, 'width': 9},}
+        'd': {'signed': 0, 'width': 9}}
 
-foo_tb = Py2ver(foo, attr).tb()
+p = Py2ver(foo, attr)      # writes hdl/main.v
 
-#Result from cocotb simulation
-g = foo_tb(3,1)
-print(g)
+foo_tb = p.TB()            # cocotb + Icarus simulation
+print(foo_tb(3, 1))
+
+foo_hw = p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
+print(foo_hw(3, 1))        # synthesizes, programs the board, runs over UART
 ```
+
+Generated files (`hdl/`, `sim_build/`, `tb.py`, `results/`, `hw/`) are written
+to the current working directory.
+
+### Attributes
+
+Each name maps to `{'signed': 0|1, 'width': <bits>, 'type': 'wire'|'reg'}`.
+`type: 'reg'` registers the signal; the testbench accounts for the resulting
+pipeline latency. Widths of undeclared temporaries are inferred.
+
+`HW()` options: `QUARTUS_DIR` (required), `UART_PORT` (default `/dev/ttyUSB0`),
+`UART_BAUD` (default `115200`), `UART_TIMEOUT` (default `1.0` s).
+
+### Supported Python subset
+
+- Integer arithmetic `+ - * / // & | ^ << >>` (`>>` is arithmetic, like Python),
+  unary `- + ~`, comparisons, `and`/`or`
+- `if` / `elif` / `else`, nested (every chain needs a final `else`, and all
+  branches must assign the same variables)
+- `for i in range(...)` with constant bounds (fully unrolled)
+- `complex(re, im)` and `abs()` of a complex variable
+- A single `return` of one or more values
+
+Not supported: `while`, calls to other functions, subscripts, list literals,
+multiple `return` statements.
+
+### Tests
+
+```
+.venv/bin/python -m pytest -q
+```
+
+Simulation tests compare the Python function against the cocotb + Icarus
+result and are skipped if Icarus or cocotb is missing.
