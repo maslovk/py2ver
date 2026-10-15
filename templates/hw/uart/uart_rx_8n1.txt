@@ -173,25 +173,28 @@ module uart_rx_8n1 #(
                         end
                         4'd1,4'd2,4'd3,4'd4,4'd5,4'd6,4'd7,4'd8:
                             shift[bit_idx_this_tick] <= sample_bit_w; // LSB-first
-                        4'd9:
+                        4'd9: begin
+                            // Stop bit sampled mid-bit: end the frame now, so
+                            // the next start edge (which may follow right
+                            // after this stop bit) is detected afresh. Ending
+                            // at the end of the stop bit instead let start
+                            // detection lag accumulate over back-to-back
+                            // bytes until the 5th byte was misread.
+                            busy    <= 1'b0;
                             stop_ok <= sample_bit_w; // stop bit must be 1
+                            if (!RX_ENA_STOPCHK || sample_bit_w) begin
+                                rx_byte       <= shift;
+                                rx_byte_ready <= 1'b1;
+                            end else
+                                rx_ferr       <= 1'b1;
+                        end
                         default: ;
                     endcase
                 end
 
                 // End-of-bit at phase==15
-                if (phase == 4'd15) begin
-                    if (bit_num == 4'd9) begin
-                        // Finished stop bit -> end frame
-                        busy <= 1'b0;
-                        if (!RX_ENA_STOPCHK || stop_ok) begin
-                            rx_byte       <= shift;
-                            rx_byte_ready <= 1'b1;
-                        end else
-                            rx_ferr       <= 1'b1;
-                    end else begin
-                        bit_num <= bit_num + 4'd1;
-                    end
+                if (phase == 4'd15 && bit_num != 4'd9) begin
+                    bit_num <= bit_num + 4'd1;
                 end
 
                 // Advance phase
