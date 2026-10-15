@@ -2,7 +2,7 @@ import shutil
 
 import pytest
 
-import py2ver as py2ver_mod
+import py2ver.core as py2ver_mod
 from py2ver import Py2ver
 
 

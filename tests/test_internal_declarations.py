@@ -1,5 +1,5 @@
-from ast_ir import Assignment, ModuleIR, Port
-from visitor import emit_internal_declarations
+from py2ver.ast_ir import Assignment, ModuleIR, Port
+from py2ver.visitor import emit_internal_declarations
 
 
 def test_emit_internal_declarations_skips_ports_and_formats_width_sign_type():

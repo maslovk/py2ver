@@ -1,6 +1,6 @@
 import ast
-from visitor import FunctionVisitor
-from renderer import Renderer
+from py2ver.visitor import FunctionVisitor
+from py2ver.renderer import Renderer
 from py2ver import DEFAULT_TEMPLATE_DIR
 
 def unit_render_add_xor(a, b):

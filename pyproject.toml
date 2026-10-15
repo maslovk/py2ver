@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py2ver"
+version = "0.1.0"
+description = "Turn Python functions into Verilog and check them against Python in simulation, on an FPGA board, and in synthesis"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Kirill Maslov" }]
+dependencies = [
+    "cocotb>=2.0,<3",
+    "Jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+# Talking to a physical DE0-Nano board over its UART
+hw = ["pyserial>=3.5"]
+test = ["pytest>=8", "hypothesis>=6", "pyserial>=3.5"]
+
+[project.urls]
+Homepage = "https://github.com/maslovk/py2ver"
+
+[tool.setuptools]
+packages = ["py2ver"]
+
+[tool.setuptools.package-data]
+py2ver = [
+    "templates/*.txt",
+    "templates/hw/*.txt",
+    "templates/hw/uart/*.txt",
+    "templates/hw/syn/*.txt",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "sim: end-to-end simulator integration tests (cocotb + Icarus)",
+    "quartus: real Quartus compile (skipped unless QUARTUS_DIR is set or quartus_sh is on PATH)",
+]

@@ -3,7 +3,7 @@ import itertools
 
 import pytest
 
-from semantics import Unsupported, analyze, parse
+from py2ver.semantics import Unsupported, analyze, parse
 
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import HealthCheck, given, settings, strategies as st  # noqa: E402

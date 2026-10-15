@@ -35,14 +35,14 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-import tb_runner
-from renderer import Renderer
-from syn_report import SynReport, read_report
-from pipeline import pipeline_ir
-from semantics import exact_ir
-from inline import inline_helpers
-from visitor import FunctionVisitor
-from ast_ir import Assignment, ModuleIR, Port
+from . import tb_runner
+from .renderer import Renderer
+from .syn_report import SynReport, read_report
+from .pipeline import pipeline_ir
+from .semantics import exact_ir
+from .inline import inline_helpers
+from .visitor import FunctionVisitor
+from .ast_ir import Assignment, ModuleIR, Port
 
 try:
     import serial  # pyserial

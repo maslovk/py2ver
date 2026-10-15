@@ -1,5 +1,5 @@
 import ast
-from visitor import FunctionVisitor
+from py2ver.visitor import FunctionVisitor
 
 def test_complex_number_support():
     """Test complex number operations."""

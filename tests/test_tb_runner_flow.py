@@ -1,4 +1,4 @@
-import tb_runner
+from py2ver import tb_runner
 
 
 class _FakeRunner:

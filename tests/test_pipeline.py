@@ -6,11 +6,11 @@ import shutil
 
 import pytest
 
-from pipeline import expr_cost, pipeline_ir
+from py2ver.pipeline import expr_cost, pipeline_ir
 from py2ver import Py2ver
 from test_sha256_readiness import sha4_round_core
 from test_state_stream import LPF_ATTR, lpf_step
-from visitor import FunctionVisitor
+from py2ver.visitor import FunctionVisitor
 
 SHA_ATTR = {
     n: {"signed": 0, "width": 32, "type": "wire"}

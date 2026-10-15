@@ -2,8 +2,8 @@ import ast
 import functools
 import re
 from typing import Dict, Any, List
-from ast_ir import ModuleIR, Port, Assignment, resolve_meta
-from semantics import Unsupported, analyze, parse
+from .ast_ir import ModuleIR, Port, Assignment, resolve_meta
+from .semantics import Unsupported, analyze, parse
 
 try:
     import textwrap

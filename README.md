@@ -12,8 +12,11 @@ or on an FPGA (DE0-Nano, over UART).
 
 ```
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install "py2ver[hw] @ git+https://github.com/maslovk/py2ver"
 ```
+
+For development, from a clone: `.venv/bin/pip install -e ".[test,hw]"`.
+The `hw` extra (pyserial) is only needed to talk to a physical board.
 
 Simulation also needs [Icarus Verilog](https://steveicarus.github.io/iverilog/)
 (`iverilog`, `vvp`) on `PATH`. The hardware path needs Intel Quartus and a

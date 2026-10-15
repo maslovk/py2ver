@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-import py2ver as py2ver_mod
+import py2ver.core as py2ver_mod
 from py2ver import Py2ver
-from syn_report import parse_setup_slack, parse_summary, read_report, summary_int
+from py2ver.syn_report import parse_setup_slack, parse_summary, read_report, summary_int
 from test_state_stream import LPF_ATTR, lpf_step
 
 # Trimmed reports from real Quartus 22.1std compiles of the SYN() wrapper

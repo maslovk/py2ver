@@ -1,7 +1,7 @@
 # renderer.py
 from typing import Dict, Any, List
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
-from ast_ir import ModuleIR, Port, Assignment
+from .ast_ir import ModuleIR, Port, Assignment
 
 def make_env(template_dir: str) -> Environment:
     return Environment(

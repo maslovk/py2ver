@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple
 
-from ast_ir import Assignment, ModuleIR, Port, resolve_meta as _meta
+from .ast_ir import Assignment, ModuleIR, Port, resolve_meta as _meta
 
 _IDENT = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 

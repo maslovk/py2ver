@@ -1,5 +1,5 @@
 import ast
-from visitor import FunctionVisitor
+from py2ver.visitor import FunctionVisitor
 import pytest
 
 def test_missing_attribute_error():

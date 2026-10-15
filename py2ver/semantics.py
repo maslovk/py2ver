@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ast_ir import Assignment, ModuleIR, Port, resolve_meta
+from .ast_ir import Assignment, ModuleIR, Port, resolve_meta
 
 log = logging.getLogger(__name__)
 
