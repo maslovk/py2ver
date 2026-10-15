@@ -33,6 +33,7 @@ import pprint
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -46,7 +47,8 @@ from .inline import inline_helpers
 from .names import rename_keywords
 from .auto import auto_fixed
 from .hwtypes import _namespace, normalize_attr, read_annotations
-from .fixed import DEFAULT_CONST_BITS, build_model, lower_fixed, quantize, uses_fixed
+from .cplx import split_complex
+from .fixed import DEFAULT_CONST_BITS, build_model, is_table, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
 
@@ -70,6 +72,79 @@ DEFAULT_SYN_DEVICE = "EP4CE22F17C6"
 DEFAULT_SYN_PERIOD_NS = 20.0
 
 log = logging.getLogger(__name__)
+
+
+def front_end(func: Callable, attr: Dict[str, Any] | None,
+              const_bits: int = DEFAULT_CONST_BITS) -> SimpleNamespace:
+    """
+    The function as the translator takes it: parsed, annotations read,
+    helpers inlined, keywords renamed, complex values split and fixed point
+    lowered to integer code, with its bit-exact model (fixed point only).
+    """
+    try:
+        source_foo = inspect.getsource(func)
+    except Exception as e:
+        raise RuntimeError(f"Unable to load source for {func}: {e}") from e
+    fe = SimpleNamespace()
+    tree = ast.parse(source_foo)
+    # Types from annotations (U[8], State(...), ...); attr entries merge over them
+    tree, ann = read_annotations(tree, func)
+    if attr is None and not ann:
+        raise ValueError("Give attr (widths and formats), annotations, or samples=<example "
+                         "inputs> to choose them automatically")
+    attr = normalize_attr(attr)
+    attr = {k: dict(ann.get(k, {}), **attr.get(k, {})) for k in dict.fromkeys([*ann, *attr])}
+    # The function's own parameters and attr, for running it as written (PY_float)
+    fe.py_attr = attr
+    fe.py_params = list(inspect.signature(func).parameters)
+    # Inline calls to your own helper functions and module-level int constants
+    tree = inline_helpers(tree, getattr(func, "__globals__", {}))
+    # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
+    tree, fe.hw_name = rename_keywords(tree)
+    fe.py_name = {v: k for k, v in fe.hw_name.items()}
+    attr = {
+        fe.hw_name.get(k, k): (
+            dict(v, next=fe.hw_name.get(v["next"], v["next"]))
+            if isinstance(v, dict) and "next" in v else v
+        )
+        for k, v in attr.items()
+    }
+    ns = _namespace(func)
+    # Inputs as the caller gives them (a complex one is split in two below)
+    fe.call_inputs = [fe.hw_name.get(p, p) for p in fe.py_params
+                      if not {"next", "memory"} & set(attr.get(fe.hw_name.get(p, p), {}))]
+    # Complex values become real / imaginary pairs (see cplx.py)
+    fixed = uses_fixed(attr)
+    fe.cplx_params = set()
+    if fixed or any(isinstance(m, dict) and m.get("complex") for m in attr.values()):
+        tree, attr, fe.cplx_params = split_complex(tree, attr, ns)
+    # Fixed point ('frac' in attr) becomes integer code on raw values, and
+    # the same code run in Python is the bit-exact reference (see fixed.py);
+    # function tables ('math.sin': {'range': ...}) become ROMs in the code
+    attr = {k: Py2ver._raw_init(v) for k, v in attr.items()}
+    tree, fx_attr, fe.fx_types = lower_fixed(tree, attr, ns, const_bits, fe.py_name)
+    attr = {k: v for k, v in attr.items() if not is_table(v)}
+    attr.update(fx_attr)
+    # The reference runs the rewritten code for fixed point, and for complex
+    # parameters (which the ports take as real / imaginary parts)
+    fe.model = build_model(tree, attr, ns) if fixed or fe.cplx_params else None
+    fe.tree, fe.attr = tree, attr
+    return fe
+
+
+def expand_args(call_inputs: List[str], cplx_params: set, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """Arguments as the caller gives them -> as the ports take them (a complex
+    argument as its real and imaginary parts)."""
+    if not cplx_params:
+        return tuple(args)
+    out: List[Any] = []
+    for name, v in zip(call_inputs, args):
+        if name in cplx_params:
+            v = complex(v)
+            out += [v.real, v.imag]
+        else:
+            out.append(v)
+    return tuple(out) + tuple(args[len(call_inputs):])
 
 
 class Py2ver:
@@ -98,38 +173,12 @@ class Py2ver:
             print(f"py2ver: formats chosen for {getattr(func, '__name__', 'the function')}"
                   f" (pass this as attr to keep them):\nattr = {{\n{lines}}}")
 
-        try:
-            source_foo = inspect.getsource(func)
-        except Exception as e:
-            raise RuntimeError(f"Unable to load source for {func}: {e}") from e
-
-        tree = ast.parse(source_foo)
-        # Types from annotations (U[8], State(...), ...); attr entries merge over them
-        tree, ann = read_annotations(tree, func)
-        if attr is None and not ann:
-            raise ValueError("Give attr (widths and formats), annotations, or samples=<example "
-                             "inputs> to choose them automatically")
-        attr = normalize_attr(attr)
-        attr = {k: dict(ann.get(k, {}), **attr.get(k, {})) for k in dict.fromkeys([*ann, *attr])}
-        # Inline calls to your own helper functions and module-level int constants
-        tree = inline_helpers(tree, getattr(func, "__globals__", {}))
-        # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
-        tree, self._hw_name = rename_keywords(tree)
-        self._py_name = {v: k for k, v in self._hw_name.items()}
-        attr = {
-            self._hw_name.get(k, k): (
-                dict(v, next=self._hw_name.get(v["next"], v["next"]))
-                if isinstance(v, dict) and "next" in v else v
-            )
-            for k, v in attr.items()
-        }
-        # Fixed point ('frac' in attr) becomes integer code on raw values, and
-        # the same code run in Python is the bit-exact reference (see fixed.py)
-        attr = {k: self._raw_init(v) for k, v in attr.items()}
-        ns = _namespace(func)
-        tree, fx_attr, self._fx_types = lower_fixed(tree, attr, ns, const_bits, self._py_name)
-        attr.update(fx_attr)
-        self._model = build_model(tree, attr, ns) if uses_fixed(attr) else None
+        fe = front_end(func, attr, const_bits)
+        tree, attr = fe.tree, fe.attr
+        self._py_attr, self._py_params = fe.py_attr, fe.py_params
+        self._hw_name, self._py_name = fe.hw_name, fe.py_name
+        self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
+        self._fx_types, self._model = fe.fx_types, fe.model
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 
@@ -1234,12 +1283,8 @@ class Py2ver:
         return self.py_float_fun
 
     def py_float_fun(self, vectors: List[Any]) -> List[Tuple[Any, ...]]:
-        if self.state_map or self.rams:
-            return self._stream_reference(vectors, exact=False)
-        params = [p for p, _ in self.arg_groups]
-        return [_flatten_outputs(self.func(*[self._float_value(p, self._py_value(p, v))
-                                             for p, v in zip(params, vec)]))
-                for vec in vectors]
+        from .auto import float_reference
+        return float_reference(self.func, self._py_attr, vectors)
 
     def quantization_error(self, vectors: List[Any]) -> Dict[str, Tuple[float, float]]:
         """
@@ -1300,15 +1345,11 @@ class Py2ver:
                                   bool(m.get("round")), bool(m.get("saturate")))
         return [conv(v) for v in value] if isinstance(value, (list, tuple)) else conv(value)
 
-    def _float_value(self, param: str, raw: Any) -> Any:
-        """Raw value(s) of a fixed-point parameter as numbers."""
-        m = self._fx_params.get(param)
-        if m is None:
-            return raw
-        conv = lambda v: int(v) / (1 << m["frac"])  # noqa: E731
-        return [conv(v) for v in raw] if isinstance(raw, (list, tuple)) else conv(raw)
+    def _expand(self, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        return expand_args(self._call_inputs, self._cplx_params, args)
 
     def _py_args(self, vec: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        vec = self._expand(tuple(vec))
         params = [p for p, _ in self.arg_groups]
         return tuple(self._py_value(p, v) for p, v in zip(params, vec)) + tuple(vec[len(params):])
 
@@ -1332,6 +1373,7 @@ class Py2ver:
         """Function arguments (a list argument as a list) -> one value per input port."""
         groups = [(p, ports) for p, ports in self.arg_groups
                   if (ports or [p])[0] in self.input_args_list]   # state lives in registers
+        in_arg = self._expand(tuple(in_arg))
         out: List[Any] = []
         for value, (param, ports) in zip(in_arg, groups):
             value = self._py_value(param, value)
@@ -1426,16 +1468,11 @@ class Py2ver:
         next-state output back into its state argument with the same
         width/sign wrapping as the hardware registers.
         """
-        return self._stream_reference(samples, exact=True)
-
-    def _stream_reference(self, samples: List[Any], exact: bool) -> List[Tuple[Any, ...]]:
-        """exact: raw values wrapped like the hardware; else the original
-        function on numbers, nothing wrapped (PY_float)."""
         samples = list(samples)
         self._stream_vectors(samples)  # validates
         groups = dict(self.arg_groups)
 
-        model = exact and self._model is not None
+        model = self._model is not None
         func = self._model if model else self.func
         py = (lambda name: name) if model else (lambda name: self._py_name.get(name, name))  # noqa: E731
         params = list(inspect.signature(func).parameters)
@@ -1449,7 +1486,7 @@ class Py2ver:
             return int(m.get("width", 1)), int(m.get("signed", 0)) == 1
 
         def keep(name: str, v: Any) -> Any:
-            return self._wrap(int(v), *_meta(name)) if exact else v
+            return self._wrap(int(v), *_meta(name))
 
         def _state_value(param: str, value_of) -> Any:
             ports = groups[param]
@@ -1457,33 +1494,26 @@ class Py2ver:
                 return keep(param, value_of(param))
             return [keep(port, value_of(port)) for port in ports]
 
-        def _init(param: str, raw: Any) -> Any:
-            return raw if exact else self._float_value(param, raw)
-
-        state = {p: _init(p, _state_value(p, self.state_init.__getitem__))
-                 for p in self.state_params}
+        state = {p: _state_value(p, self.state_init.__getitem__) for p in self.state_params}
         # Memories: the function updates the list in place; values wrap like the RAM
         rams = {}
         for mem, ram in self.rams.items():
             init = self._ram_init[mem]
             vals = list(init) if isinstance(init, (list, tuple)) else [init] * ram["length"]
             w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
-            rams[mem] = _init(mem, [self._wrap(int(v), w, sgn) for v in vals])
+            rams[mem] = [self._wrap(int(v), w, sgn) for v in vals]
         outs: List[Tuple[Any, ...]] = []
         for sample in samples:
-            args = sample if isinstance(sample, tuple) else (sample,)
+            args = self._expand(sample if isinstance(sample, tuple) else (sample,))
             kwargs = dict(zip(inputs, args))
             for p in inputs[len(args):]:                     # missing trailing args: 0
                 kwargs[p] = 0 if groups[p] is None else [0] * len(groups[p])
             kwargs = {p: self._py_value(p, v) for p, v in kwargs.items()}
-            if not exact:
-                kwargs = {p: self._float_value(p, v) for p, v in kwargs.items()}
             call = {py(k): v for k, v in {**kwargs, **state, **rams}.items()}
             ret = _flatten_outputs(func(**call))
-            if exact:
-                for mem, ram in self.rams.items():
-                    w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
-                    rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
+            for mem, ram in self.rams.items():
+                w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
+                rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
             row = {name: keep(name, v) for name, v in zip(self.output_args_list, ret)}
             outs.append(tuple(row[n] for n in self.output_args_list))
             state = {p: _state_value(p, lambda port: row[self.state_map[port]])

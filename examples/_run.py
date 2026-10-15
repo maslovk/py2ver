@@ -65,7 +65,7 @@ def run(p, vectors, stream=False):
     for v, e in list(zip(vectors, expected))[:4]:
         print(f"  {p.t_name}{v} -> {e}")
     ok = _report("simulation", sim, expected, vectors)
-    if p._model is not None:      # fixed point: how far from the float model
+    if p._fx_out:                 # fixed point: how far from the float model
         for name, (worst, rms) in p.quantization_error(vectors).items():
             if worst:
                 print(f"    {name}: max error {worst:.3g}, rms {rms:.3g} vs. float")

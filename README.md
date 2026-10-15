@@ -138,9 +138,10 @@ What the hardware computes:
   significant bits, else rounded to that many: `Py2ver(f, attr,
   const_bits=18)` (the default).
 - `int(x)` truncates toward zero, `math.floor` / `math.ceil` work, `float(x)`
-  is `x`. `//`, `%`, `round()`, bitwise operators and complex values aren't
-  supported on fixed-point values. `/` between two integers keeps its
-  integer meaning (`int(a / b)`).
+  is `x`, and `math.pi` and other module-level numbers are constants. `//`,
+  `%`, `round()` and bitwise operators aren't supported on fixed-point
+  values. `/` between two integers keeps its integer meaning (`int(a / b)`).
+- Complex values and math functions work too, see below.
 
 The Python references:
 
@@ -154,6 +155,44 @@ The Python references:
 Inputs are numbers (floats too), quantized to each input's format like an
 assignment. Fixed-point outputs come back as floats, and a fixed-point
 state's or memory's `'init'` is a number too.
+
+**Complex values.** A complex value is a pair of fixed-point values (`z_re`,
+`z_im`), with the format of `z` in attr for both. A complex parameter or
+state needs `'complex': True` (it becomes two ports); you pass and get back
+Python complex numbers, and a returned complex value is two outputs. `+`,
+`-`, `*`, `/` by a real value, `.real`, `.imag`, `.conjugate()`,
+`complex(a, b)` and complex constants work, including module-level tables of
+them (FFT twiddle factors) indexed by a variable. `abs()` of a complex value
+(a square root) and division by a complex value aren't supported.
+
+```python
+ROT = cmath.exp(-2j * math.pi * 0.125)
+
+def downconvert(x, z):             # a real signal times a complex oscillator
+    y = x * z
+    zn = z * ROT
+    return y, zn
+
+attr = {'x': {'signed': 1, 'width': 12, 'frac': 11},
+        'z': {'signed': 1, 'width': 18, 'frac': 16, 'complex': True, 'next': 'zn', 'init': 1},
+        'y': {'signed': 1, 'width': 14, 'frac': 12}}
+```
+
+**Math functions.** A call to a `math` function of one argument (`math.sin`,
+`math.exp`, `math.sqrt`, `math.tanh`, ...; `sin` if imported that way)
+becomes a table (a ROM) of the function over a range of its argument,
+configured in attr under the call as written:
+
+```python
+attr = {..., 'math.tanh': {'range': (-4, 4), 'bits': 10, 'signed': 1, 'width': 16, 'frac': 14}}
+```
+
+The table has up to `2**bits` entries (default 10) at a power-of-two step
+covering `range`; each holds the function at the middle of its step, rounded
+to the format given. The argument picks its entry (arguments outside the
+range use the end entries). Every call of that function shares the
+configuration. With `samples=` / `auto_fixed`, the ranges, formats and (with
+`max_error`) the table sizes are chosen for you.
 
 
 ### Choosing fixed-point formats automatically
@@ -363,9 +402,10 @@ vectors).
 - Complex values from integer parts: `complex(re, im)`, `1j` constants,
   `+ - *`, unary `-`, `.real`, `.imag`, `.conjugate()`; a complex variable
   `z` is held as `z_re` / `z_im`, a returned one is two outputs, and declaring
-  `z` in `attr` sets both widths. `abs()` of a complex value uses `$sqrt`, so
-  it only works in simulation. Python computes complex numbers in floating
-  point, so results match exactly while they stay below 2**53.
+  `z` in `attr` sets both widths. Complex parameters need `'complex': True`
+  in attr. `abs()` of a complex value uses `$sqrt`, so it only works in
+  simulation. Python computes complex numbers in floating point, so results
+  match exactly while they stay below 2**53. Complex fixed point: see above.
 - A single `return` of variables or expressions (an expression output is
   named `ret`, or `ret0`, `ret1`, ... for several)
 
@@ -461,7 +501,8 @@ extra hardware. `and`/`or` give 0/1, not Python's operand values.
 signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
-chosen formats, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
+table, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```

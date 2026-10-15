@@ -22,21 +22,19 @@ overflow, so give inputs that cover the real range (or more margin, or
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import inspect
 import logging
 import math
-import os
-import tempfile
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .fixed import DEFAULT_CONST_BITS
+from .fixed import DEFAULT_CONST_BITS, DEFAULT_TABLE_BITS, quantize, wrap
 from .hwtypes import _namespace, normalize_attr, read_annotations
 
 log = logging.getLogger(__name__)
 
 MAX_SEARCH_FRAC = 64
+MAX_TABLE_BITS = 14
 
 
 class _Range:
@@ -46,6 +44,7 @@ class _Range:
         self.is_float = False
         self.length = 0          # for a list: its longest length seen
         self.is_list = False
+        self.is_complex = False
 
     def add(self, v: Any) -> None:
         if isinstance(v, (list, tuple)):
@@ -57,6 +56,11 @@ class _Range:
             self._add(v)
 
     def _add(self, x: Any) -> None:
+        if isinstance(x, complex):
+            self.is_complex = True
+            self._add(x.real)
+            self._add(x.imag)
+            return
         if isinstance(x, bool) or not isinstance(x, (int, float)):
             return
         self.is_float |= isinstance(x, float)
@@ -67,6 +71,7 @@ class _Range:
         self.is_float |= other.is_float
         self.length = max(self.length, other.length)
         self.is_list |= other.is_list
+        self.is_complex |= other.is_complex
 
     def int_bits(self) -> int:
         """Smallest I with -2**I <= lo and hi < 2**I (0 for a value that is always 0)."""
@@ -131,27 +136,72 @@ def _traced(func: Callable, record: Callable[[str, Any], None]):
             node.body = trace(targets(node.target)) + node.body
             return node
 
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            key = ast.unparse(node.func)
+            if key in tables or (len(node.args) == 1 and not node.keywords
+                                 and _math_function(node.func, ns) is not None):
+                tables.setdefault(key, None)
+                return ast.Call(func=ast.Name(id="__py2ver_call", ctx=ast.Load()), keywords=[],
+                                args=[ast.Constant(key), node.func] + node.args)
+            return node
+
     returned = _returned_names(fd)
+    ns = _namespace(func)
+    tables: Dict[str, None] = {}
     fd.body = trace([a.arg for a in fd.args.args]) + [_Trace().visit(s) for s in fd.body]
     fd.body = [s for item in fd.body for s in (item if isinstance(item, list) else [item])]
     fd.decorator_list = []
-    ns = _namespace(func)
+
+    def call(key: str, fn: Callable, *args: Any) -> Any:
+        y = fn(*args)
+        record(f"{key}{_TABLE_IN}", args[0])
+        record(key, y)
+        return y
+
     ns["__py2ver_trace"] = record
+    ns["__py2ver_call"] = call
     exec(compile(ast.fix_missing_locations(tree), f"<traced {fd.name}>", "exec"), ns)
-    return ns[fd.name], order, returned, ann
+    return ns[fd.name], order + list(tables), returned, ann
 
 
-def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]):
-    """Run the float function on the samples (feeding state back like PY_float)
-    and return ({name: _Range}, names in order of first assignment, returned names)."""
-    ranges: Dict[str, _Range] = {}
+_TABLE_IN = ":in"               # range key of a table function's argument
+_NO_TABLE = {"floor", "ceil"}   # math functions computed exactly
+
+
+def _math_function(f: ast.expr, ns: Dict[str, Any]) -> Optional[Callable]:
+    node = f
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    try:
+        fn = eval(compile(ast.Expression(copy.deepcopy(f)), "<f>", "eval"), dict(ns))
+    except Exception:
+        return None
+    if getattr(fn, "__module__", None) == "math" and callable(fn) \
+            and getattr(fn, "__name__", "") not in _NO_TABLE:
+        return fn
+    return None
+
+
+def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]],
+              record: Optional[Callable[[str, Any], None]] = None):
+    """
+    Run the function as written on the samples, feeding state back ('next')
+    and keeping memories ('memory') between samples. Returns (outputs per
+    sample, flattened like the ports; names in order of first assignment;
+    returned names). record(name, value) sees every assigned value.
+    """
+    from .core import _flatten_outputs
     last: Dict[str, Any] = {}
 
-    def record(name: str, value: Any) -> None:
-        ranges.setdefault(name, _Range()).add(value)
+    def rec(name: str, value: Any) -> None:
         last[name] = list(value) if isinstance(value, list) else value
+        if record is not None:
+            record(name, value)
 
-    traced, order, returned, _ = _traced(func, record)
+    traced, order, returned, _ = _traced(func, rec)
     params = list(inspect.signature(func).parameters)
     state = [p for p in params if "next" in attr.get(p, {}) or "memory" in attr.get(p, {})]
     inputs = [p for p in params if p not in state]
@@ -163,6 +213,7 @@ def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]
             values[p] = list(init) if isinstance(init, (list, tuple)) else [init] * int(m["length"])
         else:
             values[p] = init
+    outputs = []
     for sample in samples:
         args = sample if isinstance(sample, tuple) else (sample,)
         if not state and len(args) != len(params):
@@ -171,11 +222,126 @@ def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]
         ret = traced(**dict(zip(inputs, args)), **values)
         rets = ret if isinstance(ret, tuple) and len(returned) > 1 else (ret,)
         for name, v in zip(returned, rets):
-            record(name, v)
+            rec(name, v)
+        outputs.append(_flatten_outputs(ret))
         for p in state:
             nxt = attr[p].get("next")
             if nxt is not None and nxt != p:
                 values[p] = last.get(nxt, values[p])
+    return outputs, order, returned
+
+
+def float_reference(func: Callable, attr: Dict[str, Dict[str, Any]],
+                    samples: List[Any]) -> List[Tuple[Any, ...]]:
+    """
+    PY_float(): the function as written on the samples, with the inputs (and
+    state / memory 'init') quantized to their formats in attr first, so only
+    the quantization inside the design is measured against it.
+    """
+    params = list(inspect.signature(func).parameters)
+    inputs = [p for p in params if not {"next", "memory"} & set(attr.get(p, {}))]
+
+    def number(name: str, v: Any) -> Any:
+        m = attr.get(name, {})
+        if isinstance(v, (list, tuple)):
+            return [number(name, x) for x in v]
+
+        def real(x: Any) -> Any:
+            if m.get("frac") is None:
+                return x
+            return quantize(x, m["frac"], m["width"], bool(m.get("signed")), bool(m.get("round")),
+                            bool(m.get("saturate"))) / (1 << m["frac"])
+
+        if isinstance(v, complex) or m.get("complex"):    # complex in hardware: complex here too
+            v = complex(v)
+            return complex(real(v.real), real(v.imag))
+        return real(v)
+
+    def sample(v: Any) -> Any:
+        args = v if isinstance(v, tuple) else (v,)
+        return tuple(number(p, x) for p, x in zip(inputs, args)) + tuple(args[len(inputs):])
+
+    attr = {k: (dict(m, init=number(k, m["init"])) if isinstance(m, dict) and "init" in m else m)
+            for k, m in attr.items()}
+    return run_float(func, [sample(v) for v in samples], attr)[0]
+
+
+def model_outputs(fe: Any, samples: List[Any]) -> Tuple[List[str], List[Tuple[float, ...]]]:
+    """
+    The bit-exact model of a front end (core.front_end) on the samples, with
+    state fed back and memories kept, like PY_batch / PY_stream but without
+    building the hardware. Returns (output names, values per sample).
+    """
+    from .core import expand_args
+    model, attr = fe.model, fe.attr
+    params = list(inspect.signature(model).parameters)
+    ret = next(s for s in reversed(fe.tree.body[0].body) if isinstance(s, ast.Return))
+    names = [e.id for e in (ret.value.elts if isinstance(ret.value, ast.Tuple) else [ret.value])]
+    state = [p for p in params if {"next", "memory"} & set(attr.get(p, {}))]
+    inputs = [p for p in params if p not in state]
+
+    def fit(name: str, v: Any) -> Any:
+        m = attr.get(name, {})
+        if "width" not in m:
+            return v
+        if isinstance(v, list):
+            return [wrap(int(x), int(m["width"]), bool(m.get("signed"))) for x in v]
+        return wrap(int(v), int(m["width"]), bool(m.get("signed")))
+
+    def raw(name: str, v: Any) -> Any:
+        m = attr.get(name, {})
+        if m.get("frac") is None:
+            return v
+        q = lambda x: quantize(x, m["frac"], m["width"], bool(m.get("signed")),  # noqa: E731
+                               bool(m.get("round")), bool(m.get("saturate")))
+        return [q(x) for x in v] if isinstance(v, (list, tuple)) else q(v)
+
+    def number(name: str, v: Any) -> float:
+        t = fe.fx_types.get(name)
+        t = t[1] if t is not None and t[0] == "l" else t
+        return v / (1 << t[1]) if t is not None and t[0] == "f" else v
+
+    values: Dict[str, Any] = {}
+    for p in state:
+        m = attr[p]
+        init = m.get("init", 0)
+        if "length" in m:
+            init = list(init) if isinstance(init, (list, tuple)) else [init] * int(m["length"])
+        values[p] = fit(p, init)
+    ports: List[str] = []
+    rows: List[Tuple[float, ...]] = []
+    for sample in samples:
+        args = expand_args(fe.call_inputs, fe.cplx_params, sample if isinstance(sample, tuple) else (sample,))
+        out = model(**{p: raw(p, v) for p, v in zip(inputs, args)}, **values)
+        outs = out if isinstance(out, tuple) and len(names) > 1 else (out,)
+        row = dict(zip(names, outs))
+        flat, ports = [], []
+        for n in names:
+            v = row[n]
+            if isinstance(v, list):
+                flat += [number(n, x) for x in v]
+                ports += [f"{n}_{k}" for k in range(len(v))]
+            else:
+                flat.append(number(n, v))
+                ports.append(n)
+        rows.append(tuple(flat))
+        for p in state:
+            nxt = attr[p].get("next")
+            values[p] = fit(p, row[nxt] if nxt not in (None, p) else values[p])
+    return [fe.py_name.get(n, n) for n in ports], rows
+
+
+def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]):
+    """Run the float function on the samples (feeding state back like PY_float)
+    and return ({name: _Range}, names in order of first assignment, returned names)."""
+    ranges: Dict[str, _Range] = {}
+
+    def record(name: str, value: Any) -> None:
+        ranges.setdefault(name, _Range()).add(value)
+
+    _, order, returned = run_float(func, samples, attr, record)
+    params = list(inspect.signature(func).parameters)
+    state = [p for p in params if "next" in attr.get(p, {}) or "memory" in attr.get(p, {})]
     # A state also takes the values of its next state
     for p in state:
         nxt = attr[p].get("next")
@@ -191,16 +357,13 @@ def _fmt(r: _Range, int_bits: int, frac: int) -> Dict[str, Any]:
     return out
 
 
-@contextlib.contextmanager
-def _scratch_dir() -> Iterator[None]:
-    """Build trial designs out of the way (Py2ver writes hdl/ to the working directory)."""
-    cwd = os.getcwd()
-    with tempfile.TemporaryDirectory(prefix="py2ver_auto_") as tmp:
-        os.chdir(tmp)
-        try:
-            yield
-        finally:
-            os.chdir(cwd)
+def _table_range(r: _Range) -> Tuple[float, float]:
+    """A table's input range: the arguments seen, rounded outward to 1/16 of the span."""
+    lo, hi = r.lo, r.hi
+    if not lo < hi:
+        lo, hi = lo - 0.5, hi + 0.5
+    q = 2.0 ** (math.floor(math.log2(hi - lo)) - 4)
+    return math.floor(lo / q) * q, math.ceil(hi / q) * q
 
 
 def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]] = None, *,
@@ -244,10 +407,13 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     kept = {k for k, m in base.items() if "width" in m}
     result: Dict[str, Dict[str, Any]] = {}
     auto: Dict[str, Tuple[_Range, int]] = {}       # name -> (range, integer bits)
+    tables = {n for n in order if f"{n}{_TABLE_IN}" in ranges}
     for name in order + [n for n in returned if n not in order]:
         r = ranges.get(name)
         if name in kept or name in nexts or r is None or name in result:
             continue
+        if name in tables and not r.is_float:
+            r.is_float = True                        # a table's entries are fixed point
         if r.lo > r.hi and not r.is_float:
             continue                                 # never held a number (e.g. complex)
         if not r.is_float:
@@ -260,12 +426,19 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             continue                                 # integer locals keep exact widths
         auto[name] = (r, r.int_bits() + margin)
 
+    bits = {n: DEFAULT_TABLE_BITS for n in auto if n in tables}
+
     def formats(fracs: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
         out = {k: dict(base[k]) for k in params if k in base}
         out.update(result)
         for name, (r, ib) in auto.items():
             f = max(0, fracs[name])
-            out[name] = dict(base.get(name, {}), **_fmt(r, ib, f), **extra)
+            fmt = _fmt(r, ib, f)
+            if name in tables:                       # 'math.sin': {'range', 'bits', format}
+                fmt = dict(range=_table_range(ranges[f"{name}{_TABLE_IN}"]), bits=bits[name], **fmt)
+            elif name in params and r.is_complex:
+                fmt["complex"] = True
+            out[name] = dict(base.get(name, {}), **fmt, **extra)
             if f + ib + 1 < 1:
                 out[name]["width"] = 1
         for k, m in base.items():
@@ -285,6 +458,8 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
                 raise ValueError(f"Give input '{p}' a format in attr, or width=<bits> for inputs")
             r, ib = auto.pop(p)
             result[p] = dict(base.get(p, {}), **_fmt(r, ib, max(0, width - 1 - ib)))
+            if r.is_complex:
+                result[p]["complex"] = True
 
     def target(port: str) -> Optional[float]:
         if not isinstance(max_error, dict):
@@ -294,17 +469,23 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
                 return float(max_error[name])
         return None
 
-    from .core import Py2ver                      # noqa: E402  (core imports this module's peers)
+    from .core import front_end
     n_evals = 0
 
     def error_ok(fracs: Dict[str, int]) -> bool:
+        """Does the design with these formats meet max_error on the samples?
+        (The bit-exact model against the float function, without building hardware.)"""
         nonlocal n_evals
         n_evals += 1
-        with _scratch_dir():
-            p = Py2ver(func, formats(fracs), const_bits=const_bits)
-        err = p.quantization_error(samples)
-        return all(t is None or worst <= t for port, (worst, _) in err.items()
-                   for t in [target(port)])
+        attr = formats(fracs)
+        ports, exact = model_outputs(front_end(func, attr, const_bits), samples)
+        ideal = float_reference(func, attr, samples)
+        for i, port in enumerate(ports):
+            t = target(port)
+            if t is not None and any(abs(float(e[i]) - float(r[i])) > t
+                                     for e, r in zip(exact, ideal)):
+                return False
+        return True
 
     tightest = min(v for v in ([max_error] if not isinstance(max_error, dict)
                                else max_error.values()))
@@ -312,11 +493,16 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     uniform = lambda f: {n: f for n in auto}  # noqa: E731
     hi = start
     while not error_ok(uniform(hi)):
-        if hi >= MAX_SEARCH_FRAC:
+        if hi < MAX_SEARCH_FRAC:
+            hi = min(MAX_SEARCH_FRAC, hi + 8)
+        elif bits and min(bits.values()) < MAX_TABLE_BITS:     # finer tables, then
+            for name in bits:
+                bits[name] = min(MAX_TABLE_BITS, bits[name] + 2)
+        else:
             raise ValueError(
-                f"max_error {max_error} can't be met with up to {MAX_SEARCH_FRAC} fraction bits; "
-                "check the input formats and const_bits")
-        hi = min(MAX_SEARCH_FRAC, hi + 8)
+                f"max_error {max_error} can't be met with up to {MAX_SEARCH_FRAC} fraction bits"
+                + (f" and {MAX_TABLE_BITS}-bit tables" if bits else "")
+                + "; check the input formats and const_bits")
     # The smallest fraction for all values together, then for each value on its own
     lo = 0
     while lo < hi:
@@ -340,5 +526,16 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
                 fracs[name], changed = hi, True
         if not changed:
             break
+    # Then the fewest entries for each table
+    for name in bits:
+        lo, hi = 2, bits[name]
+        while lo < hi:
+            mid = (lo + hi) // 2
+            bits[name] = mid
+            if error_ok(fracs):
+                hi = mid
+            else:
+                lo = mid + 1
+        bits[name] = hi
     log.info("auto_fixed: %d trial designs", n_evals)
     return formats(fracs)

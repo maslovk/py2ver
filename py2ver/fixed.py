@@ -30,11 +30,13 @@ from __future__ import annotations
 
 import ast
 import copy
+import functools
 import math
 from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 DEFAULT_CONST_BITS = 18
+DEFAULT_TABLE_BITS = 10
 # Beyond this many fraction bits a variable's format is taken to grow forever
 MAX_FRAC = 256
 
@@ -52,8 +54,13 @@ def quantize(v: Any, frac: int, width: int, signed: bool,
              round: bool = False, saturate: bool = False) -> int:
     """Raw value of the number v with `frac` fraction bits: floor (or round half
     up), then wrap (or saturate) to width."""
-    scaled = Fraction(v) * (1 << frac)
-    raw = math.floor(scaled + Fraction(1, 2)) if round else math.floor(scaled)
+    if isinstance(v, (int, float)):
+        num, den = v.as_integer_ratio()
+    else:
+        x = Fraction(v)
+        num, den = x.numerator, x.denominator
+    num <<= frac
+    raw = (2 * num + den) // (2 * den) if round else num // den     # exact floor
     if saturate:
         lo, hi = int_range(width, signed)
         return max(lo, min(hi, raw))
@@ -167,9 +174,11 @@ class _Lower:
             n.id for n in ast.walk(fd) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
         }
         self.used = {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)} | set(self.params)
+        # Function tables: 'math.sin': {'range': (lo, hi), 'bits', format}
+        self.tables = {k: m for k, m in attr.items() if is_table(m)}
         # Names with a format: assignments to them quantize
         self.meta: Dict[str, Dict[str, Any]] = {
-            k: m for k, m in attr.items() if isinstance(m, dict) and "width" in m
+            k: m for k, m in attr.items() if isinstance(m, dict) and "width" in m and not is_table(m)
         }
         for p in self.params:
             self.meta.setdefault(p, dict(attr.get(p, {})))
@@ -415,6 +424,12 @@ class _Lower:
             return n, LST(t)
 
         if isinstance(n, ast.Attribute):
+            const = self._global_value(n)
+            if isinstance(const, (int, float)) and not isinstance(const, bool):
+                if isinstance(const, float):
+                    raw, frac = const_raw(const, self.const_bits)
+                    return ast.copy_location(ast.Constant(raw), n), FX(frac)
+                return ast.copy_location(ast.Constant(const), n), INT
             v, t = self.ex(n.value)
             n.value = v
             if _is_fx(t):
@@ -487,6 +502,55 @@ class _Lower:
         raw, frac = const_raw(1 / q, self.const_bits)
         return ast.BinOp(left=l, op=ast.Mult(), right=ast.Constant(raw)), FX(fl + frac)
 
+    def _global_value(self, f: ast.expr) -> Any:
+        """The value of a dotted global name (math.pi, math.sin), or None."""
+        node = f
+        while isinstance(node, ast.Attribute):
+            node = node.value
+        if not isinstance(node, ast.Name) or node.id in self.locals:
+            return None
+        try:
+            return eval(compile(ast.Expression(copy.deepcopy(f)), "<global>", "eval"), dict(self.ns))
+        except Exception:
+            return None
+
+    def _table(self, n: ast.Call, key: str, v: ast.expr, t):
+        """f(x) as a table of f over attr[key]['range'], indexed by x: 2**bits
+        entries (a power-of-two step), each f at the middle of its step,
+        rounded to the format; x outside the range uses the end entries."""
+        meta = self.tables[key]
+        out = FX(int(meta["frac"]))
+        if t is None:
+            return n, out
+        if t[0] == "l" or t == CPLX or len(n.args) != 1 or n.keywords:
+            self._err(n, f"A table function takes one real value ({key})")
+        if not self.final:
+            return n, out                              # types only: no need for the entries
+        fn = self._global_value(n.func)
+        if not callable(fn):
+            self._err(n, f"'{key}' is not a function")
+        try:
+            s, start, values = _table_entries(fn, tuple(meta["range"]),
+                                              int(meta.get("bits", DEFAULT_TABLE_BITS)),
+                                              int(meta["width"]), bool(meta.get("signed", 1)),
+                                              int(meta["frac"]))
+        except (ValueError, OverflowError, ZeroDivisionError) as e:
+            self._err(n, f"Table {key} over {meta['range']}: {e}")
+        count = len(values)
+        entries = [ast.Constant(v) for v in values]
+        fa = _frac(t)
+        top = max(fa, s)                               # index in units of the step
+        index = ast.BinOp(left=self._shl(v, top - fa), op=ast.Sub(),
+                          right=ast.Constant(int(start * (1 << top))))
+        if top > s:
+            index = ast.BinOp(left=index, op=ast.RShift(), right=ast.Constant(top - s))
+        index = ast.Call(func=ast.Name(id="max", ctx=ast.Load()), keywords=[], args=[
+            ast.Constant(0), ast.Call(func=ast.Name(id="min", ctx=ast.Load()), keywords=[],
+                                      args=[ast.Constant(count - 1), index])])
+        index = self._named(index)
+        return ast.Subscript(value=ast.Tuple(elts=entries, ctx=ast.Load()), slice=index,
+                             ctx=ast.Load()), out
+
     def _call(self, n: ast.Call):
         f = n.func
         name = self.py_names.get(f.id, f.id) if isinstance(f, ast.Name) else None
@@ -496,6 +560,9 @@ class _Lower:
         n.args = [v for v, _ in parts]
         types = [t for _, t in parts]
         one = len(types) == 1 and not n.keywords
+        key = ast.unparse(f)
+        if key in self.tables and parts:
+            return self._table(n, key, parts[0][0], parts[0][1])
         if one and (name in ("int", "float") or (is_math and f.attr in ("floor", "ceil"))):
             v, t = parts[0]
             if t is None:
@@ -537,7 +604,11 @@ class _Lower:
                 self._err(n, f"'.{f.attr}()' is not supported on fixed-point values")
             return n, (CPLX if tb == CPLX else INT)
         if any(_is_fx(t) for t in types):
-            self._err(n, f"'{name or ast.unparse(f)}' can't take fixed-point values")
+            if getattr(self._global_value(f), "__module__", None) == "math":
+                self._err(n, f"Give {key} a table in attr, e.g. {{'{key}': {{'range': (-4, 4), "
+                             f"'signed': 1, 'width': 16, 'frac': 14}}}} (or choose formats with "
+                             f"samples / auto_fixed)")
+            self._err(n, f"'{name or key}' can't take fixed-point values")
         if name == "complex":
             return n, CPLX
         return n, INT
@@ -672,6 +743,31 @@ class _Lower:
 
 _OPS = {ast.Div: "/", ast.FloorDiv: "//", ast.Mod: "%", ast.Pow: "**", ast.BitAnd: "&",
         ast.BitOr: "|", ast.BitXor: "^", ast.MatMult: "@"}
+
+
+@functools.lru_cache(maxsize=256)
+def _table_entries(fn: Callable, rng: Tuple[Any, Any], bits: int, width: int, signed: bool,
+                   frac: int) -> Tuple[int, Fraction, Tuple[int, ...]]:
+    """A table of fn over rng: (s, start, raw entries). The step is 2**-s, the
+    largest power of two giving at most 2**bits steps; entry k is fn at the
+    middle of step k from start, rounded and saturated to the format."""
+    lo, hi = Fraction(rng[0]), Fraction(rng[1])
+    if not lo < hi:
+        raise ValueError("'range' must be (low, high)")
+    x = Fraction(1 << bits) / (hi - lo)
+    s = x.numerator.bit_length() - x.denominator.bit_length()      # 2**s <= x < 2**(s+1)
+    if Fraction(2) ** s > x:
+        s -= 1
+    step = Fraction(2) ** -s
+    start = math.floor(lo / step) * step
+    count = math.ceil((hi - start) / step)
+    values = tuple(quantize(fn(float(start + (k + Fraction(1, 2)) * step)), frac, width, signed,
+                            round=True, saturate=True) for k in range(count))
+    return s, start, values
+
+
+def is_table(meta: Any) -> bool:
+    return isinstance(meta, dict) and "range" in meta
 
 
 def uses_fixed(attr: Dict[str, Dict[str, Any]]) -> bool:
