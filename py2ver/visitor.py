@@ -37,6 +37,8 @@ def normalize_attr(attr: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         }
         if 'length' in v:
             out[k]['length'] = int(v['length'])
+        if 'memory' in v:
+            out[k]['memory'] = str(v['memory'])
     return out
 
 
@@ -99,6 +101,11 @@ class FunctionVisitor(ast.NodeVisitor):
         self.arg_groups: List[tuple[str, List[str] | None]] = []
         # Returned arguments get their own output port: variable -> port name
         self.output_renames: Dict[str, str] = {}
+        # Block-RAM memories (list arguments with 'memory': 'ram'): name -> info.
+        # Reads/writes become <mem>__raddr / __we / __waddr / __wdata signals and
+        # the read data is <mem>__rdata; ram_ports holds their final names.
+        self._rams: Dict[str, Dict[str, Any]] = {}
+        self.ram_ports: Dict[str, Dict[str, str | None]] = {}
         self._tmp_count = 0
         self._ssa: Dict[str, str] = {}
         self._ssa_count: Dict[str, int] = {}
@@ -273,6 +280,10 @@ class FunctionVisitor(ast.NodeVisitor):
         if isinstance(node, (ast.List, ast.Tuple)):
             return True
         if isinstance(node, ast.Name):
+            if node.id in self._rams:
+                raise NotImplementedError(
+                    f"RAM '{node.id}' can only be used as {node.id}[i] (read or write)"
+                )
             return node.id in self._lists
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return self._is_list(node.left) and self._is_list(node.right)
@@ -350,6 +361,8 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def _store_index(self, target: ast.Subscript, rhs: str, env: Dict[str, str] | None = None):
         """xs[i] = rhs, at top level (env is None) or into a branch environment."""
+        if isinstance(target.value, ast.Name) and target.value.id in self._rams:
+            return self._ram_write(target.value.id, target, rhs, env)
         if not (isinstance(target.value, ast.Name) and target.value.id in self._lists):
             raise NotImplementedError(f"Can only assign into a list variable: {ast.unparse(target)}")
         var = target.value.id
@@ -399,6 +412,10 @@ class FunctionVisitor(ast.NodeVisitor):
             self._assign_var(f"{var}_{k}", e)
 
     def visit_Subscript(self, node: ast.Subscript):
+        if isinstance(node.value, ast.Name) and node.value.id in self._rams:
+            if isinstance(node.slice, ast.Slice):
+                raise NotImplementedError("A RAM can only be read one element at a time")
+            return self._ram_read(node.value.id, node.slice)
         if isinstance(node.slice, ast.Slice):
             raise NotImplementedError("A slice is a list; index it or assign it to a variable")
         elems = self._visit_list(node.value)
@@ -664,6 +681,10 @@ class FunctionVisitor(ast.NodeVisitor):
                 vals = item.value.elts if isinstance(item.value, ast.Tuple) else [item.value]
                 outs = []
                 for i, v in enumerate(vals):
+                    if isinstance(v, ast.Name) and v.id in self._rams:
+                        raise NotImplementedError(
+                            f"RAM '{v.id}' is updated in place; don't return it"
+                        )
                     if isinstance(v, ast.Name) and v.id in self._lists:
                         # A list is returned as one output per element, <v>_0, <v>_1, ...
                         for k in range(self._lists[v.id]):
@@ -697,6 +718,14 @@ class FunctionVisitor(ast.NodeVisitor):
                     self.output_bit_count += meta['width']
             else:
                 self.generic_visit(item)
+
+        for mem, ram in self._rams.items():
+            self.ram_ports[mem] = {
+                "raddr": self._resolve_name(f"{mem}__raddr") if ram["raddr"] else None,
+                "we": self._resolve_name(f"{mem}__we"),
+                "waddr": self._resolve_name(f"{mem}__waddr"),
+                "wdata": self._resolve_name(f"{mem}__wdata"),
+            }
 
         # determine if clk needed
         self.has_clk = self._any_reg_outputs()
@@ -739,6 +768,10 @@ class FunctionVisitor(ast.NodeVisitor):
         values = [self.visit(a) for a in node.args]
         for param in values:
             length = self.attr.get(param, {}).get("length")
+            if self.attr.get(param, {}).get("memory") == "ram":
+                self._declare_ram(param)
+                self.arg_groups.append((param, None))
+                continue
             if length is None:
                 self.arg_groups.append((param, None))
                 self._register_arg(param)
@@ -750,6 +783,62 @@ class FunctionVisitor(ast.NodeVisitor):
                 self.attr.setdefault(port, {k: v for k, v in self.attr[param].items()
                                             if k != "length"})
                 self._register_arg(port)
+
+    def _declare_ram(self, mem: str):
+        meta = self.attr[mem]
+        if "length" not in meta:
+            raise NotImplementedError(f"RAM '{mem}' needs a 'length'")
+        elem = {"width": meta["width"], "signed": meta["signed"], "type": "wire"}
+        self._rams[mem] = {"length": int(meta["length"]), "elem": elem,
+                           "raddr": None, "written": False, "writes": 0}
+        self.attr[f"{mem}__rdata"] = dict(elem)
+        # Write port defaults (no write unless a statement writes)
+        self._assign_var(f"{mem}__we", "0")
+        self._assign_var(f"{mem}__waddr", "0")
+        self._assign_var(f"{mem}__wdata", "0")
+
+    def _ram_address(self, mem: str, index: ast.AST) -> str:
+        """Address for mem[index], with Python's negative indices mapped."""
+        n = self._rams[mem]["length"]
+        idx = self.visit(index)
+        if self._infer_meta(idx)["signed"]:
+            idx = f"((({idx}) < 0) ? (({idx}) + {n}) : ({idx}))"
+        return idx
+
+    def _ram_read(self, mem: str, index: ast.AST) -> str:
+        ram = self._rams[mem]
+        if ram["written"]:
+            raise NotImplementedError(
+                f"RAM '{mem}' is read after being written in the same sample; "
+                "read it first (a block RAM reads before it writes)"
+            )
+        addr = self._ram_address(mem, index)
+        if ram["raddr"] is None:
+            ram["raddr"] = addr
+            self._assign_var(f"{mem}__raddr", addr)
+        elif ram["raddr"] != addr:
+            raise NotImplementedError(
+                f"RAM '{mem}' is read at two different addresses in one sample "
+                "(a block RAM has one read port here)"
+            )
+        return f"{mem}__rdata"
+
+    def _ram_write(self, mem: str, target: ast.Subscript, rhs: str,
+                   env: Dict[str, str] | None) -> None:
+        ram = self._rams[mem]
+        ram["writes"] += 1
+        if ram["writes"] > 1:
+            raise NotImplementedError(
+                f"RAM '{mem}' is written more than once per sample (one write port)"
+            )
+        ram["written"] = True
+        writes = {f"{mem}__we": "1", f"{mem}__waddr": self._ram_address(mem, target.slice),
+                  f"{mem}__wdata": rhs}
+        for var, value in writes.items():
+            if env is None:
+                self._assign_var(var, value)
+            else:
+                env[var] = f"({value})"
 
     def _register_arg(self, name: str):
         self._ssa_count[name] = 1

@@ -41,6 +41,7 @@ from .syn_report import SynReport, read_report
 from .pipeline import pipeline_ir
 from .semantics import exact_ir
 from .inline import inline_helpers
+from .names import rename_keywords
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
 
@@ -83,6 +84,16 @@ class Py2ver:
         tree = ast.parse(source_foo)
         # Inline calls to your own helper functions and module-level int constants
         tree = inline_helpers(tree, getattr(func, "__globals__", {}))
+        # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
+        tree, self._hw_name = rename_keywords(tree)
+        self._py_name = {v: k for k, v in self._hw_name.items()}
+        attr = {
+            self._hw_name.get(k, k): (
+                dict(v, next=self._hw_name.get(v["next"], v["next"]))
+                if isinstance(v, dict) and "next" in v else v
+            )
+            for k, v in attr.items()
+        }
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 
@@ -101,16 +112,20 @@ class Py2ver:
         )
         # State updated in place and returned (next = itself) leaves on <name>_out
         self.state_map = {s: f_visitor.output_renames.get(n, n) for s, n in self.state_map.items()}
-        if self.state_map:
+        # Block-RAM memories: name -> {"length", "elem", ...}; final port names
+        self.rams = {m: dict(r) for m, r in f_visitor._rams.items()}
+        self._ram_ports = dict(f_visitor.ram_ports)
+        self._ram_init = {m: attr[m].get("init", 0) for m in self.rams}
+        if self.state_map or self.rams:
             ir = self._lower_state(ir, f_visitor.attr)
 
         # Automatic pipelining: `pipeline` register stages, balanced so every
         # output appears exactly `pipeline` clocks after its inputs.
         self.pipeline_stages = int(pipeline)
         if self.pipeline_stages:
-            if self.state_map:
+            if self.state_map or self.rams:
                 raise NotImplementedError(
-                    "pipeline cannot be combined with state registers ('next') yet."
+                    "pipeline cannot be combined with state registers or memories yet."
                 )
             res = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages)
             ir = res.ir
@@ -124,6 +139,7 @@ class Py2ver:
         self.ir = ir
 
         self.has_clk = bool(ir.has_clk)
+        self._has_ce = any(p.kind == "ce" for p in ir.inputs)
 
         self.t_name = ir.name
         self.input_args_list = [p.name for p in ir.inputs if p.kind not in ("clk", "rst", "ce")]
@@ -196,8 +212,10 @@ class Py2ver:
                 for n, w in zip(self.output_args_list, self.output_args_width_list)
             ],
             "latency": self.tb_latency_cycles,
+            "pre_step": 1 if self.rams else 0,
             "has_clk": self.has_clk,
-            "has_state": bool(self.state_map),
+            "has_state": bool(self.state_map or self.rams),
+            "has_ce": self._has_ce,
             "outputs_size": self.output_bits,
             # UART / loopback params for DE0_Nano template
             "CLK_HZ": DEFAULT_CLK_FREQ,
@@ -284,6 +302,9 @@ class Py2ver:
                 )
 
         assigns = list(ir.assigns)
+        # With a block RAM, a sample takes two clocks (read, then compute and
+        # write); state commits in the second one.
+        commit = "(ce && __phase)" if self.rams else "ce"
         for p in ir.inputs:
             if p.name not in self.state_map:
                 continue
@@ -297,7 +318,7 @@ class Py2ver:
             # selection would turn unsigned and zero-extend a signed n
             hold = f"$signed({p.name})" if n_signed else f"$unsigned({p.name})"
             assigns.append(
-                Assignment(left=p.name, right=f"rst ? {lit} : (ce ? {n} : {hold})", is_reg=True)
+                Assignment(left=p.name, right=f"rst ? {lit} : ({commit} ? {n} : {hold})", is_reg=True)
             )
 
         inputs = [p for p in ir.inputs if p.name not in self.state_map]
@@ -311,7 +332,49 @@ class Py2ver:
             outputs=list(ir.outputs),
             assigns=assigns,
             has_clk=True,
+            items=list(ir.items) + self._ram_items(),
         )
+
+    def _ram_items(self) -> List[str]:
+        """Verilog for the block-RAM memories and their shared two-clock phase."""
+        if not self.rams:
+            return []
+        items = [
+            "// Two clocks per sample: __phase 0 reads the RAMs, 1 computes and writes",
+            "reg __phase;",
+            "always @(posedge clk) begin",
+            "  if (rst) __phase <= 1'b0;",
+            "  else if (ce) __phase <= ~__phase;",
+            "end",
+        ]
+        for mem, ram in self.rams.items():
+            n, elem = ram["length"], ram["elem"]
+            w = int(elem["width"])
+            sig = "signed " if int(elem["signed"]) == 1 else ""
+            ports = self._ram_ports[mem]
+            init = self._ram_init[mem]
+            values = list(init) if isinstance(init, (list, tuple)) else [init] * n
+            if len(values) != n:
+                raise ValueError(f"'init' of RAM '{mem}' needs {n} values")
+            mask = (1 << w) - 1
+            items.append(f"// RAM {mem}: {n} x {w} bits")
+            items.append(f"reg {sig}[{w - 1}:0] {mem} [0:{n - 1}];")
+            items.append(f"reg {sig}[{w - 1}:0] {mem}__rdata;")
+            if any(values):
+                items.append("initial begin")
+                items += [f"  {mem}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(values)]
+                items.append("end")
+            else:
+                items.append("integer __i_" + mem + ";")
+                items.append(f"initial for (__i_{mem} = 0; __i_{mem} < {n}; __i_{mem} = __i_{mem} + 1)"
+                             f" {mem}[__i_{mem}] = {w}'d0;")
+            items.append("always @(posedge clk) begin")
+            if ports["raddr"]:
+                items.append(f"  if (ce && !__phase) {mem}__rdata <= {mem}[{ports['raddr']}];")
+            items.append(f"  if (ce && __phase && {ports['we']}) "
+                         f"{mem}[{ports['waddr']}] <= {ports['wdata']};")
+            items.append("end")
+        return items
 
     @staticmethod
     def _wrap(n: int, nbits: int, signed: bool) -> int:
@@ -787,6 +850,106 @@ class Py2ver:
         return True
 
     # ------------------------------------------------------------------------
+    # Valid/ready streaming wrapper
+    # ------------------------------------------------------------------------
+
+    def _stream_mode(self) -> str:
+        if self.rams:
+            return "ram"
+        if self.pipeline_stages:
+            return "pipe"
+        if self.has_clk and not self.state_map:
+            raise NotImplementedError(
+                "The stream wrapper needs a combinational, stateful or pipelined design; "
+                "'reg' signals have no balanced latency (use pipeline=N instead)."
+            )
+        return "reg_out"
+
+    def stream_wrapper(self) -> Path:
+        """
+        Write hdl/<name>_stream.v: the module behind a valid/ready interface
+        (clk, rst, s_valid/s_ready/s_<input>, m_valid/m_ready/m_<output>).
+        """
+        mode = self._stream_mode()
+
+        def rng(name: str) -> str:
+            m = self.attr.get(name, {})
+            w = int(m.get("width", 1))
+            sig = "signed " if int(m.get("signed", 0)) == 1 else ""
+            return f"{sig}[{w - 1}:0]"
+
+        ctx = {
+            "name": self.t_name,
+            "mode": mode,
+            "stages": self.pipeline_stages,
+            "in_decls": [f"{rng(n)} s_{n}" for n in self.input_args_list],
+            "out_decls": [f"{rng(n)} m_{n}" for n in self.output_args_list],
+            "in_conns": [(n, rng(n)) for n in self.input_args_list],
+            "out_conns": [(n, rng(n)) for n in self.output_args_list],
+            "has_clk": self.has_clk,
+            "has_rst": any(p.kind == "rst" for p in self.ir.inputs),
+            "has_ce": self._has_ce,
+        }
+        path = self.hdl_dir / f"{self.t_name}_stream.v"
+        path.write_text(self.get_template("stream_wrapper.txt").render(ctx), encoding="utf-8")
+        log.info("Stream wrapper (%s) written to %s", mode, path)
+        return path
+
+    def TB_handshake(self) -> Callable[..., List[Tuple[int, ...]]]:
+        return self.tb_handshake_fun
+
+    def tb_handshake_fun(self, vectors: List[Any], valid: float = 0.7, ready: float = 0.7,
+                         seed: int = 0) -> List[Tuple[int, ...]]:
+        """
+        Simulate the stream wrapper with inputs offered with probability `valid`
+        and results accepted with probability `ready` each clock. Returns the
+        results in the order they were taken (one per input). Vectors are
+        samples for a design with state (as for TB_stream), else as for TB_batch.
+        """
+        vectors = list(vectors)
+        if not vectors:
+            return []
+        if self.state_map or self.rams:
+            vecs = self._stream_vectors(vectors)
+        else:
+            vecs = [self._input_vector(tuple(v)) for v in vectors]
+        masks = [(1 << w) - 1 for w in self.input_args_width_list]
+        vecs = [tuple(v & m for v, m in zip(vec, masks)) for vec in vecs]
+
+        wrapper = self.stream_wrapper()
+        results_path = self.outdir / RESULTS_PATH
+        if results_path.exists():
+            results_path.unlink()
+        tb_src = self.get_template("tb_handshake.txt").render({
+            "name": self.t_name,
+            "vectors": repr(vecs),
+            "valid_p": float(valid),
+            "ready_p": float(ready),
+            "seed": int(seed),
+            "max_cycles": 20 * len(vecs) + 100 + 4 * self.pipeline_stages,
+            "in_names": self.input_args_list,
+            "out_args": self.output_args_list,
+            "out_meta": self.out_meta,
+        })
+        (self.outdir / "tb_handshake.py").write_text(tb_src, encoding="utf-8")
+        tb_runner.run_cocotb(
+            f"{self.t_name}_stream", [self.hdl_dir / "main.v", wrapper], "tb_handshake",
+            self.outdir, build_name="sim_build_handshake", timescale=("1ns", "1ps"),
+        )
+        rows: List[Dict[str, int]] = []
+        if results_path.exists():
+            with results_path.open("rb") as handle:
+                payload = pickle.load(handle)
+            rows = payload["outs"]
+            # Clocks from reset release to the last result taken
+            self.handshake_cycles = payload["cycles"]
+        if len(rows) != len(vecs):
+            raise RuntimeError(
+                f"Stream wrapper returned {len(rows)} results for {len(vecs)} inputs"
+            )
+        return self._rows_to_outputs(rows, len(vecs))
+
+    # ------------------------------------------------------------------------
     # Standalone synthesis (area / timing of the core only, no board)
     # ------------------------------------------------------------------------
 
@@ -912,8 +1075,8 @@ class Py2ver:
         Python reference for tb_batch_fun(): the original function's results,
         wrapped to each output's declared width and sign (int() truncates /).
         """
-        if self.state_map:
-            raise ValueError("This design has state registers ('next' in attr); use PY_stream().")
+        if self.state_map or self.rams:
+            raise ValueError("This design has state ('next' or 'memory' in attr); use PY_stream().")
         outs: List[Tuple[int, ...]] = []
         for vec in vectors:
             ret = _flatten_outputs(self.func(*vec))
@@ -953,8 +1116,8 @@ class Py2ver:
         )
 
     def _stream_vectors(self, samples: List[Any]) -> List[Tuple[int, ...]]:
-        if not self.state_map:
-            raise ValueError("Streams need state registers ('next' in attr); use TB_batch().")
+        if not (self.state_map or self.rams):
+            raise ValueError("Streams need state ('next' or 'memory' in attr); use TB_batch().")
         # A sample is a tuple of arguments; anything else is the only argument
         return [self._input_vector(s if isinstance(s, tuple) else (s,)) for s in samples]
 
@@ -973,6 +1136,8 @@ class Py2ver:
             "latency_cycles": int(getattr(self, "tb_latency_cycles", 0)),
             "out_latency": dict(getattr(self, "out_latency", {})),
             "pipeline_stages": self.pipeline_stages,
+            "has_ce": self._has_ce,
+            "two_phase": bool(self.rams),
         })
         (self.outdir / "tb.py").write_text(tb_out, encoding="utf-8")
 
@@ -991,9 +1156,9 @@ class Py2ver:
 
     def tb_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
         """Simulate all input vectors in a single cocotb run, one result per vector."""
-        if self.state_map:
+        if self.state_map or self.rams:
             raise ValueError(
-                "This design has state registers ('next' in attr); use TB_stream()."
+                "This design has state ('next' or 'memory' in attr); use TB_stream()."
             )
         vectors = [tuple(v) for v in vectors]
         log.info("TB called with %d vector(s)", len(vectors))
@@ -1025,9 +1190,11 @@ class Py2ver:
         groups = dict(self.arg_groups)
 
         params = list(inspect.signature(self.func).parameters)
-        if params != [p for p, _ in self.arg_groups]:
+        py = lambda name: self._py_name.get(name, name)  # noqa: E731
+        if params != [py(p) for p, _ in self.arg_groups]:
             raise ValueError(f"PY_stream() needs arguments {list(groups)}; function has {params}")
-        inputs = [p for p, _ in self.arg_groups if p not in self.state_params]
+        inputs = [p for p, _ in self.arg_groups
+                  if p not in self.state_params and p not in self.rams]
 
         def _meta(name: str) -> Tuple[int, bool]:
             m = self.attr.get(name, {})
@@ -1040,13 +1207,24 @@ class Py2ver:
             return [self._wrap(value_of(port), *_meta(port)) for port in ports]
 
         state = {p: _state_value(p, self.state_init.__getitem__) for p in self.state_params}
+        # Memories: the function updates the list in place; values wrap like the RAM
+        rams = {}
+        for mem, ram in self.rams.items():
+            init = self._ram_init[mem]
+            vals = list(init) if isinstance(init, (list, tuple)) else [init] * ram["length"]
+            w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
+            rams[mem] = [self._wrap(int(v), w, sgn) for v in vals]
         outs: List[Tuple[int, ...]] = []
         for sample in samples:
             args = sample if isinstance(sample, tuple) else (sample,)
             kwargs = dict(zip(inputs, args))
             for p in inputs[len(args):]:                     # missing trailing args: 0
                 kwargs[p] = 0 if groups[p] is None else [0] * len(groups[p])
-            ret = _flatten_outputs(self.func(**kwargs, **state))
+            call = {py(k): v for k, v in {**kwargs, **state, **rams}.items()}
+            ret = _flatten_outputs(self.func(**call))
+            for mem, ram in self.rams.items():
+                w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
+                rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
             row = {
                 name: self._wrap(int(v), *_meta(name))
                 for name, v in zip(self.output_args_list, ret)
@@ -1102,6 +1280,9 @@ class Py2ver:
         else:
             log.warning("No TB results found at %s", results_path)
 
+        return self._rows_to_outputs(rows, n_vectors)
+
+    def _rows_to_outputs(self, rows: List[Dict[str, int]], n_vectors: int) -> List[Tuple[int, ...]]:
         outs: List[Tuple[int, ...]] = []
         for i in range(n_vectors):
             d = rows[i] if i < len(rows) else {}

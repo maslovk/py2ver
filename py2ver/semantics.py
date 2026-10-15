@@ -414,5 +414,6 @@ def exact_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]]) -> Tuple[ModuleIR, D
         outputs=list(ir.outputs),
         assigns=view_assigns + assigns,
         has_clk=ir.has_clk,
+        items=list(ir.items),
     )
     return new_ir, attr

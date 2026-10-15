@@ -121,6 +121,28 @@ never split, so break long expressions into temporaries for finer stages.
 Constants are not registered. Pipelining can't yet be combined with state
 registers or `'type': 'reg'` signals.
 
+### Valid/ready streaming interface
+
+`p.stream_wrapper()` writes `hdl/<name>_stream.v`: the module behind a
+valid/ready handshake, for connecting it to other hardware.
+
+```
+<name>_stream ( clk, rst,
+                s_valid, s_ready, s_<input>...,     // inputs, taken when both high
+                m_valid, m_ready, m_<output>... )   // results, in input order
+```
+
+A pipelined design takes one input per clock and stalls as a whole when the
+consumer isn't ready; a design with state advances once per input taken; a
+design with block RAM takes an input every other clock. Designs using `'reg'`
+signals are rejected (use `pipeline=N`). `TB_handshake()` checks the wrapper
+in simulation with inputs and readiness that come and go at random:
+
+```python
+got = p.TB_handshake()(vectors, valid=0.6, ready=0.5, seed=1)
+assert got == p.PY_batch()(vectors)        # PY_stream for designs with state
+```
+
 ### Area and timing (`SYN()`)
 
 `SYN()` compiles the generated module alone with Quartus (no board needed,
@@ -202,6 +224,9 @@ vectors).
 Not supported: `while`, recursion, early `return`, keyword arguments in
 helper calls, dicts and sets, nested lists, lists of complex values.
 
+Python names that are Verilog keywords (`buf`, `time`, `table`, `type`, ...)
+get a `_` suffix in the HDL; keep using the Python names in `attr` and calls.
+
 Variables you don't list in `attr` get the exact width their values need, so
 they never overflow. A listed variable keeps its declared width for every
 reassignment.
@@ -241,7 +266,26 @@ attr = {'bin_':   {'signed': 0, 'width': 3},
 
 Lists are copied by value in hardware, so `ys = xs` for a list is rejected
 (Python would make both names the same list); write `ys = list(xs)`. Memories
-are register files, not block RAM, which suits small tables and buffers.
+made this way are register files, which suits small tables and buffers; for
+larger ones use block RAM:
+
+- **Block RAM**: `'memory': 'ram'` on a list argument keeps it as a RAM array
+  (FPGA block RAM: a 256 x 16 histogram is 4096 RAM bits and ~60 logic
+  elements, against ~11,000 as registers). The function updates it in place
+  and doesn't return it. Per sample it may be read at one address and written
+  once, reading before writing. A sample then takes two clocks (read, then
+  compute and write); `TB_stream`, `HW()` and the stream wrapper account for
+  that. `'init'` sets the power-up contents (KEY0 does not clear a RAM).
+
+```python
+def histogram(bin_, counts):
+    c = counts[bin_] + 1
+    counts[bin_] = c
+    return c
+
+attr = {'bin_':   {'signed': 0, 'width': 8},
+        'counts': {'signed': 0, 'width': 16, 'length': 256, 'memory': 'ram'}}
+```
 
 ### How results relate to Python
 
@@ -259,13 +303,14 @@ extra hardware. `and`/`or` give 0/1, not Python's operand values.
 
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
 signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
-a streaming low-pass filter, a FIR filter with its delay line in a memory, and
-pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+a streaming low-pass filter, a FIR filter with its delay line in a memory, a
+histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```
 python examples/sha256_pipeline.py              # simulation
 python examples/sha256_pipeline.py --board-sim  # + virtual DE0-Nano
+python examples/sha256_pipeline.py --handshake  # + valid/ready wrapper, random stalls
 python examples/sha256_pipeline.py --syn        # + Quartus area/timing
 python examples/sha256_pipeline.py --board      # + connected DE0-Nano
 ```

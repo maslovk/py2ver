@@ -22,6 +22,8 @@ class ModuleIR:
     outputs: List[Port] = field(default_factory=list)
     assigns: List[Assignment] = field(default_factory=list)
     has_clk: bool = False
+    # Raw Verilog emitted in the module body (e.g. block-RAM arrays)
+    items: List[str] = field(default_factory=list)
 
 
 def resolve_meta(name: str, attr: Dict[str, Dict[str, Any]],

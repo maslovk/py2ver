@@ -11,6 +11,8 @@ estimated delay, with a register boundary between segments:
   - every output appears exactly `stages` clocks after its inputs, so a new
     input vector can be applied every clock
   - constants (signals that do not depend on any input) are never registered
+  - all pipeline registers share a clock enable `ce` (tie it to 1, or use it
+    to stall the pipeline, as the valid/ready stream wrapper does)
 
 Delay is estimated per assignment by summing operator costs in units of
 roughly one 32-bit adder. It is a heuristic; SYN() measures the real result.
@@ -184,15 +186,20 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
         for j in range(1, k + 1):
             attr[f"{name}__p{j}"] = dict(meta, type="reg")
             prev = name if j == 1 else f"{name}__p{j - 1}"
-            new_assigns.append(Assignment(f"{name}__p{j}", prev, True))
+            # Clock enable: the whole pipeline holds while ce is low (stall)
+            new_assigns.append(Assignment(f"{name}__p{j}", f"ce ? {prev} : {name}__p{j}", True))
         register_bits += k * int(meta.get("width", 1))
 
-    new_inputs = list(ir.inputs) + [Port(name="clk", width=1, signed=False, kind="clk")]
+    new_inputs = list(ir.inputs) + [
+        Port(name="clk", width=1, signed=False, kind="clk"),
+        Port(name="ce", width=1, signed=False, kind="ce"),
+    ]
     new_ir = ModuleIR(
         name=ir.name,
         inputs=new_inputs,
         outputs=list(ir.outputs),
         assigns=new_assigns,
         has_clk=True,
+        items=list(ir.items),
     )
     return PipelineResult(new_ir, attr, stage, register_bits, stage_delay)

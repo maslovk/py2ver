@@ -196,7 +196,7 @@ def test_stateless_design_rejects_stream(monkeypatch, tmp_path):
     }
     p = Py2ver(ext_step, attr)
 
-    with pytest.raises(ValueError, match="state registers"):
+    with pytest.raises(ValueError, match="need state"):
         p.TB_stream()([1])
 
 

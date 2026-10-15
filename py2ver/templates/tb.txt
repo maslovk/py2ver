@@ -32,6 +32,9 @@ async def tb_test(dut):
     {% set lc = latency_cycles|default(0)|int %}
     latency_cycles = {{ lc }}
 
+    {% if has_ce|default(false) %}
+    dut.ce.value = 1
+    {% endif %}
     {% if has_clk %}
     cocotb.start_soon(_clock_gen(dut.clk, period_ns={{ period }}))
     dut._log.info(

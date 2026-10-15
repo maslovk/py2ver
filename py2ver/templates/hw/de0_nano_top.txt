@@ -179,7 +179,8 @@ wire en_pat  = sw2_on & ~lb_en;
 //  Structural logic
 //=======================================================
 delayed_registers #(
-    .LATENCY    ({{ latency }})
+    .LATENCY    ({{ latency }}),
+    .PRE_STEP   ({{ pre_step }})
 ) delayed_registers_inst (
     .clk        (CLOCK_50),
     .rst_n      (KEY[0]),
@@ -314,6 +315,8 @@ assign LED[7:5] = 3'b000;
 {% if has_state %}
     .rst(core_rst),
     .ce(core_step),
+{% elif has_ce %}
+    .ce(1'b1),
 {% endif %}
 {% for input in inputs %}
     .{{ input.name }}({{ input.name }}_int){% if not loop.last or outputs|length > 0 %},{% endif %}

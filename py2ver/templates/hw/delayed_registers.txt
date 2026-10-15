@@ -3,9 +3,12 @@
 // After input_valid (the UART has new, now-held core inputs), wait LATENCY
 // clocks for the core's result, latch every output once, then pulse
 // `ready` (send the outputs) and `step` (advance a stateful core by one
-// sample, after its outputs were captured).
+// sample, after its outputs were captured). With PRE_STEP = 1 (a core with
+// block RAM), `step` is also pulsed right after input_valid, for the clock
+// in which the core reads its RAM.
 module delayed_registers #(
-    parameter int LATENCY = 0
+    parameter int LATENCY = 0,
+    parameter int PRE_STEP = 0
 ) (
     input  logic clk,
     input  logic rst_n, // Active-low reset
@@ -19,7 +22,7 @@ module delayed_registers #(
 );
 
     logic busy;
-    logic [$clog2(LATENCY + 2) - 1:0] count;
+    logic [$clog2(LATENCY + PRE_STEP + 2) - 1:0] count;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -36,8 +39,9 @@ module delayed_registers #(
             if (input_valid) begin
                 busy  <= 1'b1;
                 count <= '0;
+                step  <= (PRE_STEP != 0);
             end else if (busy) begin
-                if (count == LATENCY) begin
+                if (count == LATENCY + PRE_STEP) begin
 {%- for output in outputs %}
                     {{ output.name }}_out <= {{ output.name }};
 {%- endfor %}

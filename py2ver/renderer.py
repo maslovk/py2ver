@@ -162,6 +162,8 @@ class Renderer:
             items.append('\n'.join(output_decls))
         if internal_decls:
             items.append('\n'.join(internal_decls))
+        if ir.items:
+            items.append('\n'.join(ir.items))
         if output_always:
             items.append(output_always)
         if wire_assigns:

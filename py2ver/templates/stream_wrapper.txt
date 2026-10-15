@@ -1,0 +1,144 @@
+`timescale 1ns/1ps
+
+// {{ name }} behind a valid/ready interface.
+//
+// An input is taken on a clock edge where s_valid && s_ready; a result is
+// taken where m_valid && m_ready. Inputs must stay stable while s_valid is
+// high and s_ready is low; results stay stable while m_valid is high and
+// m_ready is low. Results come out in input order.
+{% if mode == "pipe" %}
+// Pipelined core ({{ stages }} stages): the whole pipeline advances only when
+// its last stage can hand its result on, so it takes one input per clock
+// while m_ready stays high.
+{% elif mode == "ram" %}
+// Core with a block-RAM memory: each sample takes two clocks (read, then
+// compute and write), so one input is taken every other clock at most.
+{% else %}
+// The result of each input is registered; with state, the state advances
+// exactly once per input taken.
+{% endif %}
+module {{ name }}_stream (
+    input  clk,
+    input  rst,
+    input  s_valid,
+    output s_ready,
+{% for d in in_decls %}
+    input  {{ d }},
+{% endfor %}
+    output m_valid,
+    input  m_ready{% for d in out_decls %},
+    output {{ d }}{% endfor %}
+
+);
+
+{% if mode == "pipe" %}
+    wire ce = !m_valid || m_ready;
+    assign s_ready = ce;
+
+    // valid bit travelling alongside the data
+    reg [{{ stages - 1 }}:0] vpipe;
+    always @(posedge clk) begin
+        if (rst)
+            vpipe <= {{ stages }}'d0;
+        else if (ce)
+{% if stages == 1 %}
+            vpipe <= s_valid;
+{% else %}
+            vpipe <= {vpipe[{{ stages - 2 }}:0], s_valid};
+{% endif %}
+    end
+    assign m_valid = vpipe[{{ stages - 1 }}];
+
+    {{ name }} u_core (
+        .clk(clk),
+        .ce(ce),
+{% for c in in_conns %}
+        .{{ c[0] }}(s_{{ c[0] }}),
+{% endfor %}
+{% for c in out_conns %}
+        .{{ c[0] }}(m_{{ c[0] }}){{ "," if not loop.last }}
+{% endfor %}
+    );
+{% else %}
+{% for c in out_conns %}
+    wire {{ c[1] }} {{ c[0] }}_w;
+    reg  {{ c[1] }} m_{{ c[0] }}_r;
+    assign m_{{ c[0] }} = m_{{ c[0] }}_r;
+{% endfor %}
+    reg m_valid_r;
+    assign m_valid = m_valid_r;
+{% if mode == "ram" %}
+    // busy: the core is in its second clock, working on the held inputs
+    reg busy;
+{% for c in in_conns %}
+    reg {{ c[1] }} {{ c[0] }}_held;
+{% endfor %}
+    assign s_ready = !busy && (!m_valid_r || m_ready);
+    wire start = s_valid && s_ready;
+    wire core_ce = start || busy;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            busy      <= 1'b0;
+            m_valid_r <= 1'b0;
+        end else begin
+            if (m_ready)
+                m_valid_r <= 1'b0;
+            if (busy) begin
+                busy      <= 1'b0;
+                m_valid_r <= 1'b1;
+{% for c in out_conns %}
+                m_{{ c[0] }}_r <= {{ c[0] }}_w;
+{% endfor %}
+            end
+            if (start) begin
+                busy <= 1'b1;
+{% for c in in_conns %}
+                {{ c[0] }}_held <= s_{{ c[0] }};
+{% endfor %}
+            end
+        end
+    end
+{% else %}
+    assign s_ready = !m_valid_r || m_ready;
+    wire accept = s_valid && s_ready;
+
+    always @(posedge clk) begin
+        if (rst)
+            m_valid_r <= 1'b0;
+        else if (accept)
+            m_valid_r <= 1'b1;
+        else if (m_ready)
+            m_valid_r <= 1'b0;
+        if (accept) begin
+{% for c in out_conns %}
+            m_{{ c[0] }}_r <= {{ c[0] }}_w;
+{% endfor %}
+        end
+    end
+{% endif %}
+
+    {{ name }} u_core (
+{% if has_clk %}
+        .clk(clk),
+{% endif %}
+{% if has_rst %}
+        .rst(rst),
+{% endif %}
+{% if has_ce %}
+        .ce({{ "core_ce" if mode == "ram" else "accept" }}),
+{% endif %}
+{% for c in in_conns %}
+{% if mode == "ram" %}
+        .{{ c[0] }}(busy ? {{ c[0] }}_held : s_{{ c[0] }}),
+{% else %}
+        .{{ c[0] }}(s_{{ c[0] }}),
+{% endif %}
+{% endfor %}
+{% for c in out_conns %}
+        .{{ c[0] }}({{ c[0] }}_w){{ "," if not loop.last }}
+{% endfor %}
+    );
+{% endif %}
+
+endmodule

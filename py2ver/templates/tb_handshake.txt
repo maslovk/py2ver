@@ -1,0 +1,75 @@
+import pickle
+import random
+from pathlib import Path
+
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge, Timer
+
+# Drive {{ name }}_stream with inputs that come and go (s_valid) and a
+# consumer that stalls at random (m_ready); record every result taken.
+
+VECTORS = {{ vectors }}
+VALID_P = {{ valid_p }}
+READY_P = {{ ready_p }}
+SEED = {{ seed }}
+MAX_CYCLES = {{ max_cycles }}
+
+
+async def save_results(ret_val):
+    results_dir = Path(__file__).resolve().parent / "results"
+    results_dir.mkdir(exist_ok=True)
+    with open(results_dir / "results.pickle", "wb") as handle:
+        pickle.dump(ret_val, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+@cocotb.test()
+async def tb_handshake(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
+    rng = random.Random(SEED)
+
+    dut.rst.value = 1
+    dut.s_valid.value = 0
+    dut.m_ready.value = 0
+{% for name in in_names %}
+    dut.s_{{ name }}.value = 0
+{% endfor %}
+    await RisingEdge(dut.clk)
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="ns")
+    dut.rst.value = 0
+
+    i, presenting, outs, cycles = 0, False, [], 0
+    for _ in range(MAX_CYCLES):
+        cycles += 1
+        if not presenting and i < len(VECTORS) and rng.random() < VALID_P:
+            presenting = True
+            vec = VECTORS[i]
+{% for name in in_names %}
+            dut.s_{{ name }}.value = vec[{{ loop.index0 }}]
+{% endfor %}
+        dut.s_valid.value = int(presenting)
+        dut.m_ready.value = int(rng.random() < READY_P)
+        await Timer(1, unit="ns")               # let ready/valid settle
+
+        taken = presenting and int(dut.s_ready.value) == 1
+        if int(dut.m_valid.value) == 1 and int(dut.m_ready.value) == 1:
+            outs.append({
+{% for arg in out_args %}
+{% if out_meta.get(arg, {}).get("signed", 0) == 1 %}
+                "{{ arg }}": int(dut.m_{{ arg }}.value.to_signed()),
+{% else %}
+                "{{ arg }}": int(dut.m_{{ arg }}.value),
+{% endif %}
+{% endfor %}
+            })
+
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+        if taken:
+            presenting = False
+            i += 1
+        if len(outs) == len(VECTORS):
+            break
+
+    await save_results({"outs": outs, "cycles": cycles})

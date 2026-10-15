@@ -3,6 +3,7 @@ Shared runner for the examples: check py2ver's hardware against Python.
 
     python examples/basic.py               # simulation (cocotb + Icarus)
     python examples/basic.py --board-sim   # + simulated DE0-Nano over its UART
+    python examples/basic.py --handshake   # + valid/ready wrapper, random stalls
     python examples/basic.py --syn         # + Quartus area/timing (needs Quartus)
     python examples/basic.py --board       # + a connected DE0-Nano (Quartus + board)
 
@@ -23,6 +24,8 @@ def _args():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--board-sim", action="store_true",
                     help="also run on the simulated DE0-Nano (real UART timing, slower)")
+    ap.add_argument("--handshake", action="store_true",
+                    help="also run the valid/ready stream wrapper with random stalls")
     ap.add_argument("--syn", action="store_true", help="report area and timing with Quartus")
     ap.add_argument("--board", action="store_true", help="also run on a connected DE0-Nano")
     ap.add_argument("-v", "--verbose", action="store_true", help="show py2ver's log")
@@ -65,6 +68,10 @@ def run(p, vectors, stream=False):
 
     if args.board_sim:
         ok &= _report("virtual board", p.HW_sim()(vectors), expected, vectors)
+    if args.handshake:
+        got = p.TB_handshake()(vectors, valid=0.6, ready=0.6, seed=1)
+        ok &= _report("valid/ready", got, expected, vectors)
+        print(f"    wrapper: {p.stream_wrapper().name}, {p.handshake_cycles} clocks")
     if args.syn:
         print(p.SYN(_syn_attr()))
     if args.board:
