@@ -38,6 +38,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 import tb_runner
 from renderer import Renderer
 from visitor import FunctionVisitor
+from ast_ir import Assignment, ModuleIR, Port
 
 try:
     import serial  # pyserial
@@ -73,14 +74,21 @@ class Py2ver:
         tree = ast.parse(source_foo)
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
+
+        # Explicit state: an input with {'next': '<output>'} becomes a register
+        # loaded from that output every clock and reset to 'init' (default 0).
+        self.func = func
+        self.state_map, self.state_init = self._parse_state(attr)
+        if self.state_map:
+            ir = self._lower_state(ir, f_visitor.attr)
         self.ir = ir
 
         self.has_clk = bool(ir.has_clk)
 
         self.t_name = ir.name
-        self.input_args_list = [p.name for p in ir.inputs if p.kind != "clk"]
+        self.input_args_list = [p.name for p in ir.inputs if p.kind not in ("clk", "rst")]
         self.output_args_list = [p.name for p in ir.outputs]
-        self.input_args_width_list = [p.width for p in ir.inputs if p.kind != "clk"]
+        self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in ("clk", "rst")]
         self.output_args_width_list = [p.width for p in ir.outputs]
 
         # Raw IR bit widths (core widths)
@@ -179,6 +187,74 @@ class Py2ver:
         return self._tpl_cache[filename]
 
     @staticmethod
+    def _parse_state(attr: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, int]]:
+        state_map: Dict[str, str] = {}
+        state_init: Dict[str, int] = {}
+        for name, meta in attr.items():
+            if isinstance(meta, dict) and "next" in meta:
+                state_map[name] = str(meta["next"])
+                state_init[name] = int(meta.get("init", 0))
+        return state_map, state_init
+
+    def _lower_state(self, ir: ModuleIR, attr: Dict[str, Dict[str, Any]]) -> ModuleIR:
+        """
+        Turn state inputs into registers:
+          - state inputs are removed from the ports
+          - clk and a synchronous active-high rst are added
+          - each state s with next n gets:  s <= rst ? init : n
+        Outputs (including next-state values) stay as ports.
+        """
+        in_names = [p.name for p in ir.inputs]
+        out_names = [p.name for p in ir.outputs]
+
+        if ir.has_clk:
+            raise NotImplementedError(
+                "State registers ('next') cannot be combined with 'reg' signals yet."
+            )
+        for reserved in ("clk", "rst"):
+            if reserved in in_names or reserved in out_names:
+                raise ValueError(f"'{reserved}' is a reserved port name in designs with state.")
+        for s, n in self.state_map.items():
+            if s not in in_names:
+                raise ValueError(f"State '{s}' must be a function argument; arguments: {in_names}")
+            if n not in out_names:
+                raise ValueError(
+                    f"Next state '{n}' of '{s}' must be a returned value; returned: {out_names}"
+                )
+
+        assigns = list(ir.assigns)
+        for p in ir.inputs:
+            if p.name not in self.state_map:
+                continue
+            n = self.state_map[p.name]
+            init = self.state_init[p.name] & ((1 << p.width) - 1)
+            # Literal takes the next value's signedness so n is extended by its
+            # own sign, matching how PY_stream() wraps it.
+            n_signed = int(attr.get(n, {}).get("signed", 0)) == 1
+            lit = f"{p.width}'{'s' if n_signed else ''}d{init}"
+            assigns.append(Assignment(left=p.name, right=f"rst ? {lit} : {n}", is_reg=True))
+
+        inputs = [p for p in ir.inputs if p.name not in self.state_map]
+        inputs.append(Port(name="clk", width=1, signed=False, kind="clk"))
+        inputs.append(Port(name="rst", width=1, signed=False, kind="rst"))
+
+        return ModuleIR(
+            name=ir.name,
+            inputs=inputs,
+            outputs=list(ir.outputs),
+            assigns=assigns,
+            has_clk=True,
+        )
+
+    @staticmethod
+    def _wrap(n: int, nbits: int, signed: bool) -> int:
+        n &= (1 << nbits) - 1
+        if signed:
+            sign_bit = 1 << (nbits - 1)
+            n = (n ^ sign_bit) - sign_bit
+        return n
+
+    @staticmethod
     def tosigned(n: int, nbits: int) -> int:
         mask = (1 << nbits) - 1
         n &= mask
@@ -255,6 +331,10 @@ class Py2ver:
         Returns:
           (cycles_to_wait, per_output_latency)
         """
+        if self.state_map:
+            # Stream mode: outputs are combinational in (inputs, state) and are
+            # sampled every clock before the state registers update.
+            return 0, {n: 0 for n in self.output_args_list}
         per_sig = self._compute_latencies()
         per_out = {n: int(per_sig.get(n, 0)) for n in self.output_args_list}
         cycles = max(per_out.values(), default=0)
@@ -364,6 +444,10 @@ class Py2ver:
         Returns:
             hw_fun(*args) -> tuple of outputs (same shape as TB()).
         """
+        if self.state_map:
+            raise NotImplementedError(
+                "HW() does not support state registers ('next') yet; use TB_stream()."
+            )
         self.syn_attr = syn_attr
         self._hw_ok = self.createHWproject()
         return self.hw_fun
@@ -572,6 +656,12 @@ class Py2ver:
     def TB_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
         return self.tb_batch_fun
 
+    def TB_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
+        return self.tb_stream_fun
+
+    def PY_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
+        return self.py_stream_fun
+
     def _input_vector(self, in_arg: Tuple[Any, ...]) -> Tuple[int, ...]:
         # Missing trailing arguments default to 0
         return tuple(
@@ -579,11 +669,17 @@ class Py2ver:
             for i in range(len(self.input_args_list))
         )
 
-    def gen_tb(self, vectors: List[Tuple[Any, ...]]) -> None:
-        vecs = [self._input_vector(tuple(v)) for v in vectors]
-        log.info("gen_tb: generating tb.py with %d vector(s)", len(vecs))
+    def _stream_vectors(self, samples: List[Any]) -> List[Tuple[int, ...]]:
+        if not self.state_map:
+            raise ValueError("Streams need state registers ('next' in attr); use TB_batch().")
+        # A scalar sample is accepted for single-input designs
+        return [
+            self._input_vector(tuple(s) if isinstance(s, (tuple, list)) else (s,))
+            for s in samples
+        ]
 
-        tb_out = self.get_template("tb.txt").render({
+    def _render_tb(self, template: str, vecs: List[Tuple[int, ...]]) -> None:
+        tb_out = self.get_template(template).render({
             "period": DEFAULT_TB_PERIOD,
             "in_names": self.input_args_list,
             "vectors": repr(vecs),
@@ -593,19 +689,86 @@ class Py2ver:
             "latency_cycles": int(getattr(self, "tb_latency_cycles", 0)),
             "out_latency": dict(getattr(self, "out_latency", {})),
         })
-
         (self.outdir / "tb.py").write_text(tb_out, encoding="utf-8")
+
+    def gen_tb(self, vectors: List[Tuple[Any, ...]]) -> None:
+        vecs = [self._input_vector(tuple(v)) for v in vectors]
+        log.info("gen_tb: generating tb.py with %d vector(s)", len(vecs))
+        self._render_tb("tb.txt", vecs)
+
+    def gen_tb_stream(self, samples: List[Any]) -> None:
+        vecs = self._stream_vectors(samples)
+        log.info("gen_tb_stream: generating tb.py with %d sample(s)", len(vecs))
+        self._render_tb("tb_stream.txt", vecs)
 
     def tb_fun(self, *in_arg: Any) -> Tuple[int, ...]:
         return self.tb_batch_fun([in_arg])[0]
 
     def tb_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
         """Simulate all input vectors in a single cocotb run, one result per vector."""
+        if self.state_map:
+            raise ValueError(
+                "This design has state registers ('next' in attr); use TB_stream()."
+            )
         vectors = [tuple(v) for v in vectors]
         log.info("TB called with %d vector(s)", len(vectors))
         if not vectors:
             return []
+        return self._simulate(len(vectors), lambda: self.gen_tb(vectors))
 
+    def tb_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:
+        """
+        Reset the state registers, then apply one sample per clock in a single
+        cocotb run. Returns all outputs (in return order) for each sample,
+        sampled before the clock edge that loads the next state.
+        """
+        samples = list(samples)
+        self._stream_vectors(samples)  # validate before touching the filesystem
+        log.info("TB stream called with %d sample(s)", len(samples))
+        if not samples:
+            return []
+        return self._simulate(len(samples), lambda: self.gen_tb_stream(samples))
+
+    def py_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:
+        """
+        Python reference for tb_stream_fun(): calls the original function once
+        per sample, feeding each next-state output back into its state argument
+        with the same width/sign wrapping as the hardware registers.
+        """
+        vecs = self._stream_vectors(list(samples))
+
+        params = list(inspect.signature(self.func).parameters)
+        expected = set(self.input_args_list) | set(self.state_map)
+        if set(params) != expected:
+            raise ValueError(
+                f"PY_stream() needs arguments {sorted(expected)}; function has {params}"
+            )
+
+        def _meta(name: str) -> Tuple[int, bool]:
+            m = self.attr.get(name, {})
+            return int(m.get("width", 1)), int(m.get("signed", 0)) == 1
+
+        state = {
+            name: self._wrap(self.state_init[name], *_meta(name))
+            for name in self.state_map
+        }
+        outs: List[Tuple[int, ...]] = []
+        for vec in vecs:
+            ret = self.func(**dict(zip(self.input_args_list, vec)), **state)
+            ret = ret if isinstance(ret, tuple) else (ret,)
+            row = {
+                name: self._wrap(int(v), *_meta(name))
+                for name, v in zip(self.output_args_list, ret)
+            }
+            outs.append(tuple(row[n] for n in self.output_args_list))
+            state = {
+                name: self._wrap(row[nxt], *_meta(name))
+                for name, nxt in self.state_map.items()
+            }
+        return outs
+
+    def _simulate(self, n_vectors: int, write_tb: Callable[[], None]) -> List[Tuple[int, ...]]:
+        """Run one cocotb simulation of the tb.py written by write_tb()."""
         results_path = self.outdir / RESULTS_PATH
 
         # Clean previous results
@@ -633,8 +796,7 @@ class Py2ver:
                 except OSError as e:
                     log.warning("Failed to remove %s: %s", p, e)
 
-        # Generate testbench for this set of vectors
-        self.gen_tb(vectors)
+        write_tb()
 
         # Run cocotb-based simulation
         tb_runner.test_runner(self.t_name, self.outdir)
@@ -652,7 +814,7 @@ class Py2ver:
             log.warning("No TB results found at %s", results_path)
 
         outs: List[Tuple[int, ...]] = []
-        for i in range(len(vectors)):
+        for i in range(n_vectors):
             d = rows[i] if i < len(rows) else {}
             row: List[int] = []
             for n, w in zip(self.output_args_list, self.output_args_width_list):

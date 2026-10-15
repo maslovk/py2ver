@@ -56,9 +56,43 @@ to the current working directory.
 
 ### Attributes
 
-Each name maps to `{'signed': 0|1, 'width': <bits>, 'type': 'wire'|'reg'}`.
+Each name maps to `{'signed': 0|1, 'width': <bits>, 'type': 'wire'|'reg'}`, plus
+`'next'` and `'init'` for state registers (see below).
 `type: 'reg'` registers the signal; the testbench accounts for the resulting
 pipeline latency. Widths of undeclared temporaries are inferred.
+
+### State registers (streaming designs)
+
+Write one step of a stateful design as a function that takes its state as
+arguments and returns the next state. Mark each state argument with `'next'`
+(the returned value that loads it every clock) and optionally `'init'`
+(its reset value, default 0):
+
+```python
+def lpf_step(x, y_prev):
+    err = x - y_prev
+    delta = err >> 3
+    y = y_prev + delta
+    return y
+
+attr = {'x':      {'signed': 1, 'width': 12},
+        'y_prev': {'signed': 1, 'width': 16, 'next': 'y'},
+        'err':    {'signed': 1, 'width': 16},
+        'delta':  {'signed': 1, 'width': 16},
+        'y':      {'signed': 1, 'width': 16}}
+
+p = Py2ver(lpf_step, attr)    # y_prev becomes a register; clk and rst are added
+xs = [0, 256, 256, 512, -2048]
+sim = p.TB_stream()(xs)       # one sample per clock, single simulation
+ref = p.PY_stream()(xs)       # Python reference with the same register wrapping
+assert sim == ref
+```
+
+State arguments disappear from the module ports and become registers with a
+synchronous active-high `rst`. All returned values stay output ports. A stream
+returns every output for each sample, read before the clock edge that loads
+the next state. State cannot yet be combined with `'type': 'reg'` signals,
+and `HW()` does not support stateful designs yet.
 
 `HW()` options: `QUARTUS_DIR` (required), `UART_PORT` (default `/dev/ttyUSB0`),
 `UART_BAUD` (default `115200`), `UART_TIMEOUT` (default `1.0` s).
