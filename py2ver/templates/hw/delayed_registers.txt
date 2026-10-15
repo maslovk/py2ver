@@ -3,9 +3,9 @@
 // After input_valid (the UART has new, now-held core inputs), wait LATENCY
 // clocks for the core's result, latch every output once, then pulse
 // `ready` (send the outputs) and `step` (advance a stateful core by one
-// sample, after its outputs were captured). With PRE_STEP = 1 (a core with
-// block RAM), `step` is also pulsed right after input_valid, for the clock
-// in which the core reads its RAM. With USE_VOUT = 1 (a pipelined core with
+// sample, after its outputs were captured). With PRE_STEP > 0 (a core with
+// block RAM), `step` is also held for PRE_STEP clocks right after
+// input_valid, for the clocks in which the core reads its RAM. With USE_VOUT = 1 (a pipelined core with
 // state, which tracks its samples itself), the outputs are latched when the
 // core raises vout instead of after LATENCY clocks.
 module delayed_registers #(
@@ -54,6 +54,7 @@ module delayed_registers #(
                     busy  <= 1'b0;
                 end else begin
                     count <= count + 1'b1;
+                    step  <= (count + 1 < PRE_STEP);
                 end
             end
         end

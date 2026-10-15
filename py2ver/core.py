@@ -219,7 +219,7 @@ class Py2ver:
                 for n, w in zip(self.output_args_list, self.output_args_width_list)
             ],
             "latency": self.tb_latency_cycles,
-            "pre_step": 1 if self.rams else 0,
+            "pre_step": getattr(self, "ram_phases", 1) - 1,
             "has_clk": self.has_clk,
             "has_state": bool(self.state_map or self.rams),
             "has_ce": self._has_ce,
@@ -314,7 +314,8 @@ class Py2ver:
         assigns = list(ir.assigns)
         # With a block RAM, a sample takes two clocks (read, then compute and
         # write); state commits in the second one.
-        commit = "(ce && __phase)" if self.rams else "ce"
+        self.ram_phases, self._ram_schedule = self._schedule_rams(ir)
+        commit = f"(ce && {self._phase_is(self.ram_phases - 1)})" if self.ram_phases > 1 else "ce"
         if self._pipe is not None:
             # Only a real sample reaching the loop stage updates the state
             commit = f"(ce && {self._pipe.valid_at_loop})"
@@ -351,45 +352,119 @@ class Py2ver:
             items=list(ir.items) + self._ram_items(),
         )
 
+    def _schedule_rams(self, ir: ModuleIR) -> Tuple[int, Dict[str, Any]]:
+        """
+        Clocks per sample with block RAMs, and the clock of each read/write.
+        A read is issued once the reads its address depends on have their data;
+        the outputs are computed when all read data is in; then the writes
+        follow one per clock, in program order (so the last write to an
+        address wins, as in Python).
+        """
+        if not self.rams:
+            return 1, {}
+        deps = {a.left: set(self._extract_idents(a.right)) for a in ir.assigns}
+        rdata_of = {rd: (mem, j) for mem, ports in self._ram_ports.items()
+                    for j, (_ra, rd) in enumerate(ports["reads"])}
+
+        def reach(name: str, seen: set) -> set:
+            for d in deps.get(name, ()):
+                if d not in seen:
+                    seen.add(d)
+                    reach(d, seen)
+            return seen
+
+        issue: Dict[str, int] = {}
+
+        def issue_clock(rdata: str) -> int:
+            if rdata not in issue:
+                mem, j = rdata_of[rdata]
+                raddr = self._ram_ports[mem]["reads"][j][0]
+                before = [r for r in reach(raddr, {raddr}) if r in rdata_of]
+                issue[rdata] = max((issue_clock(r) + 1 for r in before), default=0)
+            return issue[rdata]
+
+        for rd in rdata_of:
+            issue_clock(rd)
+        compute = max((c + 1 for c in issue.values()), default=0)
+        writes = max((len(p["writes"]) for p in self._ram_ports.values()), default=0)
+        return compute + max(writes, 1), {"issue": issue, "compute": compute}
+
+    def _phase_is(self, clock: int) -> str:
+        if self.ram_phases <= 1:
+            return "1'b1"
+        return f"(__phase == {self._phase_bits}'d{clock})"
+
+    @property
+    def _phase_bits(self) -> int:
+        return max(1, (self.ram_phases - 1).bit_length())
+
     def _ram_items(self) -> List[str]:
-        """Verilog for the block-RAM memories and their shared two-clock phase."""
+        """
+        Verilog for the block-RAM memories. Each read port gets its own copy of
+        the memory (all copies take every write), and the writes of a sample
+        share one write port, one per clock, so every copy stays a simple
+        dual-port block RAM.
+        """
         if not self.rams:
             return []
-        items = [
-            "// Two clocks per sample: __phase 0 reads the RAMs, 1 computes and writes",
-            "reg __phase;",
-            "always @(posedge clk) begin",
-            "  if (rst) __phase <= 1'b0;",
-            "  else if (ce) __phase <= ~__phase;",
-            "end",
-        ]
+        items: List[str] = []
+        P, pb = self.ram_phases, self._phase_bits
+        compute = self._ram_schedule["compute"]
+        if P > 1:
+            items += [
+                f"// {P} clocks per sample: RAM reads, then compute, then writes",
+                f"reg [{pb - 1}:0] __phase;",
+                "always @(posedge clk) begin",
+                f"  if (rst) __phase <= {pb}'d0;",
+                f"  else if (ce) __phase <= (__phase == {pb}'d{P - 1}) ? {pb}'d0 : __phase + {pb}'d1;",
+                "end",
+            ]
         for mem, ram in self.rams.items():
             n, elem = ram["length"], ram["elem"]
             w = int(elem["width"])
+            aw = max(1, (n - 1).bit_length())
             sig = "signed " if int(elem["signed"]) == 1 else ""
-            ports = self._ram_ports[mem]
+            reads = self._ram_ports[mem]["reads"]
+            writes = self._ram_ports[mem]["writes"]
             init = self._ram_init[mem]
             values = list(init) if isinstance(init, (list, tuple)) else [init] * n
             if len(values) != n:
                 raise ValueError(f"'init' of RAM '{mem}' needs {n} values")
             mask = (1 << w) - 1
-            items.append(f"// RAM {mem}: {n} x {w} bits")
-            items.append(f"reg {sig}[{w - 1}:0] {mem} [0:{n - 1}];")
-            items.append(f"reg {sig}[{w - 1}:0] {mem}__rdata;")
-            if any(values):
-                items.append("initial begin")
-                items += [f"  {mem}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(values)]
+            items.append(f"// RAM {mem}: {n} x {w} bits, {max(len(reads), 1)} copy(ies)")
+
+            if writes:
+                def by_clock(k: int) -> str:
+                    expr = "0"
+                    for i in reversed(range(len(writes))):
+                        expr = f"({self._phase_is(compute + i)} ? {writes[i][k]} : {expr})"
+                    return expr
+                items.append(f"wire [{aw - 1}:0] {mem}__wa = {by_clock(1)};")
+                items.append(f"wire [{w - 1}:0] {mem}__wd = {by_clock(2)};")
+                enables = " || ".join(f"({self._phase_is(compute + i)} && {we})"
+                                      for i, (we, _a, _d) in enumerate(writes))
+                items.append(f"wire {mem}__wen = {enables};")
+
+            for c in range(max(len(reads), 1)):
+                arr = f"{mem}__m{c}"
+                items.append(f"reg {sig}[{w - 1}:0] {arr} [0:{n - 1}];")
+                if any(values):
+                    items.append("initial begin")
+                    items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(values)]
+                    items.append("end")
+                else:
+                    items.append(f"integer __i_{arr};")
+                    items.append(f"initial for (__i_{arr} = 0; __i_{arr} < {n}; "
+                                 f"__i_{arr} = __i_{arr} + 1) {arr}[__i_{arr}] = {w}'d0;")
+                items.append("always @(posedge clk) begin")
+                if c < len(reads):
+                    raddr, rdata = reads[c]
+                    items.insert(-1, f"reg {sig}[{w - 1}:0] {rdata};")
+                    clock = self._ram_schedule["issue"][rdata]
+                    items.append(f"  if (ce && {self._phase_is(clock)}) {rdata} <= {arr}[{raddr}];")
+                if writes:
+                    items.append(f"  if (ce && {mem}__wen) {arr}[{mem}__wa] <= {mem}__wd;")
                 items.append("end")
-            else:
-                items.append("integer __i_" + mem + ";")
-                items.append(f"initial for (__i_{mem} = 0; __i_{mem} < {n}; __i_{mem} = __i_{mem} + 1)"
-                             f" {mem}[__i_{mem}] = {w}'d0;")
-            items.append("always @(posedge clk) begin")
-            if ports["raddr"]:
-                items.append(f"  if (ce && !__phase) {mem}__rdata <= {mem}[{ports['raddr']}];")
-            items.append(f"  if (ce && __phase && {ports['we']}) "
-                         f"{mem}[{ports['waddr']}] <= {ports['wdata']};")
-            items.append("end")
         return items
 
     @staticmethod
@@ -870,11 +945,11 @@ class Py2ver:
     # ------------------------------------------------------------------------
 
     def _stream_mode(self) -> str:
-        if self.rams:
+        if getattr(self, "ram_phases", 1) > 1:
             return "ram"
         if self.pipeline_stages:
             return "pipe"
-        if self.has_clk and not self.state_map:
+        if self.has_clk and not (self.state_map or self.rams):
             raise NotImplementedError(
                 "The stream wrapper needs a combinational, stateful or pipelined design; "
                 "'reg' signals have no balanced latency (use pipeline=N instead)."
@@ -906,6 +981,7 @@ class Py2ver:
             "has_rst": any(p.kind == "rst" for p in self.ir.inputs),
             "has_ce": self._has_ce,
             "has_vin": self._has_vin,
+            "phases": getattr(self, "ram_phases", 1),
         }
         path = self.hdl_dir / f"{self.t_name}_stream.v"
         path.write_text(self.get_template("stream_wrapper.txt").render(ctx), encoding="utf-8")
@@ -1154,7 +1230,7 @@ class Py2ver:
             "out_latency": dict(getattr(self, "out_latency", {})),
             "pipeline_stages": self.pipeline_stages,
             "has_ce": self._has_ce,
-            "two_phase": bool(self.rams),
+            "ram_phases": getattr(self, "ram_phases", 1),
             "has_vin": self._has_vin,
             # With state and a pipeline, results come out this many clocks later
             "stream_latency": self.pipeline_stages if self._has_vin else 0,

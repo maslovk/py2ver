@@ -11,8 +11,8 @@
 // its last stage can hand its result on, so it takes one input per clock
 // while m_ready stays high.
 {% elif mode == "ram" %}
-// Core with a block-RAM memory: each sample takes two clocks (read, then
-// compute and write), so one input is taken every other clock at most.
+// Core with block-RAM memories: each sample takes {{ phases }} clocks (reads,
+// compute, writes), so one input is taken every {{ phases }} clocks at most.
 {% else %}
 // The result of each input is registered; with state, the state advances
 // exactly once per input taken.
@@ -79,8 +79,9 @@ module {{ name }}_stream (
     reg m_valid_r;
     assign m_valid = m_valid_r;
 {% if mode == "ram" %}
-    // busy: the core is in its second clock, working on the held inputs
-    reg busy;
+    // left: clocks still to go on the held inputs (busy while nonzero)
+    reg [{{ (phases - 1).bit_length() - 1 if phases > 2 else 0 }}:0] left;
+    wire busy = (left != 0);
 {% for c in in_conns %}
     reg {{ c[1] }} {{ c[0] }}_held;
 {% endfor %}
@@ -90,20 +91,21 @@ module {{ name }}_stream (
 
     always @(posedge clk) begin
         if (rst) begin
-            busy      <= 1'b0;
+            left      <= 0;
             m_valid_r <= 1'b0;
         end else begin
             if (m_ready)
                 m_valid_r <= 1'b0;
-            if (busy) begin
-                busy      <= 1'b0;
+            if (busy)
+                left <= left - 1'b1;
+            if (left == 1) begin            // the core's last clock: outputs valid
                 m_valid_r <= 1'b1;
 {% for c in out_conns %}
                 m_{{ c[0] }}_r <= {{ c[0] }}_w;
 {% endfor %}
             end
             if (start) begin
-                busy <= 1'b1;
+                left <= {{ phases - 1 }};
 {% for c in in_conns %}
                 {{ c[0] }}_held <= s_{{ c[0] }};
 {% endfor %}

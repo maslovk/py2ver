@@ -73,10 +73,11 @@ async def tb_test(dut):
         dut.{{ name }}.value = vec[{{ loop.index0 }}]
 {% endfor %}
 
-{% if two_phase|default(false) %}
-        # Block RAM: first clock reads it, outputs are valid in the second
-        await RisingEdge(dut.clk)
-        await Timer(1, unit="ns")
+{% if ram_phases|default(1) > 1 %}
+        # Block RAM: the first clocks read it; outputs are valid in the last one
+        for _ in range({{ ram_phases - 1 }}):
+            await RisingEdge(dut.clk)
+            await Timer(1, unit="ns")
 {% endif %}
         # Outputs are combinational in (inputs, state): sample before the edge
         await Timer(10, unit="ns")

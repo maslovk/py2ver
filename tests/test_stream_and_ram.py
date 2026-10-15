@@ -48,16 +48,6 @@ def read_after_write(x, mem):
     return mem[0]
 
 
-def two_reads(x, mem):
-    return mem[0] + mem[1]
-
-
-def two_writes(x, mem):
-    mem[0] = x
-    mem[1] = x
-    return x
-
-
 def whole_memory(x, mem):
     return sum(mem)
 
@@ -188,17 +178,15 @@ def test_ram_verilog_uses_an_array(monkeypatch, tmp_path):
     Py2ver(delay_ram, DELAY_RAM_ATTR)
     verilog = (tmp_path / "hdl" / "main.v").read_text(encoding="utf-8")
 
-    assert "reg signed [7:0] buf_ [0:7];" in verilog     # keyword renamed
-    assert "buf_[0] = 8'd1;" in verilog                    # initial contents
-    assert "if (ce && !__phase) buf___rdata <= buf_[" in verilog
+    assert "reg signed [7:0] buf___m0 [0:7];" in verilog   # keyword renamed
+    assert "buf___m0[0] = 8'd1;" in verilog                # initial contents
+    assert "if (ce && (__phase == 1'd0)) buf___rdata0 <= buf___m0[" in verilog
 
 
 @pytest.mark.parametrize(
     "func, match",
     [
         (read_after_write, "read after being written"),
-        (two_reads, "two different addresses"),
-        (two_writes, "more than once"),
         (whole_memory, "only be used as"),
         (returns_memory, "don't return it"),
     ],

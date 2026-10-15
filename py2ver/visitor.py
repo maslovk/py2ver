@@ -721,10 +721,11 @@ class FunctionVisitor(ast.NodeVisitor):
 
         for mem, ram in self._rams.items():
             self.ram_ports[mem] = {
-                "raddr": self._resolve_name(f"{mem}__raddr") if ram["raddr"] else None,
-                "we": self._resolve_name(f"{mem}__we"),
-                "waddr": self._resolve_name(f"{mem}__waddr"),
-                "wdata": self._resolve_name(f"{mem}__wdata"),
+                "reads": [(self._resolve_name(f"{mem}__raddr{j}"), f"{mem}__rdata{j}")
+                          for j in range(len(ram["reads"]))],
+                "writes": [tuple(self._resolve_name(f"{mem}__{k}{i}")
+                                 for k in ("we", "waddr", "wdata"))
+                           for i in range(ram["writes"])],
             }
 
         # determine if clk needed
@@ -789,13 +790,9 @@ class FunctionVisitor(ast.NodeVisitor):
         if "length" not in meta:
             raise NotImplementedError(f"RAM '{mem}' needs a 'length'")
         elem = {"width": meta["width"], "signed": meta["signed"], "type": "wire"}
+        # reads: one address per read port; writes: number of write statements
         self._rams[mem] = {"length": int(meta["length"]), "elem": elem,
-                           "raddr": None, "written": False, "writes": 0}
-        self.attr[f"{mem}__rdata"] = dict(elem)
-        # Write port defaults (no write unless a statement writes)
-        self._assign_var(f"{mem}__we", "0")
-        self._assign_var(f"{mem}__waddr", "0")
-        self._assign_var(f"{mem}__wdata", "0")
+                           "reads": [], "writes": 0, "written": False}
 
     def _ram_address(self, mem: str, index: ast.AST) -> str:
         """Address for mem[index], with Python's negative indices mapped."""
@@ -806,39 +803,42 @@ class FunctionVisitor(ast.NodeVisitor):
         return idx
 
     def _ram_read(self, mem: str, index: ast.AST) -> str:
+        """mem[index]: a read port per distinct address (<mem>__rdata<j>)."""
         ram = self._rams[mem]
         if ram["written"]:
             raise NotImplementedError(
                 f"RAM '{mem}' is read after being written in the same sample; "
-                "read it first (a block RAM reads before it writes)"
+                "read it first (the RAM reads before it writes)"
             )
         addr = self._ram_address(mem, index)
-        if ram["raddr"] is None:
-            ram["raddr"] = addr
-            self._assign_var(f"{mem}__raddr", addr)
-        elif ram["raddr"] != addr:
-            raise NotImplementedError(
-                f"RAM '{mem}' is read at two different addresses in one sample "
-                "(a block RAM has one read port here)"
-            )
-        return f"{mem}__rdata"
+        if addr in ram["reads"]:
+            return f"{mem}__rdata{ram['reads'].index(addr)}"
+        j = len(ram["reads"])
+        ram["reads"].append(addr)
+        self.attr[f"{mem}__rdata{j}"] = dict(ram["elem"])
+        self._assign_var(f"{mem}__raddr{j}", addr)
+        return f"{mem}__rdata{j}"
 
     def _ram_write(self, mem: str, target: ast.Subscript, rhs: str,
                    env: Dict[str, str] | None) -> None:
+        """mem[index] = rhs: write slot i (<mem>__we<i>, __waddr<i>, __wdata<i>)."""
         ram = self._rams[mem]
-        ram["writes"] += 1
-        if ram["writes"] > 1:
-            raise NotImplementedError(
-                f"RAM '{mem}' is written more than once per sample (one write port)"
-            )
         ram["written"] = True
-        writes = {f"{mem}__we": "1", f"{mem}__waddr": self._ram_address(mem, target.slice),
-                  f"{mem}__wdata": rhs}
-        for var, value in writes.items():
-            if env is None:
-                self._assign_var(var, value)
-            else:
-                env[var] = f"({value})"
+        i = ram["writes"]
+        ram["writes"] += 1
+        we, waddr, wdata = f"{mem}__we{i}", f"{mem}__waddr{i}", f"{mem}__wdata{i}"
+        addr = self._ram_address(mem, target.slice)
+        if env is None:
+            self._assign_var(we, "1")
+            self._assign_var(waddr, addr)
+            self._assign_var(wdata, rhs)
+        else:
+            # Inside an if: no write unless this branch is taken
+            for var in (we, waddr, wdata):
+                self._assign_var(var, "0")
+            env[we] = "(1)"
+            env[waddr] = f"({addr})"
+            env[wdata] = f"({rhs})"
 
     def _register_arg(self, name: str):
         self._ssa_count[name] = 1

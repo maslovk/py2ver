@@ -280,10 +280,15 @@ larger ones use block RAM:
 - **Block RAM**: `'memory': 'ram'` on a list argument keeps it as a RAM array
   (FPGA block RAM: a 256 x 16 histogram is 4096 RAM bits and ~60 logic
   elements, against ~11,000 as registers). The function updates it in place
-  and doesn't return it. Per sample it may be read at one address and written
-  once, reading before writing. A sample then takes two clocks (read, then
-  compute and write); `TB_stream`, `HW()` and the stream wrapper account for
-  that. `'init'` sets the power-up contents (KEY0 does not clear a RAM).
+  and doesn't return it. A sample may read it at several addresses (each read
+  address gets its own copy of the RAM, like Quartus' own read-port
+  replication), including addresses that come from another read
+  (`mem[mem[i]]`), and write it several times (one write per clock, in program
+  order, so the last write to an address wins); all reads must come before the
+  writes. A sample takes (read levels) + (writes) clocks, e.g. 2 for read then
+  write, 3 for a swap; `TB_stream`, `HW()` and the stream wrapper account for
+  that (`p.ram_phases`). `'init'` sets the power-up contents (KEY0 does not
+  clear a RAM).
 
 ```python
 def histogram(bin_, counts):
