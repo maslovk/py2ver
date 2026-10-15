@@ -112,7 +112,8 @@ def _fmt(t) -> str:
     if t == CPLX:
         return "a complex value"
     if t[0] == "l":
-        return "a list of " + _fmt(t[1]).split(" ", 1)[1] + "s"
+        return ("a list of integers" if not _is_fx(t[1])
+                else f"a list of fixed-point values with {t[1][1]} fraction bits")
     return f"a fixed-point value with {t[1]} fraction bits"
 
 
@@ -253,13 +254,23 @@ class _Lower:
                 return node
             if t[1] == target[1] or not (_is_fx(t[1]) or _is_fx(target[1])):
                 return node
+            elts = self._elements(node)
+            if elts is not None:
+                node = ast.List(elts=elts, ctx=ast.Load())
             if isinstance(node, (ast.List, ast.Tuple)):
                 node.elts = [self._fit(e, t[1], target[1], meta, what, where) for e in node.elts]
                 return node
-            if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult)
-                    and isinstance(node.left, (ast.List, ast.Tuple))):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                # xs + ys: both sides were aligned to the joined format
                 node.left = self._fit(node.left, t, target, meta, what, where)
+                node.right = self._fit(node.right, t, target, meta, what, where)
                 return node
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):      # [v] * n
+                for side in ("left", "right"):
+                    if isinstance(getattr(node, side), (ast.List, ast.Tuple)):
+                        setattr(node, side, self._fit(getattr(node, side), t, target, meta,
+                                                      what, where))
+                        return node
             if self.final:
                 self._err(where, f"'{what}' holds {_fmt(target)}; this list has {_fmt(t)}. "
                                  "Assign it element by element")
@@ -286,6 +297,23 @@ class _Lower:
                          args=[ast.Constant(hi), v]),
             ])
         return node
+
+    def _elements(self, node: ast.expr) -> Optional[List[ast.expr]]:
+        """A list variable of known length (or a constant slice of one) as its
+        elements, so they can be converted one by one."""
+        base, sl = node, None
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            base, sl = node.value, node.slice
+        if not (isinstance(base, ast.Name) and "length" in self.meta.get(base.id, {})):
+            return None
+        idx = list(range(int(self.meta[base.id]["length"])))
+        if sl is not None:
+            bounds = [None if b is None else _number(b, {}) for b in (sl.lower, sl.upper, sl.step)]
+            if any(b is None and e is not None for b, e in zip(bounds, (sl.lower, sl.upper, sl.step))):
+                return None
+            idx = idx[slice(*bounds)]
+        return [ast.Subscript(value=ast.Name(id=base.id, ctx=ast.Load()), slice=ast.Constant(k),
+                              ctx=ast.Load()) for k in idx]
 
     def _constant(self, v: Any):
         """A global float or table with floats as (node, type), or None."""

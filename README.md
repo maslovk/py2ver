@@ -156,6 +156,60 @@ assignment. Fixed-point outputs come back as floats, and a fixed-point
 state's or memory's `'init'` is a number too.
 
 
+### Choosing fixed-point formats automatically
+
+Without `attr`, give example inputs and py2ver chooses the formats itself,
+then prints the `attr` it chose (to keep, or adjust and pass next time):
+
+```python
+p = Py2ver(lpf, samples=examples)     # vectors, as for PY_batch()
+# py2ver: formats chosen for lpf (pass this as attr to keep them):
+# attr = {
+#     'x': {'signed': 1, 'width': 16, 'frac': 14},
+#     'y': {'signed': 1, 'width': 16, 'frac': 14},
+#     'yn': {'signed': 1, 'width': 16, 'frac': 14},
+# }
+```
+
+Without `attr` every parameter is an input. For state, pass the part that
+can't be guessed and the rest is filled in: `Py2ver(lpf, {'y': {'next':
+'yn'}}, samples=xs, max_error=1e-3)`. The same is available as a function,
+`auto_fixed()`, which returns the attr instead of printing it:
+
+```python
+from py2ver import Py2ver, auto_fixed
+
+state = {'y': {'next': 'yn'}}
+attr = auto_fixed(lpf, examples, state, width=16)                 # 16 bits everywhere
+attr = auto_fixed(lpf, examples, state, width=16, max_error=1e-3) # fewest bits for 1e-3
+p = Py2ver(lpf, attr)
+```
+
+It runs the float function on the example inputs, measures the range of
+every parameter and variable, and gives each value that holds floats a
+format with enough integer bits for its range (plus `margin=1`):
+
+- `width=W`: every value gets `W` bits (16 for `Py2ver(..., samples=...)`
+  unless given); what its integer part leaves over is fraction.
+- `max_error=E`: the fraction bits are searched instead, value by value: the
+  fewest that keep every output of the bit-exact model within `E` of the
+  float function on the examples (`quantization_error`). `E` may be a dict
+  `{output: error}`; other outputs are then free. Inputs are your interface,
+  so they aren't searched: they keep the formats you give in `attr`, or get
+  `width` bits.
+
+The result is an ordinary `attr` dict to read, adjust and keep. Entries you
+pass with a `'width'` are kept as they are, and `'next'`, `'init'`,
+`'length'` and `'memory'` are kept; a state's next value takes the state's
+format. Integer inputs get integer formats (just wide enough), integer
+variables keep their exact widths, and float values are signed. `round=True`
+/ `saturate=True` add those options to every chosen format.
+
+The ranges come only from the examples, so give inputs that cover the real
+range: a value they never reach can still overflow (add `margin` bits or use
+`saturate=True` if unsure). Trial designs for the search are built in a
+temporary directory.
+
 ### State registers (streaming designs)
 
 Write one step of a stateful design as a function that takes its state as
@@ -406,7 +460,8 @@ extra hardware. `and`/`or` give 0/1, not Python's operand values.
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
 signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
-fixed-point FIR filter from a float model, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+fixed-point FIR filter from a float model, a biquad filter with automatically
+chosen formats, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```

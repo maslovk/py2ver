@@ -29,6 +29,7 @@ import inspect
 import logging
 import os
 import pickle
+import pprint
 import shutil
 import subprocess
 from pathlib import Path
@@ -43,6 +44,7 @@ from .pipeline import pipeline_ir
 from .semantics import exact_ir
 from .inline import inline_helpers
 from .names import rename_keywords
+from .auto import auto_fixed
 from .hwtypes import _namespace, normalize_attr, read_annotations
 from .fixed import DEFAULT_CONST_BITS, build_model, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
@@ -77,8 +79,24 @@ class Py2ver:
 
     def __init__(self, func: Callable, attr: Dict[str, Any] | None = None,
                  template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0,
-                 const_bits: int = DEFAULT_CONST_BITS) -> None:
+                 const_bits: int = DEFAULT_CONST_BITS, samples: List[Any] | None = None,
+                 width: int | None = None, max_error: Any = None) -> None:
+        """
+        func: the function, as written. attr: widths, formats and state (see
+        the README). With `samples` (example inputs), formats missing from
+        attr (or all of them, without attr) are chosen by auto_fixed() from
+        the ranges seen: `width` bits per value (default 16), or the fewest
+        bits that keep the outputs within `max_error` of the float function.
+        The chosen attr is printed.
+        """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
+        if samples is not None:
+            attr = auto_fixed(func, samples, attr, width=width or 16, max_error=max_error,
+                              const_bits=const_bits)
+            lines = "".join(f"    {k!r}: {pprint.pformat(v, sort_dicts=False, width=200)},\n"
+                            for k, v in attr.items())
+            print(f"py2ver: formats chosen for {getattr(func, '__name__', 'the function')}"
+                  f" (pass this as attr to keep them):\nattr = {{\n{lines}}}")
 
         try:
             source_foo = inspect.getsource(func)
@@ -88,6 +106,9 @@ class Py2ver:
         tree = ast.parse(source_foo)
         # Types from annotations (U[8], State(...), ...); attr entries merge over them
         tree, ann = read_annotations(tree, func)
+        if attr is None and not ann:
+            raise ValueError("Give attr (widths and formats), annotations, or samples=<example "
+                             "inputs> to choose them automatically")
         attr = normalize_attr(attr)
         attr = {k: dict(ann.get(k, {}), **attr.get(k, {})) for k in dict.fromkeys([*ann, *attr])}
         # Inline calls to your own helper functions and module-level int constants
