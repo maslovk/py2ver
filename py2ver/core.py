@@ -23,6 +23,7 @@ Top-level:
 from __future__ import annotations
 
 import ast
+import copy
 import functools
 import re
 import inspect
@@ -48,6 +49,7 @@ from .names import rename_keywords
 from .auto import auto_fixed
 from .hwtypes import _namespace, normalize_attr, read_annotations
 from .cplx import split_complex
+from .fold import fold_loop
 from .fixed import DEFAULT_CONST_BITS, build_model, is_table, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
@@ -155,7 +157,8 @@ class Py2ver:
     def __init__(self, func: Callable, attr: Dict[str, Any] | None = None,
                  template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0,
                  const_bits: int = DEFAULT_CONST_BITS, samples: List[Any] | None = None,
-                 width: int | None = None, max_error: Any = None) -> None:
+                 width: int | None = None, max_error: Any = None,
+                 fold: Any = None, unroll: int = 1) -> None:
         """
         func: the function, as written. attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
@@ -163,6 +166,9 @@ class Py2ver:
         the ranges seen: `width` bits per value (default 16), or the fewest
         bits that keep the outputs within `max_error` of the float function.
         The chosen attr is printed.
+        fold: a loop to run over several clocks instead of unrolling it (its
+        variable's name, or True for the longest top-level range loop), with
+        `unroll` iterations per clock (see fold.py).
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
         if samples is not None:
@@ -179,6 +185,20 @@ class Py2ver:
         self._hw_name, self._py_name = fe.hw_name, fe.py_name
         self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
         self._fx_types, self._model = fe.fx_types, fe.model
+        # Folding: the loop's body runs once per clock (phase) instead of unrolled
+        self._fold: Dict[str, Any] | None = None
+        if fold is not None and fold is not False:
+            if pipeline:
+                raise NotImplementedError("fold can't be combined with pipeline yet")
+            unfolded = FunctionVisitor(attr)
+            unfolded.visit(copy.deepcopy(tree))
+            loop = fe.hw_name.get(fold, fold) if isinstance(fold, str) else fold
+            folded, info = fold_loop(tree, loop, unroll, unfolded.attr)
+            if info["phases"] > 1:                 # (all iterations in one clock: nothing to fold)
+                tree, self._fold = folded, info
+                attr = dict(attr, **info["attr"])
+                log.info("Folded loop '%s': %d clocks per sample, %d register(s)",
+                         info["loop"], info["phases"], len(info["regs"]))
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 
@@ -191,7 +211,8 @@ class Py2ver:
         # loaded from that output every clock and reset to 'init' (default 0).
         self.func = func
         # Parameters as ports: (param, [ports] for a list argument, or None)
-        self.arg_groups = list(f_visitor.arg_groups)
+        fold_ports = {self._fold["phase"], *self._fold["regs"]} if self._fold else set()
+        self.arg_groups = [g for g in f_visitor.arg_groups if g[0] not in fold_ports]
         self.state_map, self.state_init, self.state_params = self._parse_state(
             attr, dict(self.arg_groups)
         )
@@ -224,7 +245,9 @@ class Py2ver:
                 [round(d, 2) for d in self._pipe.stage_delay],
                 f", state loop in stage {self._pipe.loop_stage}" if self.state_map else "",
             )
-        if self.state_map or self.rams:
+        if self._fold and (self.rams or ir.has_clk):
+            raise NotImplementedError("fold can't be combined with block RAM or 'reg' signals yet")
+        if self.state_map or self.rams or self._fold:
             ir = self._lower_state(ir, f_visitor.attr)
         self.ir = ir
 
@@ -313,7 +336,7 @@ class Py2ver:
             "latency": self.tb_latency_cycles,
             "pre_step": getattr(self, "ram_phases", 1) - 1,
             "has_clk": self.has_clk,
-            "has_state": bool(self.state_map or self.rams),
+            "has_state": bool(self.state_map or self.rams or self._fold),
             "has_ce": self._has_ce,
             "has_vin": self._has_vin,
             "outputs_size": self.output_bits,
@@ -407,6 +430,9 @@ class Py2ver:
         # With a block RAM, a sample takes two clocks (read, then compute and
         # write); state commits in the second one.
         self.ram_phases, self._ram_schedule = self._schedule_rams(ir)
+        fold = self._fold or {"phases": 1, "phase": None, "regs": {}}
+        if self._fold:
+            self.ram_phases = fold["phases"]
         commit = f"(ce && {self._phase_is(self.ram_phases - 1)})" if self.ram_phases > 1 else "ce"
         if self._pipe is not None:
             # Only a real sample reaching the loop stage updates the state
@@ -429,7 +455,15 @@ class Py2ver:
                            is_reg=True)
             )
 
-        inputs = [p for p in ir.inputs if p.name not in self.state_map]
+        # A folded loop: its phase is the phase counter, its carried values are
+        # registers loaded every clock
+        if self._fold:
+            assigns.append(Assignment(left=fold["phase"], right="__phase"))
+            for reg, nxt in fold["regs"].items():
+                assigns.append(Assignment(left=reg, right=f"rst ? 0 : (ce ? {nxt} : {reg})",
+                                          is_reg=True))
+        fold_ports = {fold["phase"], *fold["regs"]}
+        inputs = [p for p in ir.inputs if p.name not in self.state_map and p.name not in fold_ports]
         have = {p.name for p in inputs}
         for name, kind in (("clk", "clk"), ("rst", "rst"), ("ce", "ce")):
             if name not in have:
@@ -438,10 +472,10 @@ class Py2ver:
         return ModuleIR(
             name=ir.name,
             inputs=inputs,
-            outputs=list(ir.outputs),
+            outputs=[p for p in ir.outputs if p.name not in set(fold["regs"].values())],
             assigns=assigns,
             has_clk=True,
-            items=list(ir.items) + self._ram_items(),
+            items=list(ir.items) + self._phase_items() + self._ram_items(),
         )
 
     def _schedule_rams(self, ir: ModuleIR) -> Tuple[int, Dict[str, Any]]:
@@ -490,6 +524,22 @@ class Py2ver:
     def _phase_bits(self) -> int:
         return max(1, (self.ram_phases - 1).bit_length())
 
+    def _phase_items(self) -> List[str]:
+        """The phase counter of a design that takes several clocks per sample."""
+        P, pb = self.ram_phases, self._phase_bits
+        if P <= 1:
+            return []
+        what = (f"the folded loop's iterations" if self._fold
+                else "RAM reads, then compute, then writes")
+        return [
+            f"// {P} clocks per sample: {what}",
+            f"reg [{pb - 1}:0] __phase;",
+            "always @(posedge clk) begin",
+            f"  if (rst) __phase <= {pb}'d0;",
+            f"  else if (ce) __phase <= (__phase == {pb}'d{P - 1}) ? {pb}'d0 : __phase + {pb}'d1;",
+            "end",
+        ]
+
     def _ram_items(self) -> List[str]:
         """
         Verilog for the block-RAM memories. Each read port gets its own copy of
@@ -500,17 +550,7 @@ class Py2ver:
         if not self.rams:
             return []
         items: List[str] = []
-        P, pb = self.ram_phases, self._phase_bits
         compute = self._ram_schedule["compute"]
-        if P > 1:
-            items += [
-                f"// {P} clocks per sample: RAM reads, then compute, then writes",
-                f"reg [{pb - 1}:0] __phase;",
-                "always @(posedge clk) begin",
-                f"  if (rst) __phase <= {pb}'d0;",
-                f"  else if (ce) __phase <= (__phase == {pb}'d{P - 1}) ? {pb}'d0 : __phase + {pb}'d1;",
-                "end",
-            ]
         for mem, ram in self.rams.items():
             n, elem = ram["length"], ram["elem"]
             w = int(elem["width"])
@@ -1094,7 +1134,7 @@ class Py2ver:
         vectors = list(vectors)
         if not vectors:
             return []
-        if self.state_map or self.rams:
+        if self.state_map or self.rams or self._fold:
             vecs = self._stream_vectors(vectors)
         else:
             vecs = [self._input_vector(tuple(v)) for v in vectors]
@@ -1395,7 +1435,7 @@ class Py2ver:
         )
 
     def _stream_vectors(self, samples: List[Any]) -> List[Tuple[int, ...]]:
-        if not (self.state_map or self.rams):
+        if not (self.state_map or self.rams or self._fold):
             raise ValueError("Streams need state ('next' or 'memory' in attr); use TB_batch().")
         # A sample is a tuple of arguments; anything else is the only argument
         return [self._input_vector(s if isinstance(s, tuple) else (s,)) for s in samples]
@@ -1446,6 +1486,8 @@ class Py2ver:
         log.info("TB called with %d vector(s)", len(vectors))
         if not vectors:
             return []
+        if self._fold:              # several clocks per vector: the stream testbench
+            return self.tb_stream_fun(vectors)
         return self._simulate(len(vectors), lambda: self.gen_tb(vectors))
 
     def tb_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:

@@ -311,6 +311,37 @@ the module) so gaps in the input never update the state; `TB_stream()`,
 `HW()` and the stream wrapper drive it for you. A FIR filter whose delay line
 is state goes from 84 to 126 MHz with `pipeline=2`.
 
+### Folding loops (fewer multipliers)
+
+By default every loop is unrolled: a 64-tap FIR becomes 64 multipliers that
+take a new sample every clock. `fold` runs a loop's body over several clocks
+instead, trading speed for area:
+
+```python
+p = Py2ver(fir_step, attr, fold='k')             # 1 copy of the body, N clocks per sample
+p = Py2ver(fir_step, attr, fold='k', unroll=4)   # 4 copies, N / 4 clocks per sample
+```
+
+`fold` names the loop variable of a top-level `for ... in range(...)` loop
+(`fold=True` takes the longest one), and `unroll` (dividing the number of
+iterations) is how many iterations run per clock. Variables the loop updates
+(an accumulator, a running maximum) become registers as wide as their widest
+value in the unrolled design, so the results don't change: the Python
+references are the same, and simulation must match them exactly. The design
+then takes N / unroll clocks per sample, which `TB_batch()` / `TB_stream()`,
+`HW()`, `HW_sim()` and the stream wrapper account for (`p.ram_phases`).
+
+A 16-tap integer FIR on the DE0-Nano's EP4CE22 (Quartus, `SYN()`):
+
+| | logic elements | 9-bit multipliers | Fmax | samples / s |
+|---|---|---|---|---|
+| unrolled | 1996 | 0 | 38 MHz | 38 M |
+| `fold='k'` | 551 | 2 | 68 MHz | 4.2 M |
+| `fold='k', unroll=4` | 637 | 8 | 63 MHz | 16 M |
+
+A folded loop can't assign list elements yet, and folding can't be combined
+with `pipeline`, block RAM or `'reg'` signals.
+
 ### Valid/ready streaming interface
 
 `p.stream_wrapper()` writes `hdl/<name>_stream.v`: the module behind a
@@ -502,7 +533,7 @@ signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
-table, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+table, a 32-tap FIR folded onto 4 multipliers, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```
