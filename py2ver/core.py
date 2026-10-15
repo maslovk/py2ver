@@ -23,6 +23,7 @@ Top-level:
 from __future__ import annotations
 
 import ast
+import builtins
 import copy
 import functools
 import re
@@ -155,7 +156,10 @@ def expand_args(call_inputs: List[str], cplx_params: set, args: Tuple[Any, ...])
         return tuple(args)
     out: List[Any] = []
     for name, v in zip(call_inputs, args):
-        if name in cplx_params:
+        if name in cplx_params and isinstance(v, (list, tuple)):     # a complex list
+            vs = [complex(x) for x in v]
+            out += [[x.real for x in vs], [x.imag for x in vs]]
+        elif name in cplx_params:
             v = complex(v)
             out += [v.real, v.imag]
         else:
@@ -172,14 +176,16 @@ class Py2ver:
                  template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0,
                  const_bits: int = DEFAULT_CONST_BITS, samples: List[Any] | None = None,
                  width: int | None = None, max_error: Any = None,
+                 round: bool = False, saturate: bool = False,
                  fold: Any = None, unroll: int = 1) -> None:
         """
         func: the function, as written. attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
         attr (or all of them, without attr) are chosen by auto_fixed() from
         the ranges seen: `width` bits per value (default 16), or the fewest
-        bits that keep the outputs within `max_error` of the float function.
-        The chosen attr is printed.
+        bits that keep the outputs within `max_error` of the float function,
+        with `round` / `saturate` added to every chosen format. The chosen attr
+        is printed.
         fold: a loop to run over several clocks instead of unrolling it (its
         variable's name, or True for the longest top-level range loop), with
         `unroll` iterations per clock (see fold.py).
@@ -187,7 +193,7 @@ class Py2ver:
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
         if samples is not None:
             attr = auto_fixed(func, samples, attr, width=width or 16, max_error=max_error,
-                              const_bits=const_bits)
+                              round=round, saturate=saturate, const_bits=const_bits)
             lines = "".join(f"    {k!r}: {pprint.pformat(v, sort_dicts=False, width=200)},\n"
                             for k, v in attr.items())
             print(f"py2ver: formats chosen for {getattr(func, '__name__', 'the function')}"
@@ -256,7 +262,7 @@ class Py2ver:
             log.info(
                 "Pipelined into %d stages: +%d register bits, est. stage delays %s%s",
                 self.pipeline_stages + 1, self._pipe.register_bits,
-                [round(d, 2) for d in self._pipe.stage_delay],
+                [builtins.round(d, 2) for d in self._pipe.stage_delay],   # ('round' is a parameter)
                 f", state loop in stage {self._pipe.loop_stage}" if self.state_map else "",
             )
         if self._fold and (self.rams or ir.has_clk):
@@ -1758,13 +1764,16 @@ class Py2ver:
 def _flatten_outputs(ret: Any) -> Tuple[Any, ...]:
     """
     Python results as output values, in port order: a complex value becomes
-    (real, imag) and a list its elements.
+    (real, imag), a list its elements, and a list of complex values its real
+    parts, then its imaginary parts (<xs>_re_*, <xs>_im_*).
     """
     out: List[Any] = []
 
     def add(v: Any) -> None:
         if isinstance(v, complex):
             out.extend([v.real, v.imag])
+        elif isinstance(v, (list, tuple)) and any(isinstance(e, complex) for e in v):
+            out.extend([complex(e).real for e in v] + [complex(e).imag for e in v])
         elif isinstance(v, (list, tuple)):
             for e in v:
                 add(e)

@@ -226,7 +226,9 @@ def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]
         outputs.append(_flatten_outputs(ret))
         for p in state:
             nxt = attr[p].get("next")
-            if nxt is not None and nxt != p:
+            # The last value given to the next state (a state reassigned under its
+            # own name too; a list updated in place keeps its object otherwise)
+            if nxt is not None:
                 values[p] = last.get(nxt, values[p])
     return outputs, order, returned
 
@@ -327,7 +329,8 @@ def model_outputs(fe: Any, samples: List[Any]) -> Tuple[List[str], List[Tuple[fl
         rows.append(tuple(flat))
         for p in state:
             nxt = attr[p].get("next")
-            values[p] = fit(p, row[nxt] if nxt not in (None, p) else values[p])
+            # (a memory, or a list updated in place and not returned, keeps its object)
+            values[p] = fit(p, row[nxt] if nxt in row else values[p])
     return [fe.py_name.get(n, n) for n in ports], rows
 
 
@@ -405,6 +408,12 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
         extra["saturate"] = True
 
     kept = {k for k, m in base.items() if "width" in m}
+    # A loop variable over a list takes the list's elements: no format of its own
+    fd = ast.parse(inspect.getsource(func)).body[0]
+    kept |= {s.target.id for s in ast.walk(fd)
+             if isinstance(s, ast.For) and isinstance(s.target, ast.Name)
+             and not (isinstance(s.iter, ast.Call) and isinstance(s.iter.func, ast.Name)
+                      and s.iter.func.id == "range")}
     result: Dict[str, Dict[str, Any]] = {}
     auto: Dict[str, Tuple[_Range, int]] = {}       # name -> (range, integer bits)
     tables = {n for n in order if f"{n}{_TABLE_IN}" in ranges}

@@ -162,8 +162,11 @@ state needs `'complex': True` (it becomes two ports); you pass and get back
 Python complex numbers, and a returned complex value is two outputs. `+`,
 `-`, `*`, `/` by a real value, `.real`, `.imag`, `.conjugate()`,
 `complex(a, b)` and complex constants work, including module-level tables of
-them (FFT twiddle factors) indexed by a variable. `abs()` of a complex value
-(a square root) and division by a complex value aren't supported.
+them (FFT twiddle factors) indexed by a variable. Lists of complex values
+work too (`ys.append(y)`, indexing, slices, `+`, `sum`, `for z in zs`; a
+complex list parameter has `'complex': True` and `'length'`). `abs()` of a
+complex value (a square root) and division by a complex value aren't
+supported.
 
 ```python
 ROT = cmath.exp(-2j * math.pi * 0.125)
@@ -397,6 +400,43 @@ gives the results per block. Folding the filter so it takes as many clocks
 per block as samples per block (`unroll=N // 4` above) keeps up with one
 sample per clock while sharing the multipliers.
 
+### Signal chains
+
+A chain of blocks is plain Python: a function that calls the blocks'
+functions. py2ver inlines them into one design, so the whole chain gets one
+set of formats, one Python reference and one stream interface. State passes
+in and out of each block as usual, and a rate change is a loop over the
+samples of a block:
+
+```python
+def downconvert(x, z):              # one sample
+    y = x * z
+    zn = z * ROT
+    return y, zn
+
+def decimate(xs, delay):            # 4 samples in, 1 out
+    ...
+    return acc, new_delay
+
+def receiver(xs, z, delay):         # the chain, on a block of 4 samples
+    ys = []
+    for x in xs:
+        y, z = downconvert(x, z)
+        ys.append(y)
+    acc, delay = decimate(ys, delay)
+    return acc.real * acc.real + acc.imag * acc.imag, z, delay
+
+state = {'xs': {'serial': True},
+         'z': {'next': 'z', 'init': 1, 'complex': True},
+         'delay': {'length': 4, 'next': 'delay', 'complex': True}}
+p = Py2ver(receiver, state, samples=blocks, max_error=1e-3, round=True)
+```
+
+`examples/receiver.py` is this chain: its formats are chosen for the error
+target, it matches the bit-exact model in simulation and takes one sample per
+handshake through the stream wrapper. `fold` applies to the chain too (the
+longest loop, here the filter's taps).
+
 ### Area and timing (`SYN()`)
 
 `SYN()` compiles the generated module alone with Quartus (no board needed,
@@ -477,7 +517,7 @@ vectors).
 - Returning an argument: it gets its own output port, `<name>_out`
 
 Not supported: `while`, recursion, early `return`, keyword arguments in
-helper calls, dicts and sets, nested lists, lists of complex values.
+helper calls, dicts and sets, nested lists.
 
 Python names that are Verilog keywords (`buf`, `time`, `table`, `type`, ...)
 get a `_` suffix in the HDL; keep using the Python names in `attr` and calls.
@@ -567,7 +607,8 @@ a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
 table, a 32-tap FIR folded onto 4 multipliers, a decimate-by-4 filter fed one
-sample per handshake, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+sample per handshake, a receiver chain built from plain Python functions, a
+histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```

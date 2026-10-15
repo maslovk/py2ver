@@ -32,11 +32,27 @@ import ast
 import copy
 import functools
 import math
+import re
 from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 DEFAULT_CONST_BITS = 18
 DEFAULT_TABLE_BITS = 10
+# Element-wise conversion of a list whose length only the translator knows:
+# FIT_LIST(xs, shift, round, lo, hi) (see fit_list)
+FIT_LIST = "py2ver_fit_list"
+# Temporaries made by the complex and fixed-point passes
+_INTERNAL = re.compile(r"(cx|fxq)\d+(_re|_im)?$")
+
+
+def fit_list(xs, shift: int, rnd: bool, lo, hi):
+    """Each element: shifted right by `shift` (rounding half up if rnd; left if
+    negative), then clamped to [lo, hi] unless lo is None."""
+    out = []
+    for x in xs:
+        v = ((x + (1 << (shift - 1) if rnd else 0)) >> shift) if shift > 0 else x << -shift
+        out.append(v if lo is None else max(lo, min(hi, v)))
+    return out
 # Beyond this many fraction bits a variable's format is taken to grow forever
 MAX_FRAC = 256
 
@@ -223,10 +239,12 @@ class _Lower:
             return
         new = _join(self.env.get(name), t, name)
         if new != self.env.get(name):
-            if _frac(new if new[0] != "l" else new[1]) > MAX_FRAC:
-                self._err(node, f"The fixed-point format of '{name}' grows on every loop "
-                                f"iteration; give '{name}' a format in attr, e.g. "
-                                f"{{'{name}': {{'signed': 1, 'width': 32, 'frac': 16}}}}")
+            # (internal temporaries grow along with a variable: name the variable)
+            if _frac(new if new[0] != "l" else new[1]) > MAX_FRAC and not _INTERNAL.match(name):
+                user = re.sub(r"_(re|im)$", "", name)
+                self._err(node, f"The fixed-point format of '{user}' grows on every loop "
+                                f"iteration; give '{user}' a format in attr, e.g. "
+                                f"{{'{user}': {{'signed': 1, 'width': 32, 'frac': 16}}}}")
             self.env[name] = new
             self.changed = True
 
@@ -261,8 +279,8 @@ class _Lower:
                 if self.final:
                     self._err(where, f"'{what}' holds {_fmt(target)}, not {_fmt(t)}")
                 return node
-            if t[1] == target[1] or not (_is_fx(t[1]) or _is_fx(target[1])):
-                return node
+            if t[1] is None or t[1] == target[1] or not (_is_fx(t[1]) or _is_fx(target[1])):
+                return node                         # (an empty list has nothing to convert)
             elts = self._elements(node)
             if elts is not None:
                 node = ast.List(elts=elts, ctx=ast.Load())
@@ -280,10 +298,14 @@ class _Lower:
                         setattr(node, side, self._fit(getattr(node, side), t, target, meta,
                                                       what, where))
                         return node
-            if self.final:
-                self._err(where, f"'{what}' holds {_fmt(target)}; this list has {_fmt(t)}. "
-                                 "Assign it element by element")
-            return node
+            # A list of a length known only to the translator: convert it there
+            shift = _frac(t[1]) - _frac(target[1])
+            lo = hi = None
+            if meta.get("saturate") and "width" in meta:
+                lo, hi = int_range(int(meta["width"]), bool(meta.get("signed")))
+            return ast.Call(func=ast.Name(id=FIT_LIST, ctx=ast.Load()), keywords=[], args=[
+                node, ast.Constant(shift), ast.Constant(bool(meta.get("round")) and shift > 0),
+                ast.Constant(lo), ast.Constant(hi)])
         if CPLX in (t, target):
             if _is_fx(t) or _is_fx(target):
                 self._err(where, f"'{what}' mixes complex and fixed-point values")
@@ -867,7 +889,7 @@ def build_model(tree: ast.Module, attr: Dict[str, Dict[str, Any]],
     fd = _Model().visit(fd)
     module = ast.fix_missing_locations(ast.Module(body=[fd], type_ignores=[]))
     env = dict(ns)
-    env.update(__py2ver_wrap=wrap, __py2ver_tdiv=_tdiv,
+    env.update(__py2ver_wrap=wrap, __py2ver_tdiv=_tdiv, **{FIT_LIST: fit_list},
                __py2ver_wrapl=lambda xs, w, s: [wrap(int(x), w, s) for x in xs])
     exec(compile(module, "<py2ver bit-exact model>", "exec"), env)
     return env[fd.name]

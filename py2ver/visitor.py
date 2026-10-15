@@ -3,6 +3,7 @@ import functools
 import re
 from typing import Dict, Any, List
 from .ast_ir import ModuleIR, Port, Assignment, resolve_meta
+from .fixed import FIT_LIST
 from .semantics import Unsupported, analyze, parse
 
 try:
@@ -292,7 +293,7 @@ class FunctionVisitor(ast.NodeVisitor):
         if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
             return self._is_list(node.value)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            return node.func.id in ("list", "tuple")
+            return node.func.id in ("list", "tuple", FIT_LIST)
         return False
 
     def _visit_list(self, node: ast.AST) -> List[str]:
@@ -315,6 +316,27 @@ class FunctionVisitor(ast.NodeVisitor):
             sl = node.slice
             bound = [None if b is None else self._eval_int(b) for b in (sl.lower, sl.upper, sl.step)]
             return self._visit_list(node.value)[slice(*bound)]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == FIT_LIST:
+            # Fixed point: each element shifted, rounded, clamped (see fixed.fit_list)
+            shift, rnd, lo, hi = (ast.literal_eval(a) for a in node.args[1:])
+            out = []
+            for e in self._visit_list(node.args[0]):
+                x: ast.expr = ast.Name(id=self._temp(e), ctx=ast.Load())
+                if shift > 0:
+                    if rnd:
+                        x = ast.BinOp(left=x, op=ast.Add(), right=ast.Constant(1 << (shift - 1)))
+                    x = ast.BinOp(left=x, op=ast.RShift(), right=ast.Constant(shift))
+                elif shift < 0:
+                    x = ast.BinOp(left=x, op=ast.LShift(), right=ast.Constant(-shift))
+                if lo is not None:
+                    lo_node = (ast.UnaryOp(op=ast.USub(), operand=ast.Constant(-lo)) if lo < 0
+                               else ast.Constant(lo))
+                    x = ast.Call(func=ast.Name(id="max", ctx=ast.Load()), keywords=[], args=[
+                        lo_node, ast.Call(func=ast.Name(id="min", ctx=ast.Load()), keywords=[],
+                                          args=[ast.Constant(hi), x])])
+                out.append(self.visit(x))
+            return out
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if len(node.args) != 1 or node.keywords:
                 raise NotImplementedError(f"{node.func.id}() takes one argument here")
