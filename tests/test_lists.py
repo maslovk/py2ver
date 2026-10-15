@@ -266,7 +266,7 @@ _counter = itertools.count()
 
 @st.composite
 def _programs(draw):
-    n = draw(st.integers(4, 7))
+    n = draw(st.integers(5, 7))      # indices go down to i - 1 = -5
     leaf = st.one_of(st.sampled_from(["a", "b", "c"]), st.integers(-9, 9).map(str))
     elems = draw(st.lists(leaf, min_size=n, max_size=n))
     read = draw(st.sampled_from(["i", "j", "-1", "i - 1", "(i + j) // 2"]))
