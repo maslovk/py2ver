@@ -814,6 +814,10 @@ class Py2ver:
         ]
 
     def _render_tb(self, template: str, vecs: List[Tuple[int, ...]]) -> None:
+        # Write raw bit patterns of each port's width (cocotb rejects e.g. -1
+        # on a 1-bit port)
+        masks = [(1 << w) - 1 for w in self.input_args_width_list]
+        vecs = [tuple(v & m for v, m in zip(vec, masks)) for vec in vecs]
         tb_out = self.get_template(template).render({
             "period": DEFAULT_TB_PERIOD,
             "in_names": self.input_args_list,

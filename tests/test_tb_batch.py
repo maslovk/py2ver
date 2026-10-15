@@ -76,6 +76,17 @@ def test_gen_tb_pads_missing_args_with_zero(monkeypatch, tmp_path):
     assert "VECTORS = [(5, 0), (1, 2)]" in tb_src
 
 
+def test_gen_tb_writes_inputs_as_port_bit_patterns(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    attr = dict(ADD_SUB_ATTR, a={"signed": 1, "width": 8}, b={"signed": 1, "width": 1})
+    p = Py2ver(_batch_add_sub, attr)
+
+    p.gen_tb([(-1, -1), (-128, 0)])
+
+    tb_src = (tmp_path / "tb.py").read_text(encoding="utf-8")
+    assert "VECTORS = [(255, 1), (128, 0)]" in tb_src
+
+
 @pytest.mark.sim
 def test_tb_batch_pipeline_single_simulation(monkeypatch, tmp_path):
     """A batch through a 2-stage pipeline matches Python and runs one simulation."""
