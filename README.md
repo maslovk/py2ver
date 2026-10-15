@@ -182,11 +182,17 @@ vectors).
 - `if` / `elif` / `else`, nested; a branch may leave out a variable that
   already had a value (it keeps it), and statements in a branch see earlier
   ones in the same branch
-- `for i in range(...)` with constant bounds (fully unrolled)
+- `for i in range(...)` with constant bounds, and `for v in (a, b, c)`
+  (fully unrolled)
 - Calls to your own helper functions (inlined; helpers may call helpers,
   must end with a single `return`, and may return a tuple for
   `x, y = helper(...)`), and module-level integer constants
-- `complex(re, im)` and `abs()` of a complex variable
+- Complex values from integer parts: `complex(re, im)`, `1j` constants,
+  `+ - *`, unary `-`, `.real`, `.imag`, `.conjugate()`; a complex variable
+  `z` is held as `z_re` / `z_im`, a returned one is two outputs, and declaring
+  `z` in `attr` sets both widths. `abs()` of a complex value uses `$sqrt`, so
+  it only works in simulation. Python computes complex numbers in floating
+  point, so results match exactly while they stay below 2**53.
 - A single `return` of variables or expressions (an expression output is
   named `ret`, or `ret0`, `ret1`, ... for several)
 
@@ -212,8 +218,8 @@ extra hardware. `and`/`or` give 0/1, not Python's operand values.
 ### Examples
 
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
-signals, a randomized regression, a streaming low-pass filter and pipelined
-SHA-256 rounds). Each checks the hardware against Python in simulation, and
+signals, complex arithmetic, a randomized regression, a streaming low-pass
+filter and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```
@@ -223,8 +229,7 @@ python examples/sha256_pipeline.py --syn        # + Quartus area/timing
 python examples/sha256_pipeline.py --board      # + connected DE0-Nano
 ```
 
-`examples/unsupported/` holds two designs py2ver can't handle yet (arithmetic
-on complex values, lists).
+`examples/unsupported/` holds a design py2ver can't handle yet (lists).
 
 ### Tests
 

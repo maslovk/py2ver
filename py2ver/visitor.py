@@ -87,6 +87,8 @@ class FunctionVisitor(ast.NodeVisitor):
         # see the latest version. Names declared in attr keep their width for
         # every version; undeclared ones get an exact inferred width.
         self._declared = set(self.attr)
+        # Complex variables (by Python name); z is held as z_re / z_im
+        self._complex: set[str] = set()
         self._ssa: Dict[str, str] = {}
         self._ssa_count: Dict[str, int] = {}
 
@@ -97,16 +99,6 @@ class FunctionVisitor(ast.NodeVisitor):
     def _clone_attr(self, src: str, dst: str):
         meta = dict(self._attrs(src))
         self.attr[dst] = meta
-
-    def _complex_parts(self, name: str) -> tuple[str, str]:
-        return f"{name}_re", f"{name}_im"
-
-    def _ensure_complex_part_attrs(self, name: str):
-        re_name, im_name = self._complex_parts(name)
-        if re_name not in self.attr:
-            self._clone_attr(name, re_name)
-        if im_name not in self.attr:
-            self._clone_attr(name, im_name)
 
     def _any_reg_outputs(self) -> bool:
         """Detect if any output port is a reg (requires clk)."""
@@ -149,8 +141,12 @@ class FunctionVisitor(ast.NodeVisitor):
     def _assign_var(self, var: str, rhs: str, is_reg: bool | None = None) -> str:
         """Assign rhs to a new version of var; returns the version's name."""
         name = self._new_version(var)
+        base = var[:-3] if var[-3:] in ("_re", "_im") else None
         if var in self._declared:
             self.attr[name] = dict(self.attr[var])
+        elif base in self._complex and base in self._declared:
+            # Declaring z covers z_re and z_im
+            self.attr[name] = dict(self.attr[base])
         else:
             meta = self._infer_meta(rhs)
             self.attr[name] = {"signed": meta["signed"], "width": meta["width"], "type": "wire"}
@@ -164,6 +160,89 @@ class FunctionVisitor(ast.NodeVisitor):
         if not isinstance(tgt, ast.Name):
             raise NotImplementedError(f"Assignment target must be a name, got {ast.unparse(tgt)}")
         return tgt.id
+
+    # ---------- complex values: each complex variable z is z_re / z_im ----------
+    def _is_complex(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in self._complex
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, complex)
+        if isinstance(node, ast.Call):
+            f = node.func
+            return ((isinstance(f, ast.Name) and f.id == "complex")
+                    or (isinstance(f, ast.Attribute) and f.attr == "conjugate"))
+        if isinstance(node, ast.BinOp):
+            return self._is_complex(node.left) or self._is_complex(node.right)
+        if isinstance(node, ast.UnaryOp):
+            return self._is_complex(node.operand)
+        if isinstance(node, ast.IfExp):
+            return self._is_complex(node.body) or self._is_complex(node.orelse)
+        return False
+
+    def _visit_cplx(self, node: ast.AST) -> tuple[str, str]:
+        """(real, imaginary) expressions of a complex-valued (or real) expression."""
+        if not self._is_complex(node):
+            return self.visit(node), "0"
+        if isinstance(node, ast.Name):
+            return self._resolve_name(f"{node.id}_re"), self._resolve_name(f"{node.id}_im")
+        if isinstance(node, ast.Constant):
+            v = node.value
+            if v.real != int(v.real) or v.imag != int(v.imag):
+                raise NotImplementedError(f"Only integer complex constants are supported: {v}")
+            return str(int(v.real)), str(int(v.imag))
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):          # z.conjugate()
+                re, im = self._visit_cplx(node.func.value)
+                return re, _neg(im)
+            if node.keywords or not 1 <= len(node.args) <= 2:
+                raise NotImplementedError("complex() takes one or two positional arguments")
+            if any(self._is_complex(a) for a in node.args):
+                raise NotImplementedError("complex() arguments must be real")
+            re = self.visit(node.args[0])
+            im = self.visit(node.args[1]) if len(node.args) == 2 else "0"
+            return re, im
+        if isinstance(node, ast.UnaryOp):
+            re, im = self._visit_cplx(node.operand)
+            if isinstance(node.op, ast.USub):
+                return _neg(re), _neg(im)
+            if isinstance(node.op, ast.UAdd):
+                return re, im
+            raise NotImplementedError(f"{type(node.op).__name__} on a complex value is not supported")
+        if isinstance(node, ast.IfExp):
+            cond = self.visit(node.test)
+            (tr, ti), (er, ei) = self._visit_cplx(node.body), self._visit_cplx(node.orelse)
+            return f"(({cond}) ? ({tr}) : ({er}))", f"(({cond}) ? ({ti}) : ({ei}))"
+        if isinstance(node, ast.BinOp):
+            (ar, ai), (br, bi) = self._visit_cplx(node.left), self._visit_cplx(node.right)
+            if isinstance(node.op, ast.Add):
+                return _add(ar, br), _add(ai, bi)
+            if isinstance(node.op, ast.Sub):
+                return _sub(ar, br), _sub(ai, bi)
+            if isinstance(node.op, ast.Mult):
+                # (ar + j ai)(br + j bi) = (ar br - ai bi) + j (ar bi + ai br)
+                return _sub(_mul(ar, br), _mul(ai, bi)), _add(_mul(ar, bi), _mul(ai, br))
+            raise NotImplementedError(
+                f"{type(node.op).__name__} on complex values is not supported (only + - *)"
+            )
+        raise NotImplementedError(f"Unsupported complex expression: {ast.unparse(node)}")
+
+    def _assign_value(self, var: str, value: ast.AST) -> None:
+        """Assign a real or complex expression to var."""
+        if self._is_complex(value):
+            re, im = self._visit_cplx(value)
+            self._complex.add(var)
+            self._assign_var(f"{var}_re", re)
+            self._assign_var(f"{var}_im", im)
+        else:
+            self._complex.discard(var)
+            self._assign_var(var, self.visit(value))
+
+    def visit_Attribute(self, node: ast.Attribute):
+        """z.real and z.imag."""
+        if node.attr in ("real", "imag"):
+            re, im = self._visit_cplx(node.value)
+            return re if node.attr == "real" else im
+        raise NotImplementedError(f"Unsupported attribute: {ast.unparse(node)}")
 
     def _finalize_output(self, var: str) -> str:
         """Expose the final version of var on an output port named var."""
@@ -218,10 +297,10 @@ class FunctionVisitor(ast.NodeVisitor):
         Only supports range with 1–3 integer-literal arguments.
         """
         if not isinstance(iter_node, ast.Call):
-            raise NotImplementedError("for-loops must iterate over range(...).")
+            raise NotImplementedError("for-loops must iterate over range(...) or a tuple of values.")
         func = iter_node.func
         if not (isinstance(func, ast.Name) and func.id == "range"):
-            raise NotImplementedError("for-loops must iterate over range(...).")
+            raise NotImplementedError("for-loops must iterate over range(...) or a tuple of values.")
 
         args = iter_node.args
         if len(args) == 1:
@@ -372,14 +451,22 @@ class FunctionVisitor(ast.NodeVisitor):
                 vals = item.value.elts if isinstance(item.value, ast.Tuple) else [item.value]
                 outs = []
                 for i, v in enumerate(vals):
-                    if isinstance(v, ast.Name):
+                    if isinstance(v, ast.Name) and v.id in self._complex:
+                        # A complex value is returned as two outputs, <v>_re and <v>_im
+                        outs.append(self._finalize_output(f"{v.id}_re"))
+                        outs.append(self._finalize_output(f"{v.id}_im"))
+                    elif isinstance(v, ast.Name):
                         outs.append(self._finalize_output(v.id))
                     else:
                         # Returned expression: give it an output named ret<i>
                         name = f"ret{i}" if len(vals) > 1 else "ret"
-                        if self._is_defined(name):
+                        if self._is_defined(name) or self._is_defined(f"{name}_re"):
                             raise NotImplementedError(f"Output name '{name}' is already used")
-                        outs.append(self._assign_var(name, self.visit(v)))
+                        self._assign_value(name, v)
+                        if name in self._complex:
+                            outs += [f"{name}_re", f"{name}_im"]
+                        else:
+                            outs.append(name)
                 self.output_args_list = outs
                 for name in outs:
                     meta = self._attrs(name)
@@ -518,7 +605,10 @@ class FunctionVisitor(ast.NodeVisitor):
         """Integer builtins: abs(x), min(a, b, ...), max(a, b, ...)."""
         if isinstance(node.func, ast.Name) and not node.keywords:
             fn = node.func.id
-            args = [self.visit(a) for a in node.args]
+            args = [] if any(self._is_complex(a) for a in node.args) else [self.visit(a) for a in node.args]
+            if fn == "abs" and len(node.args) == 1 and self._is_complex(node.args[0]):
+                re, im = self._visit_cplx(node.args[0])
+                return f"$sqrt(({re})*({re}) + ({im})*({im}))"
             if fn == "abs" and len(args) == 1:
                 x = args[0]
                 return f"((({x}) < 0) ? (-({x})) : ({x}))"
@@ -550,91 +640,47 @@ class FunctionVisitor(ast.NodeVisitor):
             raise NotImplementedError("Only 'for <var> in range(...)' loops are supported.")
         loop_var = node.target.id
 
+        if isinstance(node.iter, (ast.Tuple, ast.List)):
+            # for v in (a, b, c): Python evaluates the tuple once, up front
+            bindings = []
+            for elt in node.iter.elts:
+                if self._is_complex(elt):
+                    re, im = self._visit_cplx(elt)
+                    bindings.append((True, {f"{loop_var}_re": re, f"{loop_var}_im": im}))
+                else:
+                    bindings.append((False, {loop_var: self.visit(elt)}))
+            for is_cplx, env in bindings:
+                if is_cplx:
+                    self._complex.add(loop_var)
+                else:
+                    self._complex.discard(loop_var)
+                self._unroll_body(node.body, env)
+            self._complex.discard(loop_var)
+            return
+
         start, stop, step = self._parse_range(node.iter)
 
         for val in range(start, stop, step):
-            env = {loop_var: str(val)}
-            self._name_env_stack.append(env)
-            try:
-                for stmt in node.body:
-                    if isinstance(stmt, ast.Assign):
-                        self._visit_assign(stmt)
-                    elif isinstance(stmt, ast.If):
-                        self._visit_if(stmt)
-                    elif isinstance(stmt, ast.For):
-                        self.visit_For(stmt)
-                    else:
-                        self.generic_visit(stmt)
-            finally:
-                self._name_env_stack.pop()
+            self._unroll_body(node.body, {loop_var: str(val)})
+
+    def _unroll_body(self, body: List[ast.stmt], env: Dict[str, str]):
+        """Visit one unrolled iteration with the loop variable bound by env."""
+        self._name_env_stack.append(env)
+        try:
+            for stmt in body:
+                if isinstance(stmt, ast.Assign):
+                    self._visit_assign(stmt)
+                elif isinstance(stmt, ast.If):
+                    self._visit_if(stmt)
+                elif isinstance(stmt, ast.For):
+                    self.visit_For(stmt)
+                else:
+                    self.generic_visit(stmt)
+        finally:
+            self._name_env_stack.pop()
 
     # ---- assignments ----
     def _visit_assign(self, node: ast.Assign):
-        # Special-case complex constructor:
-        #   z = complex(a, b)  ->  z_re = a; z_im = b
-        if (
-            isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "complex"
-        ):
-            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                raise NotImplementedError("complex(...) assignment supports a single name target.")
-            if len(node.value.args) != 2:
-                raise NotImplementedError("complex(...) requires exactly 2 arguments.")
-
-            base = node.targets[0].id
-            self._ensure_complex_part_attrs(base)
-            re_name, im_name = self._complex_parts(base)
-            re_rhs = self.visit(node.value.args[0])
-            im_rhs = self.visit(node.value.args[1])
-            re_meta = self._attrs(re_name)
-            im_meta = self._attrs(im_name)
-
-            self.assigns.append(
-                Assignment(
-                    left=re_name,
-                    right=re_rhs,
-                    is_reg=(re_meta.get('type') == 'reg')
-                )
-            )
-            self.assigns.append(
-                Assignment(
-                    left=im_name,
-                    right=im_rhs,
-                    is_reg=(im_meta.get('type') == 'reg')
-                )
-            )
-            return
-
-        # Special-case absolute value of a complex temporary:
-        #   mag = abs(z)  ->  mag = $sqrt((z_re*z_re) + (z_im*z_im))
-        if (
-            isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "abs"
-            and len(node.value.args) == 1
-            and isinstance(node.value.args[0], ast.Name)
-            and f"{node.value.args[0].id}_re" in self.attr
-        ):
-            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                raise NotImplementedError("abs(...) assignment supports a single name target.")
-            if len(node.value.args) != 1 or not isinstance(node.value.args[0], ast.Name):
-                raise NotImplementedError("abs(...) currently supports a single complex variable argument.")
-
-            z_name = node.value.args[0].id
-            re_name, im_name = self._complex_parts(z_name)
-            rhs = f"$sqrt(({re_name})*({re_name}) + ({im_name})*({im_name}))"
-            left = node.targets[0].id
-            meta = self._attrs(left)
-            self.assigns.append(
-                Assignment(
-                    left=left,
-                    right=rhs,
-                    is_reg=(meta.get('type') == 'reg')
-                )
-            )
-            return
-
         for tgt in node.targets:
             if isinstance(tgt, ast.Tuple):
                 vals = node.value.elts if isinstance(node.value, ast.Tuple) else None
@@ -643,11 +689,18 @@ class FunctionVisitor(ast.NodeVisitor):
                         "Tuple assignment needs a tuple of the same length on the right"
                     )
                 # All right-hand sides are read before anything is assigned
-                rhss = [self.visit(v) for v in vals]
-                for t, rhs in zip(tgt.elts, rhss):
-                    self._assign_var(self._target_name(t), rhs)
+                names = [self._target_name(t) for t in tgt.elts]
+                rhss = [self._visit_cplx(v) if self._is_complex(v) else self.visit(v) for v in vals]
+                for name, rhs in zip(names, rhss):
+                    if isinstance(rhs, tuple):
+                        self._complex.add(name)
+                        self._assign_var(f"{name}_re", rhs[0])
+                        self._assign_var(f"{name}_im", rhs[1])
+                    else:
+                        self._complex.discard(name)
+                        self._assign_var(name, rhs)
             else:
-                self._assign_var(self._target_name(tgt), self.visit(node.value))
+                self._assign_value(self._target_name(tgt), node.value)
 
     # ---------- nested if/elif/else lowering ----------
     def _eval_stmt_block(self, stmts: List[ast.stmt]) -> Dict[str, str]:
@@ -678,11 +731,19 @@ class FunctionVisitor(ast.NodeVisitor):
                             raise NotImplementedError(
                                 "Tuple assignment needs a tuple of the same length on the right"
                             )
-                        rhss = [self.visit(v) for v in vals]
-                        for t, rhs in zip(tgt.elts, rhss):
-                            env[self._target_name(t)] = f"({rhs})"
+                        pairs = list(zip([self._target_name(t) for t in tgt.elts], vals))
                     else:
-                        env[self._target_name(tgt)] = f"({self.visit(s.value)})"
+                        pairs = [(self._target_name(tgt), s.value)]
+                    computed = [(name, self._is_complex(v),
+                                 self._visit_cplx(v) if self._is_complex(v) else self.visit(v))
+                                for name, v in pairs]
+                    for name, is_cplx, rhs in computed:
+                        if is_cplx:
+                            self._complex.add(name)
+                            env[f"{name}_re"] = f"({rhs[0]})"
+                            env[f"{name}_im"] = f"({rhs[1]})"
+                        else:
+                            env[name] = f"({rhs})"
                 elif isinstance(s, ast.If):
                     # Recursively lower nested if/elif/else into expressions
                     for k, v in self._eval_if_expr(s).items():
@@ -820,3 +881,30 @@ class _Desugar(ast.NodeTransformer):
         )
         new = ast.Assign(targets=[ast.Name(id=node.target.id, ctx=ast.Store())], value=value)
         return ast.copy_location(new, node)
+
+
+# Small builders for complex parts that keep obvious zeros out of the Verilog
+def _neg(x: str) -> str:
+    return "0" if x == "0" else f"-({x})"
+
+
+def _add(x: str, y: str) -> str:
+    if x == "0":
+        return y
+    if y == "0":
+        return x
+    return f"({x}) + ({y})"
+
+
+def _sub(x: str, y: str) -> str:
+    if y == "0":
+        return x
+    if x == "0":
+        return _neg(y)
+    return f"({x}) - ({y})"
+
+
+def _mul(x: str, y: str) -> str:
+    if x == "0" or y == "0":
+        return "0"
+    return f"({x}) * ({y})"

@@ -892,8 +892,7 @@ class Py2ver:
             raise ValueError("This design has state registers ('next' in attr); use PY_stream().")
         outs: List[Tuple[int, ...]] = []
         for vec in vectors:
-            ret = self.func(*vec)
-            ret = ret if isinstance(ret, tuple) else (ret,)
+            ret = _flatten_complex(self.func(*vec))
             outs.append(tuple(
                 self._wrap(int(v), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
                 for v, n, w in zip(ret, self.output_args_list, self.output_args_width_list)
@@ -1003,8 +1002,7 @@ class Py2ver:
         }
         outs: List[Tuple[int, ...]] = []
         for vec in vecs:
-            ret = self.func(**dict(zip(self.input_args_list, vec)), **state)
-            ret = ret if isinstance(ret, tuple) else (ret,)
+            ret = _flatten_complex(self.func(**dict(zip(self.input_args_list, vec)), **state))
             row = {
                 name: self._wrap(int(v), *_meta(name))
                 for name, v in zip(self.output_args_list, ret)
@@ -1107,6 +1105,17 @@ class Py2ver:
             log.error("quartus_pgm failed: %s", result.stderr)
         else:
             log.info("FPGA programmed successfully ✅")
+
+
+def _flatten_complex(ret: Any) -> Tuple[Any, ...]:
+    """Python results as output values: a complex value becomes (real, imag)."""
+    out: List[Any] = []
+    for v in ret if isinstance(ret, tuple) else (ret,):
+        if isinstance(v, complex):
+            out += [v.real, v.imag]
+        else:
+            out.append(v)
+    return tuple(out)
 
 
 # --------------------------------------------------------------------
