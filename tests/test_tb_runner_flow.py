@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import tb_runner
 
 
@@ -18,14 +16,14 @@ class _FakeRunner:
 def test_test_runner_verilog_defaults(monkeypatch, tmp_path):
     fake = _FakeRunner()
 
-    # Force project root/build dir into a temporary workspace
-    monkeypatch.setattr(tb_runner, "Path", lambda *_args, **_kwargs: tmp_path)
+    # Default output directory is the current working directory
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(tb_runner, "get_runner", lambda sim: fake)
 
     monkeypatch.delenv("HDL_TOPLEVEL_LANG", raising=False)
     monkeypatch.delenv("SIM", raising=False)
 
-    proj_path = tmp_path.parent  # Path(__file__).resolve().parent in test_runner
+    proj_path = tmp_path
     build_dir = proj_path / "sim_build"
     build_dir.mkdir(parents=True, exist_ok=True)
     (build_dir / "stale.txt").write_text("stale", encoding="utf-8")
@@ -52,15 +50,14 @@ def test_test_runner_verilog_defaults(monkeypatch, tmp_path):
 def test_test_runner_vhdl_xcelium_args(monkeypatch, tmp_path):
     fake = _FakeRunner()
 
-    monkeypatch.setattr(tb_runner, "Path", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr(tb_runner, "get_runner", lambda sim: fake)
 
     monkeypatch.setenv("HDL_TOPLEVEL_LANG", "vhdl")
     monkeypatch.setenv("SIM", "xcelium")
 
-    tb_runner.test_runner("top_vhdl")
+    proj_path = tmp_path / "out"
+    tb_runner.test_runner("top_vhdl", proj_path)
 
-    proj_path = tmp_path.parent
     build_kwargs = fake.build_calls[0]
     assert build_kwargs["sources"] == [proj_path / "hdl" / "main.vhdl"]
     assert build_kwargs["build_args"] == ["-v93"]

@@ -12,7 +12,7 @@ def rt_add_sub(a, b):
 
 def test_tb_fun_returns_zero_tuple_when_results_missing(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(py2ver_mod.tb_runner, "test_runner", lambda _top: None)
+    monkeypatch.setattr(py2ver_mod.tb_runner, "test_runner", lambda _top, _proj=None: None)
 
     attr = {
         "a": {"signed": 0, "width": 8, "type": "wire"},
@@ -29,7 +29,7 @@ def test_tb_fun_returns_zero_tuple_when_results_missing(monkeypatch, tmp_path):
 def test_tb_fun_parses_string_payload_and_applies_signed(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
 
-    def _fake_test_runner(_top):
+    def _fake_test_runner(_top, _proj=None):
         results_dir = Path("results")
         results_dir.mkdir(exist_ok=True)
         payload = "{'s': 5, 'd': 15}"  # d should become -1 for 4-bit signed output
@@ -54,7 +54,7 @@ def test_tb_fun_parses_string_payload_and_applies_signed(monkeypatch, tmp_path):
 
 def test_hw_fun_falls_back_to_tb_when_pyserial_missing(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(py2ver_mod.tb_runner, "test_runner", lambda _top: None)
+    monkeypatch.setattr(py2ver_mod.tb_runner, "test_runner", lambda _top, _proj=None: None)
 
     attr = {
         "a": {"signed": 0, "width": 8, "type": "wire"},

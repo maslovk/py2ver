@@ -37,8 +37,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 import tb_runner
 from renderer import Renderer
-# use new visitor package structure (re-exports in visitor/__init__.py)
-from visitor import FunctionVisitor  # , emit_internal_declarations, normalize_attr, BINOP_TOKENS
+from visitor import FunctionVisitor
 
 try:
     import serial  # pyserial
@@ -592,21 +591,23 @@ class Py2ver:
         first_line = tb_out.splitlines()[0] if tb_out else ""
         log.debug("gen_tb: first line of tb.py: %s", first_line)
 
-        Path("tb.py").write_text(tb_out, encoding="utf-8")
+        (self.outdir / "tb.py").write_text(tb_out, encoding="utf-8")
 
     def tb_fun(self, *in_arg: Any) -> Tuple[int, ...]:
         # Log TB invocation so we can see arguments clearly
         log.info("TB called with args: %s", in_arg)
 
+        results_path = self.outdir / RESULTS_PATH
+
         # Clean previous results
-        if RESULTS_PATH.exists():
+        if results_path.exists():
             try:
-                RESULTS_PATH.unlink()
+                results_path.unlink()
             except OSError as e:
                 log.warning(e)
 
         # Ensure a clean sim build directory so tb.py isn't stale
-        sim_build = Path("sim_build")
+        sim_build = self.outdir / "sim_build"
         if sim_build.exists():
             try:
                 shutil.rmtree(sim_build)
@@ -614,7 +615,7 @@ class Py2ver:
                 log.warning("Failed to remove sim_build: %s", e)
 
         # 🔥 Remove stale compiled tb.py so Python can't reuse old bytecode
-        pycache_dir = Path("__pycache__")
+        pycache_dir = self.outdir / "__pycache__"
         if pycache_dir.exists():
             for p in pycache_dir.glob("tb.*.pyc"):
                 try:
@@ -627,11 +628,11 @@ class Py2ver:
         self.gen_tb(*in_arg)
 
         # Run cocotb-based simulation
-        tb_runner.test_runner(self.t_name)
+        tb_runner.test_runner(self.t_name, self.outdir)
 
         # Load results written by tb.py
-        if RESULTS_PATH.exists():
-            with RESULTS_PATH.open("rb") as handle:
+        if results_path.exists():
+            with results_path.open("rb") as handle:
                 payload = pickle.load(handle)
                 d = payload if isinstance(payload, dict) else ast.literal_eval(payload)
         else:

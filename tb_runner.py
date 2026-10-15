@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import shutil
 from pathlib import Path
@@ -6,12 +8,12 @@ from cocotb_tools.runner import get_runner
 LANGUAGE = os.getenv("HDL_TOPLEVEL_LANG", "verilog").lower().strip()
 
 
-def test_runner(top_name: str):
+def test_runner(top_name: str, proj_path: Path | None = None):
     hdl_toplevel_lang = os.getenv("HDL_TOPLEVEL_LANG", "verilog").lower().strip()
     sim = os.getenv("SIM", "icarus")
 
-    # Project root: where hdl/main.v and tb.py live
-    proj_path = Path(__file__).resolve().parent
+    # Output directory: where Py2ver wrote hdl/main.v and tb.py
+    proj_path = Path.cwd() if proj_path is None else Path(proj_path)
 
     # Explicit build directory inside the project
     build_dir = proj_path / "sim_build"
