@@ -569,17 +569,24 @@ class Py2ver:
     def TB(self) -> Callable[..., Tuple[int, ...]]:
         return self.tb_fun
 
-    def gen_tb(self, *in_arg: Any) -> None:
-        # Map input names to argument values
-        key_val = [
-            (name, in_arg[i] if i < len(in_arg) else 0)
-            for i, name in enumerate(self.input_args_list)
-        ]
-        log.info("gen_tb: generating tb.py with in_args=%s", key_val)
+    def TB_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
+        return self.tb_batch_fun
+
+    def _input_vector(self, in_arg: Tuple[Any, ...]) -> Tuple[int, ...]:
+        # Missing trailing arguments default to 0
+        return tuple(
+            int(in_arg[i]) if i < len(in_arg) else 0
+            for i in range(len(self.input_args_list))
+        )
+
+    def gen_tb(self, vectors: List[Tuple[Any, ...]]) -> None:
+        vecs = [self._input_vector(tuple(v)) for v in vectors]
+        log.info("gen_tb: generating tb.py with %d vector(s)", len(vecs))
 
         tb_out = self.get_template("tb.txt").render({
             "period": DEFAULT_TB_PERIOD,
-            "in_args": key_val,
+            "in_names": self.input_args_list,
+            "vectors": repr(vecs),
             "out_args": self.output_args_list,
             "has_clk": self.has_clk,
             "out_meta": self.out_meta,
@@ -587,15 +594,17 @@ class Py2ver:
             "out_latency": dict(getattr(self, "out_latency", {})),
         })
 
-        # Optional: tiny snippet to confirm what ended up in the file
-        first_line = tb_out.splitlines()[0] if tb_out else ""
-        log.debug("gen_tb: first line of tb.py: %s", first_line)
-
         (self.outdir / "tb.py").write_text(tb_out, encoding="utf-8")
 
     def tb_fun(self, *in_arg: Any) -> Tuple[int, ...]:
-        # Log TB invocation so we can see arguments clearly
-        log.info("TB called with args: %s", in_arg)
+        return self.tb_batch_fun([in_arg])[0]
+
+    def tb_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
+        """Simulate all input vectors in a single cocotb run, one result per vector."""
+        vectors = [tuple(v) for v in vectors]
+        log.info("TB called with %d vector(s)", len(vectors))
+        if not vectors:
+            return []
 
         results_path = self.outdir / RESULTS_PATH
 
@@ -624,27 +633,35 @@ class Py2ver:
                 except OSError as e:
                     log.warning("Failed to remove %s: %s", p, e)
 
-        # Generate testbench for this specific input set
-        self.gen_tb(*in_arg)
+        # Generate testbench for this set of vectors
+        self.gen_tb(vectors)
 
         # Run cocotb-based simulation
         tb_runner.test_runner(self.t_name, self.outdir)
 
-        # Load results written by tb.py
+        # Load results written by tb.py (a list of dicts; a single dict is
+        # accepted as a one-vector batch)
+        rows: List[Dict[str, int]] = []
         if results_path.exists():
             with results_path.open("rb") as handle:
                 payload = pickle.load(handle)
-                d = payload if isinstance(payload, dict) else ast.literal_eval(payload)
+            if isinstance(payload, str):
+                payload = ast.literal_eval(payload)
+            rows = [payload] if isinstance(payload, dict) else list(payload)
         else:
-            d = {}
+            log.warning("No TB results found at %s", results_path)
 
-        outs: List[int] = []
-        for n, w in zip(self.output_args_list, self.output_args_width_list):
-            v = d.get(n, 0)
-            if self.attr.get(n, {}).get("signed") == 1:
-                v = self.tosigned(v, w)
-            outs.append(v)
-        return tuple(outs)
+        outs: List[Tuple[int, ...]] = []
+        for i in range(len(vectors)):
+            d = rows[i] if i < len(rows) else {}
+            row: List[int] = []
+            for n, w in zip(self.output_args_list, self.output_args_width_list):
+                v = d.get(n, 0)
+                if self.attr.get(n, {}).get("signed") == 1:
+                    v = self.tosigned(v, w)
+                row.append(v)
+            outs.append(tuple(row))
+        return outs
 
     # ------------------------------------------------------------------------
     # FPGA Programmer

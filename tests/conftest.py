@@ -68,10 +68,11 @@ def assert_python_matches_sim(monkeypatch):
 
     def _run(func, attr, vectors):
         p = Py2ver(func, attr)
-        tb = p.TB()
-        for vec in vectors:
+        vectors = [tuple(vec) for vec in vectors]
+        sim_outs = p.TB_batch()(vectors)
+        assert len(sim_outs) == len(vectors)
+        for vec, sim_out in zip(vectors, sim_outs):
             py_out = _normalize_expected(_as_tuple(func(*vec)), p)
-            sim_out = tb(*vec)
             assert sim_out == py_out, f"mismatch for {func.__name__}{vec}: sim={sim_out} py={py_out}"
 
     return _run

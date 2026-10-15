@@ -19,11 +19,11 @@ def prop_add_sub(a, b):
 @given(
     vectors=st.lists(
         st.tuples(st.integers(min_value=0, max_value=255), st.integers(min_value=0, max_value=255)),
-        min_size=4,
-        max_size=8,
+        min_size=1,
+        max_size=200,
     )
 )
-@settings(max_examples=5, deadline=None)
+@settings(max_examples=10, deadline=None)
 def test_property_python_vs_sim_add_sub(vectors):
     """Property-based differential check: Python reference must match Icarus sim."""
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
@@ -45,11 +45,10 @@ def test_property_python_vs_sim_add_sub(vectors):
         os.chdir(root)
         os.environ["SIM"] = "icarus"
         p = Py2ver(prop_add_sub, attr)
-        tb = p.TB()
-        for a, b in vectors:
-            py_out = prop_add_sub(a, b)
-            sim_out = tb(a, b)
-            assert sim_out == py_out
+        sim_outs = p.TB_batch()(vectors)
+        assert len(sim_outs) == len(vectors)
+        for (a, b), sim_out in zip(vectors, sim_outs):
+            assert sim_out == prop_add_sub(a, b)
     finally:
         os.chdir(old_cwd)
         if old_sim is None:

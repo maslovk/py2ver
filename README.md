@@ -42,6 +42,11 @@ p = Py2ver(foo, attr)      # writes hdl/main.v
 foo_tb = p.TB()            # cocotb + Icarus simulation
 print(foo_tb(3, 1))
 
+# Many input vectors in a single simulation run (much faster than
+# calling foo_tb in a loop, which rebuilds and reruns the sim each time)
+foo_batch = p.TB_batch()
+print(foo_batch([(3, 1), (7, 2), (255, 255)]))   # list of output tuples
+
 foo_hw = p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
 print(foo_hw(3, 1))        # synthesizes, programs the board, runs over UART
 ```
