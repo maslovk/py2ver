@@ -23,6 +23,7 @@ Top-level:
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import inspect
 import logging
@@ -31,7 +32,7 @@ import pickle
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -42,6 +43,8 @@ from .pipeline import pipeline_ir
 from .semantics import exact_ir
 from .inline import inline_helpers
 from .names import rename_keywords
+from .hwtypes import _namespace, normalize_attr, read_annotations
+from .fixed import DEFAULT_CONST_BITS, build_model, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
 
@@ -72,8 +75,9 @@ class Py2ver:
 
     t_name: str = ""
 
-    def __init__(self, func: Callable, attr: Dict[str, Any],
-                 template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0) -> None:
+    def __init__(self, func: Callable, attr: Dict[str, Any] | None = None,
+                 template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0,
+                 const_bits: int = DEFAULT_CONST_BITS) -> None:
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
 
         try:
@@ -82,6 +86,10 @@ class Py2ver:
             raise RuntimeError(f"Unable to load source for {func}: {e}") from e
 
         tree = ast.parse(source_foo)
+        # Types from annotations (U[8], State(...), ...); attr entries merge over them
+        tree, ann = read_annotations(tree, func)
+        attr = normalize_attr(attr)
+        attr = {k: dict(ann.get(k, {}), **attr.get(k, {})) for k in dict.fromkeys([*ann, *attr])}
         # Inline calls to your own helper functions and module-level int constants
         tree = inline_helpers(tree, getattr(func, "__globals__", {}))
         # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
@@ -94,6 +102,13 @@ class Py2ver:
             )
             for k, v in attr.items()
         }
+        # Fixed point ('frac' in attr) becomes integer code on raw values, and
+        # the same code run in Python is the bit-exact reference (see fixed.py)
+        attr = {k: self._raw_init(v) for k, v in attr.items()}
+        ns = _namespace(func)
+        tree, fx_attr, self._fx_types = lower_fixed(tree, attr, ns, const_bits, self._py_name)
+        attr.update(fx_attr)
+        self._model = build_model(tree, attr, ns) if uses_fixed(attr) else None
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 
@@ -153,6 +168,13 @@ class Py2ver:
         self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in control]
         self.output_args_width_list = [p.width for p in ir.outputs if p.kind != "vout"]
         self._has_vin = any(p.kind == "vin" for p in ir.inputs)
+
+        # Fixed-point parameters (meta) and outputs (fraction bits): the API
+        # takes and gives numbers, the ports and the model carry raw values
+        self._fx_params = {p: attr[p] for p, _ in self.arg_groups
+                           if attr.get(p, {}).get("frac") is not None}
+        self._fx_out = {n: f for n in self.output_args_list
+                        if (f := self._fx_frac(n)) is not None}
 
         # Raw IR bit widths (core widths)
         self.input_args_bits = sum(self.input_args_width_list)
@@ -674,7 +696,7 @@ class Py2ver:
         self._hw_ok = self.createHWproject()
         if not self._hw_ok:
             self._hw_unavailable(getattr(self, "_hw_error", "board project could not be built (see log)"))
-        return self.hw_fun
+        return self._fx_rows(self.hw_fun)
 
     def _hw_unavailable(self, reason: str, *in_arg: Any) -> Tuple[int, ...]:
         """Raise, or fall back to simulation if FALLBACK_TO_SIM is set."""
@@ -767,7 +789,7 @@ class Py2ver:
         handling, core) and talk to it over its UART pins with the same bytes
         hw_fun() sends. Returns a batch callable like TB_batch().
         """
-        return self.hw_sim_fun
+        return self._fx_rows(self.hw_sim_fun)
 
     def hw_sim_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
         vectors = [tuple(v) for v in vectors]
@@ -989,7 +1011,7 @@ class Py2ver:
         return path
 
     def TB_handshake(self) -> Callable[..., List[Tuple[int, ...]]]:
-        return self.tb_handshake_fun
+        return self._fx_rows(self.tb_handshake_fun)
 
     def tb_handshake_fun(self, vectors: List[Any], valid: float = 0.7, ready: float = 0.7,
                          seed: int = 0) -> List[Tuple[int, ...]]:
@@ -1155,35 +1177,135 @@ class Py2ver:
     # ------------------------------------------------------------------------
 
     def TB(self) -> Callable[..., Tuple[int, ...]]:
-        return self.tb_fun
+        return self._fx_rows(self.tb_fun)
 
     def TB_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
-        return self.tb_batch_fun
+        return self._fx_rows(self.tb_batch_fun)
 
     def PY_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
-        return self.py_batch_fun
+        return self._fx_rows(self.py_batch_fun)
 
     def py_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
         """
-        Python reference for tb_batch_fun(): the original function's results,
-        wrapped to each output's declared width and sign (int() truncates /).
+        Python reference for tb_batch_fun(): the function's results (for a
+        fixed-point design, its bit-exact model's), wrapped to each output's
+        declared width and sign (int() truncates /).
         """
         if self.state_map or self.rams:
             raise ValueError("This design has state ('next' or 'memory' in attr); use PY_stream().")
-        outs: List[Tuple[int, ...]] = []
-        for vec in vectors:
-            ret = _flatten_outputs(self.func(*vec))
-            outs.append(tuple(
-                self._wrap(int(v), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
-                for v, n, w in zip(ret, self.output_args_list, self.output_args_width_list)
-            ))
-        return outs
+        func = self._model or self.func
+        return [self._py_row(func(*self._py_args(vec))) for vec in vectors]
+
+    def _py_row(self, ret: Any) -> Tuple[int, ...]:
+        return tuple(
+            self._wrap(int(v), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
+            for v, n, w in zip(_flatten_outputs(ret), self.output_args_list,
+                               self.output_args_width_list)
+        )
+
+    def PY_float(self) -> Callable[[List[Any]], List[Tuple[Any, ...]]]:
+        """
+        The original function as written (floats), on the same inputs as the
+        hardware after they are quantized: the ideal a fixed-point design
+        approximates. Takes vectors like PY_batch(), or samples like
+        PY_stream() for a design with state.
+        """
+        return self.py_float_fun
+
+    def py_float_fun(self, vectors: List[Any]) -> List[Tuple[Any, ...]]:
+        if self.state_map or self.rams:
+            return self._stream_reference(vectors, exact=False)
+        params = [p for p, _ in self.arg_groups]
+        return [_flatten_outputs(self.func(*[self._float_value(p, self._py_value(p, v))
+                                             for p, v in zip(params, vec)]))
+                for vec in vectors]
+
+    def quantization_error(self, vectors: List[Any]) -> Dict[str, Tuple[float, float]]:
+        """
+        Per output: (max abs error, RMS error) of the bit-exact results
+        (PY_batch / PY_stream, which the hardware matches) against PY_float().
+        """
+        stream = bool(self.state_map or self.rams)
+        exact = (self.PY_stream() if stream else self.PY_batch())(vectors)
+        ideal = self.py_float_fun(vectors)
+        out: Dict[str, Tuple[float, float]] = {}
+        for i, name in enumerate(self.output_args_list):
+            errs = [abs(float(e[i]) - float(r[i])) for e, r in zip(exact, ideal)]
+            if errs:
+                out[self._py_name.get(name, name)] = (
+                    max(errs), (sum(x * x for x in errs) / len(errs)) ** 0.5)
+        return out
 
     def TB_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
-        return self.tb_stream_fun
+        return self._fx_rows(self.tb_stream_fun)
 
     def PY_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
-        return self.py_stream_fun
+        return self._fx_rows(self.py_stream_fun)
+
+    # ------------------------------ fixed point ------------------------------
+
+    @staticmethod
+    def _raw_init(meta: Any) -> Any:
+        """A fixed-point state/memory's 'init' (numbers) as raw values."""
+        if not (isinstance(meta, dict) and meta.get("frac") is not None and "init" in meta):
+            return meta
+        q = lambda v: quantize(v, meta["frac"], meta["width"], bool(meta.get("signed")),  # noqa: E731
+                               bool(meta.get("round")), bool(meta.get("saturate")))
+        init = meta["init"]
+        return dict(meta, init=[q(v) for v in init] if isinstance(init, (list, tuple)) else q(init))
+
+    def _fx_frac(self, port: str) -> Optional[int]:
+        """Fraction bits of an output port (xs_3 is an element of xs, a_out
+        returns a, xs_3_out returns an element of xs)."""
+        names = [port]
+        for name in list(names):
+            base = name[:-4] if name.endswith("_out") else name
+            m = re.fullmatch(r"(.+)_(\d+)", base)
+            names += [base] + ([m.group(1)] if m else [])
+        for name in names:
+            t = self._fx_types.get(name)
+            if t is not None:
+                t = t[1] if t[0] == "l" else t
+                return t[1] if t is not None and t[0] == "f" else None
+        return None
+
+    def _py_value(self, param: str, value: Any) -> Any:
+        """An argument for the ports / the bit-exact model: a fixed-point
+        parameter's numbers as raw values, quantized like assignments to it."""
+        m = self._fx_params.get(param)
+        if m is None:
+            return value
+        conv = lambda v: quantize(v, m["frac"], m["width"], bool(m.get("signed")),  # noqa: E731
+                                  bool(m.get("round")), bool(m.get("saturate")))
+        return [conv(v) for v in value] if isinstance(value, (list, tuple)) else conv(value)
+
+    def _float_value(self, param: str, raw: Any) -> Any:
+        """Raw value(s) of a fixed-point parameter as numbers."""
+        m = self._fx_params.get(param)
+        if m is None:
+            return raw
+        conv = lambda v: int(v) / (1 << m["frac"])  # noqa: E731
+        return [conv(v) for v in raw] if isinstance(raw, (list, tuple)) else conv(raw)
+
+    def _py_args(self, vec: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        params = [p for p, _ in self.arg_groups]
+        return tuple(self._py_value(p, v) for p, v in zip(params, vec)) + tuple(vec[len(params):])
+
+    def _fx_rows(self, fn: Callable) -> Callable:
+        """fn with its results' fixed-point outputs as numbers (raw / 2**frac)."""
+        if not self._fx_out:
+            return fn
+        fracs = [self._fx_out.get(n) for n in self.output_args_list]
+
+        def row(r):
+            return tuple(v if f is None else int(v) / (1 << f) for v, f in zip(r, fracs))
+
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            out = fn(*args, **kwargs)
+            return [row(r) for r in out] if isinstance(out, list) else row(out)
+
+        return wrapped
 
     def _flatten_args(self, in_arg: Tuple[Any, ...]) -> Tuple[Any, ...]:
         """Function arguments (a list argument as a list) -> one value per input port."""
@@ -1191,6 +1313,7 @@ class Py2ver:
                   if (ports or [p])[0] in self.input_args_list]   # state lives in registers
         out: List[Any] = []
         for value, (param, ports) in zip(in_arg, groups):
+            value = self._py_value(param, value)
             if ports is None:
                 out.append(value)
                 continue
@@ -1277,16 +1400,24 @@ class Py2ver:
 
     def py_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:
         """
-        Python reference for tb_stream_fun(): calls the original function once
-        per sample, feeding each next-state output back into its state argument
-        with the same width/sign wrapping as the hardware registers.
+        Python reference for tb_stream_fun(): calls the function (for a
+        fixed-point design, its bit-exact model) once per sample, feeding each
+        next-state output back into its state argument with the same
+        width/sign wrapping as the hardware registers.
         """
+        return self._stream_reference(samples, exact=True)
+
+    def _stream_reference(self, samples: List[Any], exact: bool) -> List[Tuple[Any, ...]]:
+        """exact: raw values wrapped like the hardware; else the original
+        function on numbers, nothing wrapped (PY_float)."""
         samples = list(samples)
         self._stream_vectors(samples)  # validates
         groups = dict(self.arg_groups)
 
-        params = list(inspect.signature(self.func).parameters)
-        py = lambda name: self._py_name.get(name, name)  # noqa: E731
+        model = exact and self._model is not None
+        func = self._model if model else self.func
+        py = (lambda name: name) if model else (lambda name: self._py_name.get(name, name))  # noqa: E731
+        params = list(inspect.signature(func).parameters)
         if params != [py(p) for p, _ in self.arg_groups]:
             raise ValueError(f"PY_stream() needs arguments {list(groups)}; function has {params}")
         inputs = [p for p, _ in self.arg_groups
@@ -1296,35 +1427,43 @@ class Py2ver:
             m = self.attr.get(name, {})
             return int(m.get("width", 1)), int(m.get("signed", 0)) == 1
 
+        def keep(name: str, v: Any) -> Any:
+            return self._wrap(int(v), *_meta(name)) if exact else v
+
         def _state_value(param: str, value_of) -> Any:
             ports = groups[param]
             if ports is None:
-                return self._wrap(value_of(param), *_meta(param))
-            return [self._wrap(value_of(port), *_meta(port)) for port in ports]
+                return keep(param, value_of(param))
+            return [keep(port, value_of(port)) for port in ports]
 
-        state = {p: _state_value(p, self.state_init.__getitem__) for p in self.state_params}
+        def _init(param: str, raw: Any) -> Any:
+            return raw if exact else self._float_value(param, raw)
+
+        state = {p: _init(p, _state_value(p, self.state_init.__getitem__))
+                 for p in self.state_params}
         # Memories: the function updates the list in place; values wrap like the RAM
         rams = {}
         for mem, ram in self.rams.items():
             init = self._ram_init[mem]
             vals = list(init) if isinstance(init, (list, tuple)) else [init] * ram["length"]
             w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
-            rams[mem] = [self._wrap(int(v), w, sgn) for v in vals]
-        outs: List[Tuple[int, ...]] = []
+            rams[mem] = _init(mem, [self._wrap(int(v), w, sgn) for v in vals])
+        outs: List[Tuple[Any, ...]] = []
         for sample in samples:
             args = sample if isinstance(sample, tuple) else (sample,)
             kwargs = dict(zip(inputs, args))
             for p in inputs[len(args):]:                     # missing trailing args: 0
                 kwargs[p] = 0 if groups[p] is None else [0] * len(groups[p])
+            kwargs = {p: self._py_value(p, v) for p, v in kwargs.items()}
+            if not exact:
+                kwargs = {p: self._float_value(p, v) for p, v in kwargs.items()}
             call = {py(k): v for k, v in {**kwargs, **state, **rams}.items()}
-            ret = _flatten_outputs(self.func(**call))
-            for mem, ram in self.rams.items():
-                w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
-                rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
-            row = {
-                name: self._wrap(int(v), *_meta(name))
-                for name, v in zip(self.output_args_list, ret)
-            }
+            ret = _flatten_outputs(func(**call))
+            if exact:
+                for mem, ram in self.rams.items():
+                    w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
+                    rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
+            row = {name: keep(name, v) for name, v in zip(self.output_args_list, ret)}
             outs.append(tuple(row[n] for n in self.output_args_list))
             state = {p: _state_value(p, lambda port: row[self.state_map[port]])
                      for p in self.state_params}

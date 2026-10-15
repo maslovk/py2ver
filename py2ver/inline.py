@@ -33,6 +33,8 @@ import itertools
 import textwrap
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .hwtypes import strip_helper_annotations
+
 _BUILTINS = {"range", "min", "max", "abs", "complex"}
 
 
@@ -67,7 +69,7 @@ class _Inliner:
         fd = ast.parse(src).body[0]
         if not isinstance(fd, ast.FunctionDef):
             raise NotImplementedError(f"Helper '{name}' is not a plain function")
-        return fd
+        return strip_helper_annotations(fd)
 
     def _constants(self, locals_: Set[str]):
         """Transformer replacing names of module-level int constants with values."""

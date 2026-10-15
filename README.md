@@ -63,9 +63,98 @@ to the current working directory.
 ### Attributes
 
 Each name maps to `{'signed': 0|1, 'width': <bits>, 'type': 'wire'|'reg'}`, plus
-`'next'` and `'init'` for state registers (see below).
-`type: 'reg'` registers the signal; the testbench accounts for the resulting
-pipeline latency. Widths of undeclared temporaries are inferred.
+`'next'` and `'init'` for state registers, `'length'` and `'memory'` for lists
+and memories, and `'frac'`, `'round'` and `'saturate'` for fixed point (see
+below). `type: 'reg'` registers the signal; the testbench accounts for the
+resulting pipeline latency. Widths of undeclared temporaries are inferred.
+
+### Annotations (optional)
+
+The function is used as written, with everything about the hardware in
+`attr`. If you write a function for py2ver anyway, you can put the same
+information in annotations instead, and leave `attr` out:
+
+```python
+from py2ver import Py2ver, Reg, S, U
+
+def foo(arg1: U[8], arg2: U[8]) -> (Reg(U[9]), S[9], U[9], U[9]):
+    ...
+
+p = Py2ver(foo)
+```
+
+| Annotation | `attr` equivalent |
+|---|---|
+| `U[8]`, `S[12]` | `{'signed': 0, 'width': 8}` |
+| `Reg(U[9])` | `'type': 'reg'` |
+| `Array(U[8], 4)` | `'length': 4` |
+| `State(S[16], next='y', init=0)` | `'next': 'y', 'init': 0` |
+| `Ram(U[16], 256, init=0)` | `'length': 256, 'memory': 'ram'` |
+
+Parameters (`x: S[12]`), variables (`t: S[16] = ...`, or a bare `t: S[16]`)
+and the return (one type per returned value; a returned expression is the
+output `ret` / `ret<i>`) can be annotated; other annotations (`x: int`) are
+ignored. An `attr` entry is merged over an annotation of the same name, and
+`attr` values may be types too (`{'x': S[12]}`).
+
+### Fixed point
+
+A float model needs no changes: give its values a fixed-point format in
+`attr` and py2ver builds it in fixed point. `'frac'` is the number of the
+`'width'` bits after the binary point (`{'signed': 1, 'width': 16, 'frac':
+15}` is Q15, -1 .. 1 - 2**-15); the hardware holds `value * 2**frac` as an
+integer.
+
+```python
+def lpf(x, y):                      # the float model, as written
+    yn = y + 0.1 * (x - y)
+    return yn
+
+attr = {'x': {'signed': 1, 'width': 12, 'frac': 10},
+        'y': {'signed': 1, 'width': 16, 'frac': 14, 'next': 'yn', 'round': True}}
+
+p = Py2ver(lpf, attr)
+p.TB_stream()(xs) == p.PY_stream()(xs)     # hardware == bit-exact model
+p.quantization_error(xs)                   # {'yn': (max error, rms error)} vs. the float model
+```
+
+What the hardware computes:
+
+- **Assignments to a variable with a format quantize**: floor to its
+  fraction bits (`'round': True`: round half up) and wrap to its width
+  (`'saturate': True`: clamp). This applies to parameters, state (a state's
+  `next` value takes the state's format), list elements, memories and
+  returned expressions (`'ret'`, `'ret0'`, ... in attr).
+- **Everything else is exact**: `+`/`-` align the binary points, `*` adds the
+  fraction bits, and comparisons, `min`, `max`, `abs` and `x if c else y`
+  align. A variable without a format holds the widest value assigned to it
+  (one whose format would grow on every loop iteration, like `y = y * a`,
+  needs a format in attr).
+- **`/` by a constant**: a power of two only moves the binary point; any
+  other constant multiplies by its reciprocal. Division by a variable isn't
+  supported.
+- **Float constants** (literals and module-level floats or tables of floats,
+  like filter coefficients) are exact if they fit in `const_bits`
+  significant bits, else rounded to that many: `Py2ver(f, attr,
+  const_bits=18)` (the default).
+- `int(x)` truncates toward zero, `math.floor` / `math.ceil` work, `float(x)`
+  is `x`. `//`, `%`, `round()`, bitwise operators and complex values aren't
+  supported on fixed-point values. `/` between two integers keeps its
+  integer meaning (`int(a / b)`).
+
+The Python references:
+
+- `PY_batch()` / `PY_stream()` are the **bit-exact model**: your function
+  rewritten the way the hardware computes it, run in Python. Simulation, the
+  virtual board and the board must match it exactly.
+- `PY_float()` runs **your function as written** on the same (quantized)
+  inputs: the ideal. `quantization_error(vectors)` gives the maximum and RMS
+  error of each output against it.
+
+Inputs are numbers (floats too), quantized to each input's format like an
+assignment. Fixed-point outputs come back as floats, and a fixed-point
+state's or memory's `'init'` is a number too.
+
 
 ### State registers (streaming designs)
 
@@ -317,7 +406,7 @@ extra hardware. `and`/`or` give 0/1, not Python's operand values.
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
 signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
-histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+fixed-point FIR filter from a float model, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```
