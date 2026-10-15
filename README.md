@@ -1,4 +1,7 @@
 # py2ver
+
+[![tests](https://github.com/maslovk/py2ver/actions/workflows/tests.yml/badge.svg)](https://github.com/maslovk/py2ver/actions/workflows/tests.yml)
+
 ## Simple Verilog code generator from Python source
 
 py2ver turns a plain Python function into a Verilog module and gives you back
