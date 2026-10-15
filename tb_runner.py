@@ -58,3 +58,35 @@ def test_runner(top_name: str, proj_path: Path | None = None):
         )
     finally:
         sys.path.remove(str(proj_path))
+
+
+def run_cocotb(top_name: str, sources, test_module: str, proj_path: Path,
+               build_name: str = "sim_build", timescale=None):
+    """Build `sources` with `top_name` as toplevel and run cocotb `test_module`."""
+    sim = os.getenv("SIM", "icarus")
+    proj_path = Path(proj_path)
+    build_dir = proj_path / build_name
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+
+    runner = get_runner(sim)
+    build_kwargs = {}
+    if timescale is not None:
+        build_kwargs["timescale"] = timescale
+    runner.build(
+        sources=[Path(s) for s in sources],
+        hdl_toplevel=top_name,
+        build_dir=str(build_dir),
+        always=True,
+        **build_kwargs,
+    )
+
+    sys.path.insert(0, str(proj_path))
+    try:
+        runner.test(
+            hdl_toplevel=top_name,
+            test_module=test_module,
+            build_dir=str(build_dir),
+        )
+    finally:
+        sys.path.remove(str(proj_path))

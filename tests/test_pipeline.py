@@ -167,14 +167,6 @@ def test_pipeline_rejects_unsupported_designs(monkeypatch, tmp_path, kwargs, att
         Py2ver(func or add_reg, attr, **kwargs)
 
 
-def test_hw_rejects_pipelined_design(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    p = Py2ver(mixed_ops, MIXED_ATTR, pipeline=2)
-
-    with pytest.raises(NotImplementedError, match="pipelined"):
-        p.HW({"QUARTUS_DIR": "/nonexistent"})
-
-
 # ----------------------------- simulation (new vector every clock) -----------------------------
 
 @pytest.mark.sim

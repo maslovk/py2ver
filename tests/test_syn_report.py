@@ -177,4 +177,4 @@ def test_syn_real_quartus_lpf(monkeypatch, tmp_path):
     assert r.combinational and r.combinational > 0
     assert r.fmax_mhz and r.fmax_mhz > 50
     assert r.meets_timing is True
-    assert r.fit_summary["Total virtual pins"] == "29"  # x(12) + rst(1) + y(16)
+    assert r.fit_summary["Total virtual pins"] == "30"  # x(12) + rst(1) + ce(1) + y(16)

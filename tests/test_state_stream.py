@@ -162,7 +162,8 @@ def test_state_lowering_ports_and_verilog(monkeypatch, tmp_path):
     verilog = (tmp_path / "hdl" / "main.v").read_text(encoding="utf-8")
     assert "input rst;" in verilog
     assert "reg signed [15:0] y_prev;" in verilog
-    assert "y_prev <= rst ? 16'sd0 : y;" in verilog
+    assert "y_prev <= rst ? 16'sd0 : (ce ? y : $signed(y_prev));" in verilog
+    assert "input ce;" in verilog
 
 
 def test_stream_empty_does_not_simulate(monkeypatch, tmp_path):
@@ -176,7 +177,7 @@ def test_stream_empty_does_not_simulate(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_stateful_design_rejects_tb_batch_and_hw(monkeypatch, tmp_path):
+def test_stateful_design_rejects_tb_batch(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     p = Py2ver(lpf_step, LPF_ATTR)
 
@@ -184,8 +185,6 @@ def test_stateful_design_rejects_tb_batch_and_hw(monkeypatch, tmp_path):
         p.TB()(1)
     with pytest.raises(ValueError, match="TB_stream"):
         p.TB_batch()([(1,)])
-    with pytest.raises(NotImplementedError, match="HW"):
-        p.HW({"QUARTUS_DIR": "/nonexistent"})
 
 
 def test_stateless_design_rejects_stream(monkeypatch, tmp_path):

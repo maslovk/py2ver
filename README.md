@@ -89,10 +89,11 @@ assert sim == ref
 ```
 
 State arguments disappear from the module ports and become registers with a
-synchronous active-high `rst`. All returned values stay output ports. A stream
-returns every output for each sample, read before the clock edge that loads
-the next state. State cannot yet be combined with `'type': 'reg'` signals,
-and `HW()` does not support stateful designs yet.
+synchronous active-high `rst` and a clock enable `ce`. All returned values stay
+output ports. A stream returns every output for each sample, read before the
+clock edge that loads the next state. On the board, each `HW()` call is one
+sample and advances the state once; KEY0 or power-up resets it. State cannot
+yet be combined with `'type': 'reg'` signals.
 
 ### Automatic pipelining
 
@@ -112,7 +113,7 @@ p.SYN(syn_attr)          # SHA-256 4 rounds on EP4CE22: 31 MHz -> 88 MHz
 Delay is estimated per assignment from its operators, and one assignment is
 never split, so break long expressions into temporaries for finer stages.
 Constants are not registered. Pipelining can't yet be combined with state
-registers or `'type': 'reg'` signals, and `HW()` does not support it yet.
+registers or `'type': 'reg'` signals.
 
 ### Area and timing (`SYN()`)
 
@@ -140,8 +141,30 @@ Options: `QUARTUS_DIR` (default: `quartus_sh` on `PATH`), `CLK_PERIOD_NS`
 (default 20), `DEVICE` (default `EP4CE22F17C6`), `FAMILY` (default
 `Cyclone IV E`). The project is written to `syn/<name>/`.
 
-`HW()` options: `QUARTUS_DIR` (required), `UART_PORT` (default `/dev/ttyUSB0`),
-`UART_BAUD` (default `115200`), `UART_TIMEOUT` (default `1.0` s).
+### On the board (`HW()`) and the virtual board (`HW_sim()`)
+
+`HW()` builds the DE0-Nano project (UART link plus your module), programs the
+FPGA and returns a function that sends inputs over the serial port and reads
+the outputs back. The board waits for your module's latency (`reg` signals,
+`pipeline=N`) before replying, and advances state once per call.
+
+`HW()` raises instead of returning simulation results when the board can't be
+used, and refuses a build that misses 50 MHz timing (results could be wrong;
+use `pipeline=N`). Options: `QUARTUS_DIR` (required), `UART_PORT` (default
+`/dev/ttyUSB0`), `UART_BAUD` (default `115200`), `UART_TIMEOUT` (default
+`1.0` s), `FALLBACK_TO_SIM` (return simulation results instead of raising),
+`ALLOW_TIMING_FAILURE` (run anyway).
+
+`HW_sim()` needs no board or Quartus: it simulates the whole board project
+and talks to it over its UART pins with the exact bytes `HW()` would send,
+so the board path can be checked against Python before touching hardware:
+
+```python
+p.HW_sim()(vectors) == p.TB_batch()(vectors)   # one reply per input vector
+```
+
+It runs at real UART speed in simulation (a few seconds per handful of
+vectors).
 
 ### Supported Python subset
 

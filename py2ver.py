@@ -117,9 +117,9 @@ class Py2ver:
         self.has_clk = bool(ir.has_clk)
 
         self.t_name = ir.name
-        self.input_args_list = [p.name for p in ir.inputs if p.kind not in ("clk", "rst")]
+        self.input_args_list = [p.name for p in ir.inputs if p.kind not in ("clk", "rst", "ce")]
         self.output_args_list = [p.name for p in ir.outputs]
-        self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in ("clk", "rst")]
+        self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in ("clk", "rst", "ce")]
         self.output_args_width_list = [p.width for p in ir.outputs]
 
         # Raw IR bit widths (core widths)
@@ -178,14 +178,17 @@ class Py2ver:
         self.syn_data = {
             "top_name": self.t_name,
             "inputs": [
-                {"name": n, "width": w, "delay": 0}
+                {"name": n, "width": w}
                 for n, w in zip(self.input_args_list, self.input_args_width_list)
             ],
             "inputs_size": self.input_args_bits,
             "outputs": [
-                {"name": n, "width": w, "delay": 0}
+                {"name": n, "width": w}
                 for n, w in zip(self.output_args_list, self.output_args_width_list)
             ],
+            "latency": self.tb_latency_cycles,
+            "has_clk": self.has_clk,
+            "has_state": bool(self.state_map),
             "outputs_size": self.output_bits,
             # UART / loopback params for DE0_Nano template
             "CLK_HZ": DEFAULT_CLK_FREQ,
@@ -231,8 +234,8 @@ class Py2ver:
         """
         Turn state inputs into registers:
           - state inputs are removed from the ports
-          - clk and a synchronous active-high rst are added
-          - each state s with next n gets:  s <= rst ? init : n
+          - clk, a synchronous active-high rst and a clock enable ce are added
+          - each state s with next n gets:  s <= rst ? init : (ce ? n : s)
         Outputs (including next-state values) stay as ports.
         """
         in_names = [p.name for p in ir.inputs]
@@ -242,7 +245,7 @@ class Py2ver:
             raise NotImplementedError(
                 "State registers ('next') cannot be combined with 'reg' signals yet."
             )
-        for reserved in ("clk", "rst"):
+        for reserved in ("clk", "rst", "ce"):
             if reserved in in_names or reserved in out_names:
                 raise ValueError(f"'{reserved}' is a reserved port name in designs with state.")
         for s, n in self.state_map.items():
@@ -263,11 +266,17 @@ class Py2ver:
             # own sign, matching how PY_stream() wraps it.
             n_signed = int(attr.get(n, {}).get("signed", 0)) == 1
             lit = f"{p.width}'{'s' if n_signed else ''}d{init}"
-            assigns.append(Assignment(left=p.name, right=f"rst ? {lit} : {n}", is_reg=True))
+            # The hold value takes the same signedness too, or the whole
+            # selection would turn unsigned and zero-extend a signed n
+            hold = f"$signed({p.name})" if n_signed else f"$unsigned({p.name})"
+            assigns.append(
+                Assignment(left=p.name, right=f"rst ? {lit} : (ce ? {n} : {hold})", is_reg=True)
+            )
 
         inputs = [p for p in ir.inputs if p.name not in self.state_map]
         inputs.append(Port(name="clk", width=1, signed=False, kind="clk"))
         inputs.append(Port(name="rst", width=1, signed=False, kind="rst"))
+        inputs.append(Port(name="ce", width=1, signed=False, kind="ce"))
 
         return ModuleIR(
             name=ir.name,
@@ -471,19 +480,27 @@ class Py2ver:
             'UART_PORT':    serial port (default '/dev/ttyUSB0')
             'UART_BAUD':    baud rate (default DEFAULT_BAUD_RATE)
             'UART_TIMEOUT': read timeout in seconds (default 1.0)
+            'FALLBACK_TO_SIM': return simulation results instead of raising
+                               when the board cannot be used (default False)
+            'ALLOW_TIMING_FAILURE': run even if the board design misses
+                               50 MHz timing (results may be wrong)
 
         Returns:
-            hw_fun(*args) -> tuple of outputs (same shape as TB()).
+            hw_fun(*args) -> tuple of outputs (same shape as TB()). For designs
+            with state, each call is one sample and advances the state.
         """
-        if self.state_map:
-            raise NotImplementedError(
-                "HW() does not support state registers ('next') yet; use TB_stream()."
-            )
-        if self.pipeline_stages:
-            raise NotImplementedError("HW() does not support pipelined designs yet.")
         self.syn_attr = syn_attr
         self._hw_ok = self.createHWproject()
+        if not self._hw_ok:
+            self._hw_unavailable(getattr(self, "_hw_error", "board project could not be built (see log)"))
         return self.hw_fun
+
+    def _hw_unavailable(self, reason: str, *in_arg: Any) -> Tuple[int, ...]:
+        """Raise, or fall back to simulation if FALLBACK_TO_SIM is set."""
+        if self.syn_attr.get("FALLBACK_TO_SIM") and not self.state_map:
+            log.warning("HW unavailable (%s); returning simulation result.", reason)
+            return self.tb_fun(*in_arg) if in_arg else ()
+        raise RuntimeError(f"HW unavailable: {reason}")
 
     def hw_fun(self, *in_arg: Any) -> Tuple[int, ...]:
         """
@@ -498,13 +515,12 @@ class Py2ver:
               * unpack to tuple of outputs
         """
         if not getattr(self, "_hw_ok", False):
-            log.error("HW() called but Quartus project/compile failed; "
-                      "falling back to simulation result.")
-            return self.tb_fun(*in_arg)
+            return self._hw_unavailable(
+                getattr(self, "_hw_error", "board project could not be built"), *in_arg
+            )
 
         if serial is None:
-            log.error("pyserial not available; falling back to simulation result.")
-            return self.tb_fun(*in_arg)
+            return self._hw_unavailable("pyserial is not installed", *in_arg)
 
         port = self.syn_attr.get("UART_PORT", "/dev/ttyUSB0")
         baud = int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE))
@@ -544,19 +560,18 @@ class Py2ver:
                              len(resp), resp.hex(" "))
 
                 if len(resp) != output_bytes_expected:
-                    log.error("UART: expected %d bytes, got %d; "
-                              "falling back to simulation result.",
-                              output_bytes_expected, len(resp))
-                    return self.tb_fun(*in_arg)
+                    return self._hw_unavailable(
+                        f"UART: expected {output_bytes_expected} bytes, got {len(resp)}",
+                        *in_arg,
+                    )
 
                 # --- Decode ---
                 outs = self._unpack_outputs(resp)
                 log.info("Decoded HW outputs: %s", outs)
                 return outs
 
-        except Exception as e:
-            log.error("UART communication failed (%s); falling back to simulation.", e)
-            return self.tb_fun(*in_arg)
+        except (OSError, serial.SerialException) as e:
+            return self._hw_unavailable(f"UART communication failed ({e})", *in_arg)
 
     def hw_run(self) -> int:
         """
@@ -565,28 +580,58 @@ class Py2ver:
         """
         return 1
 
-    def createHWproject(self) -> bool:
+    def HW_sim(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
         """
-        Create Quartus project, emit all HDL, run compile, and attempt
-        to program the FPGA.
-
-        Returns:
-            True on successful compile (programming errors are logged but
-            do not flip this to False), False on any early/compile error.
+        Virtual board: simulate the full DE0-Nano project (UART, latency
+        handling, core) and talk to it over its UART pins with the same bytes
+        hw_fun() sends. Returns a batch callable like TB_batch().
         """
-        syn_tool_dir = self.syn_attr.get("QUARTUS_DIR")
-        if not syn_tool_dir:
-            log.error("Missing 'QUARTUS_DIR'")
-            return False
+        return self.hw_sim_fun
 
-        quartus_sh = os.path.join(syn_tool_dir, "quartus_sh")
-        if not os.path.exists(quartus_sh):
-            log.error("quartus_sh not found: %s", quartus_sh)
-            return False
+    def hw_sim_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
+        vectors = [tuple(v) for v in vectors]
+        if not vectors:
+            return []
+        project_dir = self.gen_hw_project()
+        tx_bytes = (self.tx_width + 7) // 8
+        requests = [list(self._pack_inputs(*v)) for v in vectors]
 
-        if self._hw_root.is_dir():
-            shutil.rmtree(self._hw_root)
+        tb_src = self.get_template("tb_hw.txt").render({
+            "baud": DEFAULT_BAUD_RATE,
+            "tx_bytes": tx_bytes,
+            "requests": repr(requests),
+        })
+        (project_dir / "tb_hw.py").write_text(tb_src, encoding="utf-8")
+
+        sources = (
+            [project_dir / "DE0_Nano.v", project_dir / "delayed_registers.sv",
+             project_dir / f"{self.t_name}.v"]
+            + sorted((project_dir / "uart").glob("*.sv"))
+        )
+        tb_runner.run_cocotb(
+            "DE0_Nano", sources, "tb_hw", project_dir, timescale=("1ns", "1ps")
+        )
+
+        results_path = project_dir / "results" / "results.pickle"
+        if not results_path.exists():
+            raise RuntimeError(f"Virtual board produced no results ({results_path})")
+        with results_path.open("rb") as handle:
+            replies = pickle.load(handle)
+
+        outs: List[Tuple[int, ...]] = []
+        for vec, reply in zip(vectors, replies):
+            if len(reply) != tx_bytes or not all(isinstance(b, int) for b in reply):
+                raise RuntimeError(
+                    f"Virtual board reply for {vec}: expected {tx_bytes} bytes, got {reply}"
+                )
+            outs.append(self._unpack_outputs(bytes(reply)))
+        return outs
+
+    def gen_hw_project(self) -> Path:
+        """Write the DE0-Nano Quartus project (board top, UART, core). No compile."""
         project_dir = self._project_dir
+        if project_dir.is_dir():
+            shutil.rmtree(project_dir)
         project_dir.mkdir(parents=True, exist_ok=True)
 
         project_name = self.t_name
@@ -655,6 +700,32 @@ class Py2ver:
 
         log.info("Quartus project created at %s", project_dir)
 
+        return project_dir
+
+    def createHWproject(self) -> bool:
+        """
+        Create Quartus project, emit all HDL, run compile, and attempt
+        to program the FPGA.
+
+        Returns:
+            True on successful compile (programming errors are logged but
+            do not flip this to False), False on any early/compile error.
+        """
+        syn_tool_dir = self.syn_attr.get("QUARTUS_DIR")
+        if not syn_tool_dir:
+            self._hw_error = "missing 'QUARTUS_DIR'"
+            log.error(self._hw_error)
+            return False
+
+        quartus_sh = os.path.join(syn_tool_dir, "quartus_sh")
+        if not os.path.exists(quartus_sh):
+            self._hw_error = f"quartus_sh not found: {quartus_sh}"
+            log.error(self._hw_error)
+            return False
+
+        project_dir = self.gen_hw_project()
+        project_name = self.t_name
+
         # ---- Compile ----
         log.info("Running Quartus compile...")
         result = subprocess.run(
@@ -664,17 +735,26 @@ class Py2ver:
             text=True,
         )
         if result.returncode != 0:
+            self._hw_error = f"Quartus compile failed (rc={result.returncode}); see log"
             log.error("Quartus compile failed: rc=%d", result.returncode)
             log.error("quartus_sh stdout:\n%s", result.stdout)
             log.error("quartus_sh stderr:\n%s", result.stderr)
             return False
 
-        out_dir = project_dir / "output_files"
-        if out_dir.exists():
-            files = sorted(p.name for p in out_dir.iterdir() if p.is_file())
-            log.info("Artifacts: %s", files)
-        else:
-            log.warning("No output_files/ directory found.")
+        # Board reports are written to the project directory
+        self.hw_report = read_report(
+            project_dir, project_name, self.t_name,
+            1e9 / DEFAULT_CLK_FREQ, out_dir=project_dir,
+        )
+        log.info("Board build:\n%s", self.hw_report)
+        if self.hw_report.meets_timing is False and not self.syn_attr.get("ALLOW_TIMING_FAILURE"):
+            self._hw_error = (
+                f"board design misses {DEFAULT_CLK_FREQ // 1_000_000} MHz timing "
+                f"(Fmax {self.hw_report.fmax_mhz} MHz), so results would be unreliable; "
+                "use pipeline=N, or set ALLOW_TIMING_FAILURE"
+            )
+            log.error(self._hw_error)
+            return False
 
         self._program_fpga(syn_tool_dir, project_dir, project_name)
         return True

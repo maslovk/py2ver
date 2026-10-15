@@ -46,7 +46,7 @@ class Renderer:
         for p in ir.inputs:
             port_name = p.name if p.kind != 'clk' else 'clk'
             input_port_names.append(port_name)
-            if p.kind in ('input', 'clk', 'rst'):
+            if p.kind in ('input', 'clk', 'rst', 'ce'):
                 input_decls.append(
                     self._tpl('input.txt').render({
                         'name': port_name,

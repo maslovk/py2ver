@@ -1,0 +1,86 @@
+import pickle
+from pathlib import Path
+
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import FallingEdge, Timer
+
+# Virtual DE0-Nano: drive the board's UART RX pin with real 8N1 frames and
+# decode what comes back on TX, exactly as hw_fun() does over the serial port.
+
+BAUD = {{ baud }}
+BIT_PS = round(1e12 / BAUD)
+TX_BYTES = {{ tx_bytes }}
+
+# One list of input bytes per call, as produced by Py2ver._pack_inputs()
+REQUESTS = {{ requests }}
+
+
+async def save_results(ret_val):
+    results_dir = Path(__file__).resolve().parent / "results"
+    results_dir.mkdir(exist_ok=True)
+    with open(results_dir / "results.pickle", "wb") as handle:
+        pickle.dump(ret_val, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+async def uart_send(pin, byte):
+    pin.value = 0                                   # start bit
+    await Timer(BIT_PS, unit="ps")
+    for i in range(8):                              # data, LSB first
+        pin.value = (byte >> i) & 1
+        await Timer(BIT_PS, unit="ps")
+    pin.value = 1                                   # stop bit
+    await Timer(BIT_PS, unit="ps")
+
+
+async def uart_receive(pin, sink):
+    while True:
+        await FallingEdge(pin)                      # start bit
+        await Timer(BIT_PS // 2, unit="ps")
+        if not pin.value.is_resolvable or int(pin.value) != 0:
+            continue                                # glitch / undefined
+        byte, undefined = 0, False
+        for i in range(8):
+            await Timer(BIT_PS, unit="ps")
+            if not pin.value.is_resolvable:
+                undefined = True
+                continue
+            byte |= int(pin.value) << i
+        await Timer(BIT_PS, unit="ps")
+        if undefined:
+            sink.append(("undefined_bits", byte))
+        elif not pin.value.is_resolvable or int(pin.value) != 1:
+            sink.append(("framing_error", byte))
+        else:
+            sink.append(byte)
+
+
+@cocotb.test()
+async def tb_hw(dut):
+    cocotb.start_soon(Clock(dut.CLOCK_50, 20, unit="ns").start())
+
+    dut.SW.value = 0b1111            # switches active-low: all OFF -> core mode
+    dut.GPIO_0_RX.value = 1          # UART idle
+    dut.KEY.value = 0b10             # KEY[0] low: reset
+    await Timer(1, unit="us")
+    dut.KEY.value = 0b11
+    await Timer(5 * BIT_PS, unit="ps")
+
+    received = []
+    cocotb.start_soon(uart_receive(dut.GPIO_0_TX, received))
+
+    replies = []
+    for req in REQUESTS:
+        received.clear()
+        for byte in req:
+            await uart_send(dut.GPIO_0_RX, byte)
+        # Wait for the reply (generous: latency + TX_BYTES frames), then two
+        # more frame times so any extra bytes are caught too
+        for _ in range((TX_BYTES + 4) * 12):
+            if len(received) >= TX_BYTES:
+                break
+            await Timer(BIT_PS, unit="ps")
+        await Timer(20 * BIT_PS, unit="ps")
+        replies.append(list(received))
+
+    await save_results(replies)

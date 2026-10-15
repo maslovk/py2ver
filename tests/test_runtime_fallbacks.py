@@ -1,3 +1,4 @@
+import pytest
 from pathlib import Path
 
 import py2ver as py2ver_mod
@@ -52,10 +53,9 @@ def test_tb_fun_parses_string_payload_and_applies_signed(monkeypatch, tmp_path):
     assert out == (5, -1)
 
 
-def test_hw_fun_falls_back_to_tb_when_pyserial_missing(monkeypatch, tmp_path):
+def _hw_ready(monkeypatch, tmp_path, **syn_attr):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(py2ver_mod.tb_runner, "test_runner", lambda _top, _proj=None: None)
-
     attr = {
         "a": {"signed": 0, "width": 8, "type": "wire"},
         "b": {"signed": 0, "width": 8, "type": "wire"},
@@ -63,10 +63,29 @@ def test_hw_fun_falls_back_to_tb_when_pyserial_missing(monkeypatch, tmp_path):
         "d": {"signed": 1, "width": 9, "type": "wire"},
     }
     p = Py2ver(rt_add_sub, attr)
-
     monkeypatch.setattr(py2ver_mod, "serial", None)
     monkeypatch.setattr(p, "_hw_ok", True)
+    monkeypatch.setattr(p, "syn_attr", dict(syn_attr))
     monkeypatch.setattr(p, "tb_fun", lambda *_args: (123, 456))
+    return p
 
-    out = p.hw_fun(9, 2)
-    assert out == (123, 456)
+
+def test_hw_fun_raises_when_pyserial_missing(monkeypatch, tmp_path):
+    p = _hw_ready(monkeypatch, tmp_path)
+
+    with pytest.raises(RuntimeError, match="pyserial"):
+        p.hw_fun(9, 2)
+
+
+def test_hw_fun_falls_back_to_tb_only_when_asked(monkeypatch, tmp_path):
+    p = _hw_ready(monkeypatch, tmp_path, FALLBACK_TO_SIM=True)
+
+    assert p.hw_fun(9, 2) == (123, 456)
+
+
+def test_hw_without_quartus_raises_with_reason(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(rt_add_sub, {"a": {"width": 8}, "b": {"width": 8}, "s": {"width": 9}, "d": {"width": 9}})
+
+    with pytest.raises(RuntimeError, match="quartus_sh not found"):
+        p.HW({"QUARTUS_DIR": str(tmp_path / "nowhere")})

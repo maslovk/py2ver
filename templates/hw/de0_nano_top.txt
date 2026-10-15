@@ -107,6 +107,14 @@ input       [1:0]  GPIO_1_IN;
 //=======================================================
 wire input_valid;
 wire ready;
+wire core_step;
+
+{% if has_state %}
+// Core state reset: KEY[0] (active-low) or power-on
+reg [3:0] por_count = 4'd0;
+always @(posedge CLOCK_50) if (por_count != 4'hF) por_count <= por_count + 4'd1;
+wire core_rst = ~KEY[0] | (por_count != 4'hF);
+{% endif %}
 
 // Core-side ports
 {% for input in inputs %}
@@ -170,7 +178,9 @@ wire en_pat  = sw2_on & ~lb_en;
 //=======================================================
 //  Structural logic
 //=======================================================
-delayed_registers delayed_registers_inst (
+delayed_registers #(
+    .LATENCY    ({{ latency }})
+) delayed_registers_inst (
     .clk        (CLOCK_50),
     .rst_n      (KEY[0]),
     .input_valid(input_valid),
@@ -178,7 +188,8 @@ delayed_registers delayed_registers_inst (
     .{{ output.name }}    ({{ output.name }}_int),
     .{{ output.name }}_out({{ output.name }}_out_int),
 {% endfor %}
-    .ready      (ready)
+    .ready      (ready),
+    .step       (core_step)
 );
 
 // ------------------------------------------------------
@@ -297,7 +308,13 @@ assign LED[7:5] = 3'b000;
 
 // ---------------- Main Core ----------------------------
 {{ top_name }} {{ top_name }}_inst(
-    //.clk(CLOCK_50),
+{% if has_clk %}
+    .clk(CLOCK_50),
+{% endif %}
+{% if has_state %}
+    .rst(core_rst),
+    .ce(core_step),
+{% endif %}
 {% for input in inputs %}
     .{{ input.name }}({{ input.name }}_int){% if not loop.last or outputs|length > 0 %},{% endif %}
 {% endfor %}

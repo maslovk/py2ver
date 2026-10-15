@@ -154,8 +154,9 @@ def parse_entity_registers(map_rpt: str, entity: str) -> Optional[int]:
 # --------------------------------------------------------------------
 
 def read_report(project_dir: Path, revision: str, core_entity: str,
-                clk_period_ns: float) -> SynReport:
-    out = Path(project_dir) / "output_files"
+                clk_period_ns: float, out_dir: Optional[Path] = None) -> SynReport:
+    """out_dir: where Quartus wrote the reports (default <project_dir>/output_files)."""
+    out = Path(out_dir) if out_dir is not None else Path(project_dir) / "output_files"
 
     def _read(name: str) -> str:
         p = out / f"{revision}.{name}"

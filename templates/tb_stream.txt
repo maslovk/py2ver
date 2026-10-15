@@ -31,6 +31,7 @@ VECTORS = {{ vectors }}
 async def tb_test(dut):
     # Synchronous reset: state registers load their init values on the first edge
     dut.rst.value = 1
+    dut.ce.value = 1
 {% for name in in_names %}
     dut.{{ name }}.value = 0
 {% endfor %}
