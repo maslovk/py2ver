@@ -880,6 +880,26 @@ class Py2ver:
     def TB_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
         return self.tb_batch_fun
 
+    def PY_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
+        return self.py_batch_fun
+
+    def py_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
+        """
+        Python reference for tb_batch_fun(): the original function's results,
+        wrapped to each output's declared width and sign (int() truncates /).
+        """
+        if self.state_map:
+            raise ValueError("This design has state registers ('next' in attr); use PY_stream().")
+        outs: List[Tuple[int, ...]] = []
+        for vec in vectors:
+            ret = self.func(*vec)
+            ret = ret if isinstance(ret, tuple) else (ret,)
+            outs.append(tuple(
+                self._wrap(int(v), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
+                for v, n, w in zip(ret, self.output_args_list, self.output_args_width_list)
+            ))
+        return outs
+
     def TB_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
         return self.tb_stream_fun
 

@@ -1,8 +1,7 @@
 from py2ver import Py2ver
-import logging
 
-logging.basicConfig(level=logging.DEBUG,
-                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+from _run import run
+
 
 def foo(arg1, arg2, arg3, arg4):
     if arg3 == 0:
@@ -39,26 +38,6 @@ attr = {
     'd':    {'signed': 0, 'width': 9},
 }
 
-syn_attr = {
-    'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'
-}
 
-p = Py2ver(foo, attr)
-
-foo_tb = p.TB()
-foo_hw = p.HW(syn_attr)
-
-g = foo_tb(4, 3, 2, 0)   # simulation result
-h = foo_hw(4, 3, 2, 0)   # hardware
-print("TB:", g)
-print("HW:", h)
-
-g = foo_tb(4, 3, 1, 0)   # simulation result
-h = foo_hw(4, 3, 1, 0)   # hardware
-print("TB:", g)
-print("HW:", h)
-
-g = foo_tb(4, 3, 1, 1)   # simulation result
-h = foo_hw(4, 3, 1, 1)   # hardware
-print("TB:", g)
-print("HW:", h)
+if __name__ == "__main__":
+    run(Py2ver(foo, attr), [(4, 3, 2, 0), (4, 3, 1, 0), (4, 3, 1, 1), (4, 3, 0, 0), (9, 200, 0, 5)])

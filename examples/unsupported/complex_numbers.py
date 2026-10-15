@@ -1,3 +1,7 @@
+# NOT SUPPORTED YET: arithmetic on complex values (x + y, x * y) is not
+# lowered; only complex(a, b) and abs(z) are.
+# Kept as a target for future work; this script fails today.
+
 from py2ver import Py2ver
 import logging
 

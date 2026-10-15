@@ -133,7 +133,12 @@ def only_some_branches(a, b):
 
 def returns_argument(a, b):
     a = a + b
-    return a
+    return a, b
+
+
+def returns_argument_unchanged(a, b):
+    y = a - b
+    return a, y
 
 
 # ----------------------------- simulation vs Python -----------------------------
@@ -167,6 +172,9 @@ def _vectors(attrs, n=24, seed=0):
         (return_expression, {"a": S8, "b": U8}, [S8, U8]),
         (helpers, {"a": S8, "b": S8, "c": {"signed": 1, "width": 6}},
          [S8, S8, {"signed": 1, "width": 6}]),
+        (returns_argument, {"a": {"signed": 1, "width": 10}, "b": S8},
+         [{"signed": 1, "width": 10}, S8]),
+        (returns_argument_unchanged, {"a": S8, "b": S8}, [S8, S8]),
     ],
 )
 def test_python_forms_match_python(assert_python_matches_sim, func, attr, ins):
@@ -199,7 +207,6 @@ def test_helper_locals_are_prefixed_and_constants_folded(monkeypatch, tmp_path):
         (recursive, "Recursive call"),
         (early_return, "may only return at its end"),
         (only_some_branches, "only some branches"),
-        (returns_argument, "Returning argument"),
     ],
 )
 def test_unsupported_forms_raise_clearly(monkeypatch, tmp_path, func, match):

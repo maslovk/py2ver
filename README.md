@@ -209,6 +209,23 @@ comparisons) get exactly-sized intermediate wires (`<name>__t<k>`), and
 unsigned signals are read through signed views (`<name>__s`), so this costs no
 extra hardware. `and`/`or` give 0/1, not Python's operand values.
 
+### Examples
+
+`examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
+signals, a randomized regression, a streaming low-pass filter and pipelined
+SHA-256 rounds). Each checks the hardware against Python in simulation, and
+optionally on the virtual board, in Quartus, or on the real board:
+
+```
+python examples/sha256_pipeline.py              # simulation
+python examples/sha256_pipeline.py --board-sim  # + virtual DE0-Nano
+python examples/sha256_pipeline.py --syn        # + Quartus area/timing
+python examples/sha256_pipeline.py --board      # + connected DE0-Nano
+```
+
+`examples/unsupported/` holds two designs py2ver can't handle yet (arithmetic
+on complex values, lists).
+
 ### Tests
 
 ```

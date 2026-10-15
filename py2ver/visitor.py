@@ -169,9 +169,13 @@ class FunctionVisitor(ast.NodeVisitor):
         """Expose the final version of var on an output port named var."""
         current = self._resolve_name(var)
         if var in self.input_args_list:
-            raise NotImplementedError(
-                f"Returning argument '{var}' is not supported; assign it to a new variable first."
-            )
+            # An output can't share the input port's name: expose it as <var>_out
+            out = f"{var}_out"
+            while self._is_defined(out) or out in self.attr or out in self.input_args_list:
+                out += "_"
+            self.attr[out] = dict(self.attr.get(current) or self._attrs(var), type="wire")
+            self.assigns.append(Assignment(left=out, right=current, is_reg=False))
+            return out
         if current == var:
             return var
         # var's first version becomes var__v1, and the port carries the last one

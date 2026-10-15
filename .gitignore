@@ -15,6 +15,10 @@ tb.py
 *.vcd
 *.fst
 
+# Generated when running the examples in place
+examples/hw/
+examples/syn/
+
 # Packaging
 build/
 dist/

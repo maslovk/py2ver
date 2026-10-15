@@ -1,3 +1,6 @@
+# NOT SUPPORTED YET: lists (data = [], data.append(...)) are not supported.
+# Kept as a target for future work; this script fails today.
+
 from py2ver import Py2ver
 import logging
 
