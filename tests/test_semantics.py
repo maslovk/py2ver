@@ -141,7 +141,17 @@ def _expr():
             lambda t: f"({t[0]} {t[1]} {t[2]})"
         )
         unary = st.tuples(st.sampled_from(["-", "~"]), sub).map(lambda t: f"{t[0]}({t[1]})")
-        return st.one_of(binop, div, shift, unary)
+        mod = st.tuples(sub, sub).map(lambda t: f"({t[0]} % ({t[1]} | 1))")
+        call = st.one_of(
+            sub.map(lambda x: f"abs({x})"),
+            st.tuples(st.sampled_from(["min", "max"]), sub, sub).map(
+                lambda t: f"{t[0]}({t[1]}, {t[2]})"
+            ),
+        )
+        ifexp = st.tuples(sub, st.sampled_from(["<", ">=", "=="]), sub, sub, sub).map(
+            lambda t: f"({t[3]} if {t[0]} {t[1]} {t[2]} else {t[4]})"
+        )
+        return st.one_of(binop, div, shift, unary, mod, call, ifexp)
 
     return st.recursive(leaf, extend, max_leaves=6)
 
@@ -153,7 +163,9 @@ def _designs(draw):
         attr[name] = {"signed": draw(st.integers(0, 1)), "width": draw(st.integers(1, 8))}
     attr["y"] = {"signed": 1, "width": 24}
     cond = f"{draw(_expr())} {draw(st.sampled_from(['<', '<=', '>', '>=', '==', '!=']))} {draw(_expr())}"
-    then, other = draw(_expr()), draw(_expr())
+    then, other, extra = draw(_expr()), draw(_expr()), draw(_expr())
+    aug = draw(st.sampled_from(["+=", "-=", "^=", "*="]))
+    no_else = draw(st.booleans())
 
     def values(m):
         w = m["width"]
@@ -161,14 +173,21 @@ def _designs(draw):
         return st.integers(lo, hi)
 
     vectors = draw(st.lists(st.tuples(*[values(attr[n]) for n in _LEAVES]), min_size=4, max_size=16))
-    src = (
-        "def rand_expr(a, b, c):\n"
-        f"    if {cond}:\n"
-        f"        y = {then}\n"
-        "    else:\n"
-        f"        y = {other}\n"
-        "    return y\n"
-    )
+    if no_else:
+        # if without else keeps y's earlier value; y is updated in place
+        body = (
+            f"    y = {other}\n"
+            f"    if {cond}:\n"
+            f"        y {aug} {then}\n"
+        )
+    else:
+        body = (
+            f"    if {cond}:\n"
+            f"        y = {then}\n"
+            "    else:\n"
+            f"        y = {other}\n"
+        )
+    src = "def rand_expr(a, b, c):\n" + body + f"    y {aug} {extra}\n" + "    return y\n"
     return src, attr, vectors
 
 

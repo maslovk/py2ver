@@ -1,7 +1,9 @@
 import ast
 import functools
+import re
 from typing import Dict, Any, List
-from ast_ir import ModuleIR, Port, Assignment
+from ast_ir import ModuleIR, Port, Assignment, resolve_meta
+from semantics import Unsupported, analyze, parse
 
 try:
     import textwrap
@@ -47,6 +49,8 @@ BINOP_TOKENS = {
     # Verilog by semantics.exact_ir (" // " is not Verilog on its own)
     ast.Div: " / ",
     ast.FloorDiv: " // ",
+    # Python % (sign of the divisor) is lowered by semantics.exact_ir
+    ast.Mod: " % ",
     ast.BitAnd: " & ",
     ast.BitOr: " | ",
     ast.BitXor: " ^ ",
@@ -78,6 +82,13 @@ class FunctionVisitor(ast.NodeVisitor):
         # stack of name substitutions (for loops / SSA)
         # each entry is a dict {var_name: replacement_str}
         self._name_env_stack: List[Dict[str, str]] = []
+
+        # Versioned variables: reassigning y creates y__v2, y__v3, ...; reads
+        # see the latest version. Names declared in attr keep their width for
+        # every version; undeclared ones get an exact inferred width.
+        self._declared = set(self.attr)
+        self._ssa: Dict[str, str] = {}
+        self._ssa_count: Dict[str, int] = {}
 
     # ---------- helpers ----------
     def _attrs(self, name: str) -> Dict[str, Any]:
@@ -113,7 +124,71 @@ class FunctionVisitor(ast.NodeVisitor):
         for env in reversed(self._name_env_stack):
             if name in env:
                 return env[name]
+        return self._ssa.get(name, name)
+
+    def _is_defined(self, name: str) -> bool:
+        return name in self._ssa or any(name in env for env in self._name_env_stack)
+
+    def _infer_meta(self, rhs: str) -> Dict[str, int]:
+        """Exact width/sign of an expression, as semantics.exact_ir computes it."""
+        try:
+            info = analyze(parse(rhs), lambda n: resolve_meta(n, self.attr, {}))
+        except Unsupported:
+            return {"width": 1, "signed": 0}
+        if info.nonneg:
+            return {"width": max(1, info.bits - 1), "signed": 0}
+        return {"width": info.bits, "signed": 1}
+
+    def _new_version(self, var: str) -> str:
+        n = self._ssa_count.get(var, 0) + 1
+        self._ssa_count[var] = n
+        name = var if n == 1 else f"{var}__v{n}"
+        self._ssa[var] = name
         return name
+
+    def _assign_var(self, var: str, rhs: str, is_reg: bool | None = None) -> str:
+        """Assign rhs to a new version of var; returns the version's name."""
+        name = self._new_version(var)
+        if var in self._declared:
+            self.attr[name] = dict(self.attr[var])
+        else:
+            meta = self._infer_meta(rhs)
+            self.attr[name] = {"signed": meta["signed"], "width": meta["width"], "type": "wire"}
+        if is_reg is None:
+            is_reg = self.attr[name].get("type") == "reg"
+        self.assigns.append(Assignment(left=name, right=rhs, is_reg=is_reg))
+        return name
+
+    @staticmethod
+    def _target_name(tgt: ast.expr) -> str:
+        if not isinstance(tgt, ast.Name):
+            raise NotImplementedError(f"Assignment target must be a name, got {ast.unparse(tgt)}")
+        return tgt.id
+
+    def _finalize_output(self, var: str) -> str:
+        """Expose the final version of var on an output port named var."""
+        current = self._resolve_name(var)
+        if var in self.input_args_list:
+            raise NotImplementedError(
+                f"Returning argument '{var}' is not supported; assign it to a new variable first."
+            )
+        if current == var:
+            return var
+        # var's first version becomes var__v1, and the port carries the last one
+        first = f"{var}__v1"
+        ident = re.compile(rf"\b{re.escape(var)}\b")
+        for i, a in enumerate(self.assigns):
+            self.assigns[i] = Assignment(
+                left=first if a.left == var else a.left,
+                right=ident.sub(first, a.right),
+                is_reg=a.is_reg,
+            )
+        if var in self.attr:
+            self.attr[first] = dict(self.attr[var])
+        if var not in self._declared:
+            self.attr[var] = dict(self.attr[current], type="wire")
+        self.assigns.append(Assignment(left=var, right=current, is_reg=False))
+        return var
 
     def _eval_int(self, node: ast.expr) -> int:
         """
@@ -257,6 +332,7 @@ class FunctionVisitor(ast.NodeVisitor):
         return self.visit(node.body[0])
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ModuleIR:
+        node = _Desugar().visit(node)
         self.top_name = node.name
 
         # parse arguments (inputs)
@@ -289,7 +365,17 @@ class FunctionVisitor(ast.NodeVisitor):
                 if seen_return:
                     raise NotImplementedError("Multiple return statements are not supported.")
                 seen_return = True
-                outs = self.visit(item)
+                vals = item.value.elts if isinstance(item.value, ast.Tuple) else [item.value]
+                outs = []
+                for i, v in enumerate(vals):
+                    if isinstance(v, ast.Name):
+                        outs.append(self._finalize_output(v.id))
+                    else:
+                        # Returned expression: give it an output named ret<i>
+                        name = f"ret{i}" if len(vals) > 1 else "ret"
+                        if self._is_defined(name):
+                            raise NotImplementedError(f"Output name '{name}' is already used")
+                        outs.append(self._assign_var(name, self.visit(v)))
                 self.output_args_list = outs
                 for name in outs:
                     meta = self._attrs(name)
@@ -338,6 +424,8 @@ class FunctionVisitor(ast.NodeVisitor):
     def visit_arguments(self, node: ast.arguments):
         values = [self.visit(a) for a in node.args]
         for name in values:
+            self._ssa_count[name] = 1
+            self._ssa[name] = name
             meta = self._attrs(name)
             self.input_args_list.append(name)
             self.input_args_width_list.append(meta['width'])
@@ -418,6 +506,27 @@ class FunctionVisitor(ast.NodeVisitor):
         parts = [f"({self.visit(v)})" for v in node.values]
         return "(" + op_str.join(parts) + ")"
 
+    def visit_IfExp(self, node: ast.IfExp):
+        return (f"(({self.visit(node.test)}) ? ({self.visit(node.body)}) "
+                f": ({self.visit(node.orelse)}))")
+
+    def visit_Call(self, node: ast.Call):
+        """Integer builtins: abs(x), min(a, b, ...), max(a, b, ...)."""
+        if isinstance(node.func, ast.Name) and not node.keywords:
+            fn = node.func.id
+            args = [self.visit(a) for a in node.args]
+            if fn == "abs" and len(args) == 1:
+                x = args[0]
+                return f"((({x}) < 0) ? (-({x})) : ({x}))"
+            if fn in ("min", "max") and len(args) >= 2:
+                op = "<" if fn == "min" else ">"
+                acc = args[0]
+                for a in args[1:]:
+                    # Ties keep the earlier argument, like Python
+                    acc = f"((({a}) {op} ({acc})) ? ({a}) : ({acc}))"
+                return acc
+        raise NotImplementedError(f"Unsupported call: {ast.unparse(node)}")
+
     def visit_While(self, node: ast.While):
         raise NotImplementedError("while-loops are not supported")
 
@@ -429,43 +538,15 @@ class FunctionVisitor(ast.NodeVisitor):
     # ---- for-loops ----
     def visit_For(self, node: ast.For):
         """
-        Handle two cases:
-
-        (A) Accumulator pattern (SSA-style):
-
-            acc = <init>      # already seen earlier in self.assigns
-            for i in range(...):
-                acc = acc + f(i, ...)
-            ...
-
-        -> emit acc_0, acc_1, ..., acc_N and final acc = acc_N.
-
-        (B) Fallback: generic unrolling (no self-updates),
-            as before, for "simple" loops.
+        Unroll `for <var> in range(...)`. Assignments in the body create new
+        versions of their variables, so accumulators (acc = acc + ...) chain
+        naturally across iterations.
         """
         if not isinstance(node.target, ast.Name):
             raise NotImplementedError("Only 'for <var> in range(...)' loops are supported.")
         loop_var = node.target.id
 
         start, stop, step = self._parse_range(node.iter)
-
-        # --- Try to detect accumulator pattern (A) ---
-
-        if (
-            len(node.body) == 1
-            and isinstance(node.body[0], ast.Assign)
-            and len(node.body[0].targets) == 1
-            and isinstance(node.body[0].targets[0], ast.Name)
-        ):
-            assign_node = node.body[0]
-            acc_name = assign_node.targets[0].id
-
-            # RHS must use acc_name (acc = acc + ...)
-            if self._expr_uses_name(assign_node.value, acc_name):
-                self._lower_accumulating_for(node, loop_var, acc_name, start, stop, step)
-                return
-
-        # --- Otherwise, fallback to plain unrolling (B) ---
 
         for val in range(start, stop, step):
             env = {loop_var: str(val)}
@@ -482,91 +563,6 @@ class FunctionVisitor(ast.NodeVisitor):
                         self.generic_visit(stmt)
             finally:
                 self._name_env_stack.pop()
-
-    def _lower_accumulating_for(
-        self,
-        node: ast.For,
-        loop_var: str,
-        acc_name: str,
-        start: int,
-        stop: int,
-        step: int
-    ):
-        """
-        Lower accumulator-style loop into a chain:
-
-            acc_0 = <init>
-            acc_1 = f(acc_0, ...)
-            ...
-            acc_N = f(acc_{N-1}, ...)
-            acc   = acc_N
-        """
-        assign_node = node.body[0]
-
-        # Find initial assignment to acc_name in self.assigns (last one wins)
-        init_idx = None
-        for idx in range(len(self.assigns) - 1, -1, -1):
-            if self.assigns[idx].left == acc_name:
-                init_idx = idx
-                break
-
-        if init_idx is not None:
-            init_assign = self.assigns.pop(init_idx)
-            init_rhs = init_assign.right
-            is_reg = init_assign.is_reg
-        else:
-            # No explicit init seen; use acc itself as initial value.
-            init_rhs = acc_name
-            is_reg = (self._attrs(acc_name).get('type') == 'reg')
-
-        # Declare acc_0
-        prev_name = f"{acc_name}_0"
-        self._clone_attr(acc_name, prev_name)
-        self.assigns.append(
-            Assignment(
-                left=prev_name,
-                right=init_rhs,
-                is_reg=is_reg
-            )
-        )
-
-        curr_name = prev_name
-        iter_values = list(range(start, stop, step))
-
-        for idx, val in enumerate(iter_values):
-            next_name = f"{acc_name}_{idx + 1}"
-            self._clone_attr(acc_name, next_name)
-
-            # For this iteration, acc -> curr_name, loop_var -> val
-            env = {
-                loop_var: str(val),
-                acc_name: curr_name,
-            }
-            self._name_env_stack.append(env)
-            try:
-                rhs_expr = self.visit(assign_node.value)
-            finally:
-                self._name_env_stack.pop()
-
-            self.assigns.append(
-                Assignment(
-                    left=next_name,
-                    right=rhs_expr,
-                    is_reg=is_reg
-                )
-            )
-
-            curr_name = next_name
-
-        # Final acc assignment: acc = acc_N (or acc_0 if loop empty)
-        final_rhs = curr_name
-        self.assigns.append(
-            Assignment(
-                left=acc_name,
-                right=final_rhs,
-                is_reg=is_reg
-            )
-        )
 
     # ---- assignments ----
     def _visit_assign(self, node: ast.Assign):
@@ -612,6 +608,9 @@ class FunctionVisitor(ast.NodeVisitor):
             isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name)
             and node.value.func.id == "abs"
+            and len(node.value.args) == 1
+            and isinstance(node.value.args[0], ast.Name)
+            and f"{node.value.args[0].id}_re" in self.attr
         ):
             if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
                 raise NotImplementedError("abs(...) assignment supports a single name target.")
@@ -632,18 +631,19 @@ class FunctionVisitor(ast.NodeVisitor):
             )
             return
 
-        rhs = self.visit(node.value)
         for tgt in node.targets:
-            left = self.visit(tgt)
-            self._ensure_target_attr(left, node.value)
-            meta = self._attrs(left)
-            self.assigns.append(
-                Assignment(
-                    left=left,
-                    right=rhs,
-                    is_reg=(meta.get('type') == 'reg')
-                )
-            )
+            if isinstance(tgt, ast.Tuple):
+                vals = node.value.elts if isinstance(node.value, ast.Tuple) else None
+                if vals is None or len(vals) != len(tgt.elts):
+                    raise NotImplementedError(
+                        "Tuple assignment needs a tuple of the same length on the right"
+                    )
+                # All right-hand sides are read before anything is assigned
+                rhss = [self.visit(v) for v in vals]
+                for t, rhs in zip(tgt.elts, rhss):
+                    self._assign_var(self._target_name(t), rhs)
+            else:
+                self._assign_var(self._target_name(tgt), self.visit(node.value))
 
     # ---------- nested if/elif/else lowering ----------
     def _eval_stmt_block(self, stmts: List[ast.stmt]) -> Dict[str, str]:
@@ -658,25 +658,37 @@ class FunctionVisitor(ast.NodeVisitor):
         Statement order is respected: later assignments override earlier ones.
         """
         env: Dict[str, str] = {}
-        for s in stmts:
-            if isinstance(s, ast.Assign):
-                if len(s.targets) != 1:
+        # Later statements in the block read values assigned earlier in it
+        self._name_env_stack.append(env)
+        try:
+            for s in stmts:
+                if isinstance(s, ast.Assign):
+                    if len(s.targets) != 1:
+                        raise NotImplementedError(
+                            "Multiple assignment targets are not supported."
+                        )
+                    tgt = s.targets[0]
+                    if isinstance(tgt, ast.Tuple):
+                        vals = s.value.elts if isinstance(s.value, ast.Tuple) else None
+                        if vals is None or len(vals) != len(tgt.elts):
+                            raise NotImplementedError(
+                                "Tuple assignment needs a tuple of the same length on the right"
+                            )
+                        rhss = [self.visit(v) for v in vals]
+                        for t, rhs in zip(tgt.elts, rhss):
+                            env[self._target_name(t)] = f"({rhs})"
+                    else:
+                        env[self._target_name(tgt)] = f"({self.visit(s.value)})"
+                elif isinstance(s, ast.If):
+                    # Recursively lower nested if/elif/else into expressions
+                    for k, v in self._eval_if_expr(s).items():
+                        env[k] = f"({v})"
+                else:
                     raise NotImplementedError(
-                        "Multiple assignment targets are not supported."
+                        f"Unsupported statement type in combinational block: {type(s).__name__}"
                     )
-                lhs = self.visit(s.targets[0])
-                self._ensure_target_attr(lhs, s.value)
-                rhs = self.visit(s.value)
-                env[lhs] = rhs
-            elif isinstance(s, ast.If):
-                # Recursively lower nested if/elif/else into expressions
-                nested_env = self._eval_if_expr(s)
-                # Later statements override earlier ones
-                env.update(nested_env)
-            else:
-                raise NotImplementedError(
-                    f"Unsupported statement type in combinational block: {type(s).__name__}"
-                )
+        finally:
+            self._name_env_stack.pop()
         return env
 
     def _eval_if_expr(self, node: ast.If) -> Dict[str, str]:
@@ -692,15 +704,9 @@ class FunctionVisitor(ast.NodeVisitor):
           * all branches assign to the same set of variables
         """
         branches: List[tuple[str, Dict[str, str]]] = []
-        else_env: Dict[str, str] | None = None
 
         cur = node
         while True:
-            if not cur.orelse:
-                raise NotImplementedError(
-                    "if/elif without final else is not supported (would infer a latch)."
-                )
-
             cond = self.visit(cur.test)
             then_env = self._eval_stmt_block(cur.body)
             branches.append((cond, then_env))
@@ -709,33 +715,33 @@ class FunctionVisitor(ast.NodeVisitor):
             if len(cur.orelse) == 1 and isinstance(cur.orelse[0], ast.If):
                 cur = cur.orelse[0]
                 continue
-            else:
-                # Final else
-                else_env = self._eval_stmt_block(cur.orelse)
-                break
+            else_env = self._eval_stmt_block(cur.orelse) if cur.orelse else {}
+            break
 
-        if else_env is None:
-            raise NotImplementedError("if/elif chain ended without a final else branch.")
-
-        # All branches must assign to the same set of variables
-        key_sets = [set(env.keys()) for _, env in branches] + [set(else_env.keys())]
-        first_keys = key_sets[0]
-        for ks in key_sets[1:]:
-            if ks != first_keys:
-                raise NotImplementedError(
-                    "All branches of if/elif/else must assign to the same set of variables "
-                    f"(got {[sorted(ks) for ks in key_sets]})."
-                )
-
-        # Deterministic variable order: that of the first branch
-        var_order = list(branches[0][1].keys())
+        # Variables in first-assigned order across all branches
+        var_order: List[str] = []
+        for env in [m for _, m in branches] + [else_env]:
+            for k in env:
+                if k not in var_order:
+                    var_order.append(k)
 
         result_env: Dict[str, str] = {}
         for lhs in var_order:
+            def value_in(env: Dict[str, str]) -> str:
+                if lhs in env:
+                    return env[lhs]
+                # Not assigned in this branch: keeps its value from before the if
+                if not self._is_defined(lhs):
+                    raise NotImplementedError(
+                        f"'{lhs}' is assigned in only some branches of an if and has no "
+                        "earlier value (that would infer a latch)."
+                    )
+                return self._resolve_name(lhs)
+
             # Build nested ternary from bottom (else) up
-            rhs = else_env[lhs]
+            rhs = value_in(else_env)
             for cond, then_map in reversed(branches):
-                rhs = f"({cond}) ? ({then_map[lhs]}) : ({rhs})"
+                rhs = f"({cond}) ? ({value_in(then_map)}) : ({rhs})"
             result_env[lhs] = rhs
 
         return result_env
@@ -745,16 +751,8 @@ class FunctionVisitor(ast.NodeVisitor):
         Lower a restricted if/elif/else (with possible nested ifs) into
         per-variable nested ternary expressions.
         """
-        env = self._eval_if_expr(node)
-        for lhs, rhs in env.items():
-            meta = self._attrs(lhs)
-            self.assigns.append(
-                Assignment(
-                    left=lhs,
-                    right=rhs,
-                    is_reg=(meta.get('type') == 'reg')
-                )
-            )
+        for lhs, rhs in self._eval_if_expr(node).items():
+            self._assign_var(lhs, rhs)
 
     # ---- default ----
     def generic_visit(self, node):
@@ -805,3 +803,16 @@ def emit_internal_declarations(module_ir: ModuleIR,
         lines.append(f"{decl_kw} {signed_str}{range_str}{name};")
 
     return "\n".join(lines)
+
+
+class _Desugar(ast.NodeTransformer):
+    """Rewrite `x op= e` as `x = x op e`."""
+
+    def visit_AugAssign(self, node: ast.AugAssign):
+        if not isinstance(node.target, ast.Name):
+            raise NotImplementedError("Augmented assignment target must be a name")
+        value = ast.BinOp(
+            left=ast.Name(id=node.target.id, ctx=ast.Load()), op=node.op, right=node.value
+        )
+        new = ast.Assign(targets=[ast.Name(id=node.target.id, ctx=ast.Store())], value=value)
+        return ast.copy_location(new, node)

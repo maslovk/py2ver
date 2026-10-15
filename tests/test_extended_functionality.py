@@ -171,8 +171,8 @@ def test_complex_expressions_py_vs_sim(assert_python_matches_sim):
     assert_python_matches_sim(unit_complex_expr, attr, [(1, 2, 3), (10, 5, 2), (7, 9, 4)])
 
 
-def test_modulo_operations_not_supported():
-    """Test that modulo operations raise NotImplementedError."""
+def test_modulo_operations_lowered():
+    """Modulo is accepted and emitted for the semantics pass to lower."""
     src = """
 def foo(a, b):
     result = a % b  # Modulo operation
@@ -186,9 +186,8 @@ def foo(a, b):
 
     tree = ast.parse(src)
     
-    # Modulo operations should raise NotImplementedError
-    with pytest.raises(NotImplementedError, match="Unsupported binary op.*Mod"):
-        FunctionVisitor(attr).visit(tree)
+    ir = FunctionVisitor(attr).visit(tree)
+    assert any(" % " in a.right for a in ir.assigns)
 
 def test_list_operations_not_supported():
     """Test that list literals raise NotImplementedError."""

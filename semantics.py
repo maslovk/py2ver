@@ -222,7 +222,8 @@ def analyze(node: Node, meta) -> Info:
     if op in ("/", "//"):
         return Info(a.bits + 1, a.nonneg and b.nonneg)
     if op == "%":
-        return Info(max(a.bits, b.bits), a.nonneg and b.nonneg)
+        # Python: |a % b| < |b|, and the result takes the sign of b
+        return Info(b.bits, b.nonneg)
     if op in ("<<", "<<<"):
         rhs = node.kids[1]
         amount = rhs.value if rhs.kind == "num" else (1 << max(b.bits - 1, 0)) - 1
@@ -348,12 +349,17 @@ class _Emitter:
             q = self._temp(f"({ua}) {vop} ({ub})", ia.bits - 1, signed=False)
             return self._signed_name_of_temp(q)
         sa, sb = self.exact(a), self.exact(b)
+        # Verilog truncates toward zero; Python floors. They differ exactly
+        # when the remainder is nonzero and the operand signs differ.
+        fix = f"((({sa}) % ({sb})) != 0) && ((({sa}) < 0) != (({sb}) < 0))"
         if op == "//":
-            fix = f"((({sa}) % ({sb})) != 0) && ((({sa}) < 0) != (({sb}) < 0))"
             expr = f"(({sa}) / ({sb})) - (({fix}) ? 1 : 0)"
+        elif op == "%":
+            # Python's remainder takes the divisor's sign: add b when they differ
+            expr = f"(({sa}) % ({sb})) + (({fix}) ? ({sb}) : 0)"
         else:
-            expr = f"({sa}) {'%' if op == '%' else '/'} ({sb})"
-        return self._temp(expr, ia.bits + 1)
+            expr = f"({sa}) / ({sb})"
+        return self._temp(expr, max(ia.bits, ib.bits) + 1)
 
     def _signed_name_of_temp(self, name: str) -> str:
         self.views.add(name)

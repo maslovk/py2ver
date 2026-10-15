@@ -40,6 +40,7 @@ from renderer import Renderer
 from syn_report import SynReport, read_report
 from pipeline import pipeline_ir
 from semantics import exact_ir
+from inline import inline_helpers
 from visitor import FunctionVisitor
 from ast_ir import Assignment, ModuleIR, Port
 
@@ -80,6 +81,8 @@ class Py2ver:
             raise RuntimeError(f"Unable to load source for {func}: {e}") from e
 
         tree = ast.parse(source_foo)
+        # Inline calls to your own helper functions and module-level int constants
+        tree = inline_helpers(tree, getattr(func, "__globals__", {}))
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
 

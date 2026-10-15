@@ -61,10 +61,12 @@ def foo(a):
     assert ir.name == "foo"
     # Should have unrolled assignments for i=0,1,2
     assert len(ir.assigns) >= 3
-    # Should have accumulator tracking
-    assert any('acc_0' in assign.left for assign in ir.assigns)
-    assert any('acc_1' in assign.left for assign in ir.assigns)
-    assert any('acc_2' in assign.left for assign in ir.assigns)
+    # One new version of acc per iteration (plus the initial value), and the
+    # output acc carries the last one
+    acc_versions = [x.left for x in ir.assigns if x.left.startswith('acc')]
+    assert len(acc_versions) >= 4
+    assert ir.outputs[0].name == 'acc'
+    assert any(x.left == 'acc' and x.right == 'acc__v4' for x in ir.assigns)
 
 
 def test_if_else_py_vs_sim(assert_python_matches_sim):

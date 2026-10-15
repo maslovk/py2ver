@@ -168,16 +168,28 @@ vectors).
 
 ### Supported Python subset
 
-- Integer arithmetic `+ - * / // & | ^ << >>` (`>>` is arithmetic, like Python),
-  unary `- + ~`, comparisons, `and`/`or`
-- `if` / `elif` / `else`, nested (every chain needs a final `else`, and all
-  branches must assign the same variables)
+- Integer arithmetic `+ - * / // % & | ^ << >>` with Python semantics,
+  unary `- + ~`, comparisons, `and`/`or`, `x if c else y`
+- `abs`, `min`, `max` on integers
+- Assignment, reassignment (`y = y + b`), augmented assignment (`y += b`,
+  `y >>= 1`, ...) and tuple assignment (`a, b = b, a - b`)
+- `if` / `elif` / `else`, nested; a branch may leave out a variable that
+  already had a value (it keeps it), and statements in a branch see earlier
+  ones in the same branch
 - `for i in range(...)` with constant bounds (fully unrolled)
+- Calls to your own helper functions (inlined; helpers may call helpers,
+  must end with a single `return`, and may return a tuple for
+  `x, y = helper(...)`), and module-level integer constants
 - `complex(re, im)` and `abs()` of a complex variable
-- A single `return` of one or more values
+- A single `return` of variables or expressions (an expression output is
+  named `ret`, or `ret0`, `ret1`, ... for several)
 
-Not supported: `while`, calls to other functions, subscripts, list literals,
-multiple `return` statements.
+Not supported: `while`, recursion, early `return`, keyword arguments in
+helper calls, subscripts, list literals, returning an argument unchanged.
+
+Variables you don't list in `attr` get the exact width their values need, so
+they never overflow. A listed variable keeps its declared width for every
+reassignment.
 
 ### How results relate to Python
 
