@@ -19,23 +19,23 @@ SHA_ATTR = {
 
 
 def mixed_ops(a, b, c):
-    # Division operands stay non-negative: Python // floors, Verilog / truncates
+    # Signed floor division and signed/unsigned mixing (see semantics.py)
     p = a * b
     q = p // (c + 1)
     if a > b:
         r = q - c
     else:
         r = q + c
-    s = (r >> 2) - r  # signed only: mixing in unsigned a would make Verilog's >>> logical
+    s = (r >> 2) ^ c
     return r, s
 
 
 MIXED_ATTR = {
-    "a": {"signed": 0, "width": 8, "type": "wire"},
-    "b": {"signed": 0, "width": 8, "type": "wire"},
+    "a": {"signed": 1, "width": 8, "type": "wire"},
+    "b": {"signed": 1, "width": 8, "type": "wire"},
     "c": {"signed": 0, "width": 7, "type": "wire"},
-    "p": {"signed": 0, "width": 16, "type": "wire"},
-    "q": {"signed": 0, "width": 16, "type": "wire"},
+    "p": {"signed": 1, "width": 16, "type": "wire"},
+    "q": {"signed": 1, "width": 16, "type": "wire"},
     "r": {"signed": 1, "width": 16, "type": "wire"},
     "s": {"signed": 1, "width": 16, "type": "wire"},
 }
@@ -189,7 +189,7 @@ def test_pipelined_sha_rounds_match_python_at_full_throughput(assert_python_matc
 @pytest.mark.sim
 def test_pipelined_mixed_ops_match_python(assert_python_matches_sim):
     rng = random.Random(7)
-    vectors = [(rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 126)) for _ in range(40)]
+    vectors = [(rng.randint(-128, 127), rng.randint(-128, 127), rng.randint(0, 126)) for _ in range(40)]
     assert_python_matches_sim(mixed_ops, MIXED_ATTR, vectors, pipeline=2)
 
 

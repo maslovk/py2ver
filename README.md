@@ -156,6 +156,18 @@ Options: `QUARTUS_DIR` (default: `quartus_sh` on `PATH`), `CLK_PERIOD_NS`
 Not supported: `while`, calls to other functions, subscripts, list literals,
 multiple `return` statements.
 
+### How results relate to Python
+
+Every named signal holds the exact Python value of its expression, truncated
+to the signal's declared width and sign (so declare widths large enough for
+what you need to keep). Within an expression, the generated Verilog computes
+what Python does, including signed/unsigned mixing, right shifts of negative
+values, comparisons and `//` (floor division); `/` matches `int(a / b)`.
+Operations whose result depends on high bits (division, right shift,
+comparisons) get exactly-sized intermediate wires (`<name>__t<k>`), and
+unsigned signals are read through signed views (`<name>__s`), so this costs no
+extra hardware. `and`/`or` give 0/1, not Python's operand values.
+
 ### Tests
 
 ```

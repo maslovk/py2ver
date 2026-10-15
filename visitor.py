@@ -43,9 +43,10 @@ BINOP_TOKENS = {
     ast.Add: " + ",
     ast.Sub: " - ",
     ast.Mult: " * ",
-    # Support both / and // in Python, both mapped to Verilog integer division
+    # Python / is truncated toward zero by int(); // floors and is lowered to
+    # Verilog by semantics.exact_ir (" // " is not Verilog on its own)
     ast.Div: " / ",
-    ast.FloorDiv: " / ",
+    ast.FloorDiv: " // ",
     ast.BitAnd: " & ",
     ast.BitOr: " | ",
     ast.BitXor: " ^ ",
@@ -370,7 +371,7 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def visit_UnaryOp(self, node: ast.UnaryOp):
         op = self.visit(node.op)
-        return f"{op}{self.visit(node.operand)}"
+        return f"{op}({self.visit(node.operand)})"
 
     def visit_USub(self, node): return "-"
     def visit_UAdd(self, node): return "+"
@@ -404,7 +405,7 @@ class FunctionVisitor(ast.NodeVisitor):
             token = " >= "
         else:
             raise NotImplementedError(f"Unsupported comparison operator: {type(op).__name__}")
-        return f"({left}{token}{right})"
+        return f"(({left}){token}({right}))"
 
     def visit_BoolOp(self, node: ast.BoolOp):
         """Support 'and' / 'or' conditions."""
@@ -414,7 +415,7 @@ class FunctionVisitor(ast.NodeVisitor):
             op_str = " || "
         else:
             raise NotImplementedError(f"Unsupported boolean operator: {type(node.op).__name__}")
-        parts = [self.visit(v) for v in node.values]
+        parts = [f"({self.visit(v)})" for v in node.values]
         return "(" + op_str.join(parts) + ")"
 
     def visit_While(self, node: ast.While):

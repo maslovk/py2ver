@@ -39,6 +39,7 @@ import tb_runner
 from renderer import Renderer
 from syn_report import SynReport, read_report
 from pipeline import pipeline_ir
+from semantics import exact_ir
 from visitor import FunctionVisitor
 from ast_ir import Assignment, ModuleIR, Port
 
@@ -81,6 +82,11 @@ class Py2ver:
         tree = ast.parse(source_foo)
         f_visitor = FunctionVisitor(attr)
         ir = f_visitor.visit(tree)
+
+        # Rewrite expressions so the Verilog computes what Python computes
+        ir, exact_attr = exact_ir(ir, f_visitor.attr)
+        f_visitor.attr.clear()
+        f_visitor.attr.update(exact_attr)
 
         # Explicit state: an input with {'next': '<output>'} becomes a register
         # loaded from that output every clock and reset to 'init' (default 0).

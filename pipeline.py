@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple
 
-from ast_ir import Assignment, ModuleIR, Port
+from ast_ir import Assignment, ModuleIR, Port, resolve_meta as _meta
 
 _IDENT = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 
@@ -51,20 +51,6 @@ class PipelineResult:
     stage: Dict[str, int] = field(default_factory=dict)
     register_bits: int = 0
     stage_delay: List[float] = field(default_factory=list)
-
-
-def _meta(name: str, attr: Dict[str, Dict[str, Any]], ports: Dict[str, Port]) -> Dict[str, Any]:
-    """Width/sign of a signal, resolved the same way the renderer does."""
-    if name in attr:
-        return dict(attr[name])
-    if name in ports:
-        p = ports[name]
-        return {"width": p.width, "signed": int(p.signed), "type": "wire"}
-    if "_" in name:
-        head, tail = name.rsplit("_", 1)
-        if tail.isdigit():
-            return _meta(head, attr, ports)
-    return {"width": 1, "signed": 0, "type": "wire"}
 
 
 def _rename(expr: str, mapping: Dict[str, str]) -> str:
