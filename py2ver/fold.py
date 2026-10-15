@@ -41,13 +41,30 @@ def _assigned(stmts: List[ast.stmt]) -> Set[str]:
     return out
 
 
+def _const(node: ast.expr) -> int:
+    """A constant int expression: literals, len() of a literal list, + - * //."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "len" \
+            and len(node.args) == 1 and isinstance(node.args[0], (ast.List, ast.Tuple)):
+        return len(node.args[0].elts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv)):
+        a, b = _const(node.left), _const(node.right)
+        return {ast.Add: a + b, ast.Sub: a - b, ast.Mult: a * b}.get(type(node.op), None) \
+            if not isinstance(node.op, ast.FloorDiv) else a // b
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_const(node.operand)
+    value = ast.literal_eval(node)
+    if not isinstance(value, int):
+        raise ValueError("not an int")
+    return value
+
+
 def _range_values(it: ast.expr) -> Optional[List[int]]:
     if not (isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and it.func.id == "range"
             and not it.keywords):
         return None
     try:
-        return list(range(*[ast.literal_eval(a) for a in it.args]))
-    except (ValueError, TypeError):
+        return list(range(*[_const(a) for a in it.args]))
+    except (ValueError, TypeError, ZeroDivisionError):
         return None
 
 
@@ -90,11 +107,29 @@ def find_loop(fd: ast.FunctionDef, loop: Any) -> Tuple[int, ast.For, List[int]]:
     return max(loops, key=lambda x: len(x[2]))
 
 
+def _list_writes(stmts: List[ast.stmt]) -> Set[str]:
+    """Lists whose elements the statements assign (xs[i] = ..., xs[i] += ...)."""
+    out: Set[str] = set()
+    for s in stmts:
+        for n in ast.walk(s):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target] \
+                if isinstance(n, ast.AugAssign) else []
+            for t in targets:
+                if isinstance(t, ast.Subscript):
+                    if not isinstance(t.value, ast.Name) or isinstance(t.slice, ast.Slice):
+                        raise NotImplementedError(
+                            "A folded loop assigns list elements as xs[i] = ... only")
+                    out.add(t.value.id)
+    return out
+
+
 def fold_loop(tree: ast.Module, loop: Any, unroll: int,
-              widths: Dict[str, Dict[str, Any]]) -> Tuple[ast.Module, Dict[str, Any]]:
+              widths: Dict[str, Dict[str, Any]],
+              lists: Dict[str, int]) -> Tuple[ast.Module, Dict[str, Any]]:
     """
     Rewrite the module's first function with the loop folded. `widths` is
-    the translator's attr for the unfolded function (to size registers).
+    the translator's attr for the unfolded function (to size registers) and
+    `lists` its list lengths.
     Returns (tree, info): info has 'phases', 'phase' (the phase port name),
     'regs' ({register: next value}) and 'attr' (formats of the new signals).
     """
@@ -111,19 +146,27 @@ def fold_loop(tree: ast.Module, loop: Any, unroll: int,
     before, after = fd.body[:index], fd.body[index + 1:]
     if k in {n.id for s in after for n in ast.walk(s) if isinstance(n, ast.Name)}:
         raise NotImplementedError(f"The folded loop's variable '{k}' is used after the loop")
-    for s in node.body:
-        for n in ast.walk(s):
-            if (isinstance(n, (ast.Assign, ast.AugAssign))
-                    and any(isinstance(t, ast.Subscript)
-                            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))):
-                raise NotImplementedError("A folded loop can't assign list elements yet")
     params = [a.arg for a in fd.args.args]
-    carried = sorted((_assigned(node.body) - {k}) & (_assigned(before) | set(params)))
+    defined = _assigned(before) | set(params)
+    carried = sorted((_assigned(node.body) - {k}) & defined)
+    # A list whose elements the loop assigns is carried element by element
+    carried_lists = sorted(_list_writes(node.body) & defined)
+    for c in carried_lists:
+        if c in carried:
+            raise NotImplementedError(f"A folded loop can't both assign list '{c}' and its elements")
+        if c not in lists:
+            raise NotImplementedError(f"Can't tell the length of list '{c}'")
     sizes = carried_widths(widths, carried)
+    for c in carried_lists:
+        elems = carried_widths(widths, [f"{c}_{i}" for i in range(lists[c])])
+        signed = any(m["signed"] for m in elems.values())
+        sizes[c] = {"signed": int(signed), "type": "wire", "length": lists[c],
+                    "width": max(m["width"] + (1 if signed and not m["signed"] else 0)
+                                 for m in elems.values())}
 
     used = {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)} | set(params)
     phase = _fresh("fphase", used)
-    regs = {c: (_fresh(f"fc_{c}", used), _fresh(f"fcn_{c}", used)) for c in carried}
+    regs = {c: (_fresh(f"fc_{c}", used), _fresh(f"fcn_{c}", used)) for c in carried + carried_lists}
 
     def name(n: str, store: bool = False) -> ast.Name:
         return ast.Name(id=n, ctx=ast.Store() if store else ast.Load())
@@ -131,8 +174,15 @@ def fold_loop(tree: ast.Module, loop: Any, unroll: int,
     first = ast.Compare(left=name(phase), ops=[ast.Eq()], comparators=[ast.Constant(0)])
     body: List[ast.stmt] = list(before)
     for c, (reg, _) in regs.items():
-        body.append(ast.Assign(targets=[name(c, True)],
-                               value=ast.IfExp(test=copy.deepcopy(first), body=name(c), orelse=name(reg))))
+        if c in carried_lists:            # element by element: [c[i] if phase 0 else reg[i], ...]
+            value = ast.List(elts=[ast.IfExp(
+                test=copy.deepcopy(first),
+                body=ast.Subscript(value=name(c), slice=ast.Constant(i), ctx=ast.Load()),
+                orelse=ast.Subscript(value=name(reg), slice=ast.Constant(i), ctx=ast.Load()))
+                for i in range(lists[c])], ctx=ast.Load())
+        else:
+            value = ast.IfExp(test=copy.deepcopy(first), body=name(c), orelse=name(reg))
+        body.append(ast.Assign(targets=[name(c, True)], value=value))
     start, step = values[0], (values[1] - values[0]) if len(values) > 1 else 1
     base = phase
     if unroll > 1:                       # first iteration of this clock: phase * U, once
@@ -147,7 +197,9 @@ def fold_loop(tree: ast.Module, loop: Any, unroll: int,
         body.append(ast.Assign(targets=[name(k, True)], value=kv))
         body += copy.deepcopy(node.body)
     for c, (_, nxt) in regs.items():
-        body.append(ast.Assign(targets=[name(nxt, True)], value=name(c)))
+        value = (ast.Call(func=name("list"), args=[name(c)], keywords=[]) if c in carried_lists
+                 else name(c))
+        body.append(ast.Assign(targets=[name(nxt, True)], value=value))
     ret = after[-1] if after and isinstance(after[-1], ast.Return) else None
     if ret is None or ret.value is None:
         raise NotImplementedError("A function with a folded loop must end with 'return ...'")
@@ -168,8 +220,13 @@ def fold_loop(tree: ast.Module, loop: Any, unroll: int,
     ast.fix_missing_locations(tree)
 
     attr = {phase: {"signed": 0, "width": max(1, (phases - 1).bit_length()), "type": "wire"}}
+    ports: Dict[str, str] = {}               # register port -> its next value's port
     for c, (reg, nxt) in regs.items():
         attr[reg] = dict(sizes[c])
-        attr[nxt] = dict(sizes[c])
-    return tree, {"phases": phases, "phase": phase, "loop": k,
-                  "regs": {reg: nxt for reg, nxt in regs.values()}, "attr": attr}
+        attr[nxt] = {key: v for key, v in sizes[c].items() if key != "length"}
+        if c in carried_lists:
+            ports.update({f"{reg}_{i}": f"{nxt}_{i}" for i in range(lists[c])})
+        else:
+            ports[reg] = nxt
+    return tree, {"phases": phases, "phase": phase, "loop": k, "regs": ports,
+                  "params": {phase} | {reg for reg, _ in regs.values()}, "attr": attr}

@@ -134,6 +134,20 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
     return fe
 
 
+def _drop_bytecode(directory: Path, module: str) -> None:
+    """
+    Remove the cached bytecode of a testbench module before rewriting it:
+    Python checks a .pyc only by the source's size and mtime (in seconds), so
+    a rewrite of the same size within a second would run the old testbench.
+    """
+    for p in (directory / "__pycache__").glob(f"{module}.*.pyc"):
+        try:
+            log.debug("Removing stale pycache file: %s", p)
+            p.unlink()
+        except OSError as e:
+            log.warning("Failed to remove %s: %s", p, e)
+
+
 def expand_args(call_inputs: List[str], cplx_params: set, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
     """Arguments as the caller gives them -> as the ports take them (a complex
     argument as its real and imaginary parts)."""
@@ -193,7 +207,7 @@ class Py2ver:
             unfolded = FunctionVisitor(attr)
             unfolded.visit(copy.deepcopy(tree))
             loop = fe.hw_name.get(fold, fold) if isinstance(fold, str) else fold
-            folded, info = fold_loop(tree, loop, unroll, unfolded.attr)
+            folded, info = fold_loop(tree, loop, unroll, unfolded.attr, dict(unfolded._lists))
             if info["phases"] > 1:                 # (all iterations in one clock: nothing to fold)
                 tree, self._fold = folded, info
                 attr = dict(attr, **info["attr"])
@@ -211,8 +225,8 @@ class Py2ver:
         # loaded from that output every clock and reset to 'init' (default 0).
         self.func = func
         # Parameters as ports: (param, [ports] for a list argument, or None)
-        fold_ports = {self._fold["phase"], *self._fold["regs"]} if self._fold else set()
-        self.arg_groups = [g for g in f_visitor.arg_groups if g[0] not in fold_ports]
+        fold_params = self._fold["params"] if self._fold else set()
+        self.arg_groups = [g for g in f_visitor.arg_groups if g[0] not in fold_params]
         self.state_map, self.state_init, self.state_params = self._parse_state(
             attr, dict(self.arg_groups)
         )
@@ -268,6 +282,7 @@ class Py2ver:
                            if attr.get(p, {}).get("frac") is not None}
         self._fx_out = {n: f for n in self.output_args_list
                         if (f := self._fx_frac(n)) is not None}
+        self._serial = self._serial_ports(attr)
 
         # Raw IR bit widths (core widths)
         self.input_args_bits = sum(self.input_args_width_list)
@@ -914,6 +929,7 @@ class Py2ver:
             "tx_bytes": tx_bytes,
             "requests": repr(requests),
         })
+        _drop_bytecode(project_dir, "tb_hw")
         (project_dir / "tb_hw.py").write_text(tb_src, encoding="utf-8")
 
         sources = (
@@ -1088,20 +1104,57 @@ class Py2ver:
             )
         return "reg_out"
 
+    def _serial_ports(self, attr: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Lists the stream wrapper moves one element per transfer ('serial' in
+        attr): {'in': {param: [ports]}, 'out': {name: [ports]}, 'm', 'l'}
+        (m inputs per call, l results per call).
+        """
+        sin = {p: ports for p, ports in self.arg_groups
+               if ports and attr.get(p, {}).get("serial") and ports[0] in self.input_args_list}
+        for p, _ in self.arg_groups:
+            if attr.get(p, {}).get("serial") and p not in sin:
+                raise ValueError(f"'serial' input '{p}' must be a list input (not state)")
+        sout: Dict[str, List[str]] = {}
+        for name, meta in attr.items():
+            if not (isinstance(meta, dict) and meta.get("serial")) or name in dict(self.arg_groups):
+                continue
+            ports = [n for n in self.output_args_list if re.fullmatch(rf"{re.escape(name)}_\d+", n)]
+            if not ports:
+                raise ValueError(f"'serial' output '{name}' must be a returned list")
+            sout[name] = sorted(ports, key=lambda n: int(n.rsplit("_", 1)[1]))
+        lengths_in = {len(v) for v in sin.values()}
+        lengths_out = {len(v) for v in sout.values()}
+        if len(lengths_in) > 1 or len(lengths_out) > 1:
+            raise ValueError("Serial inputs (and serial outputs) must all have the same length")
+        return {"in": sin, "out": sout, "m": lengths_in.pop() if sin else 1,
+                "l": lengths_out.pop() if sout else 1}
+
     def stream_wrapper(self) -> Path:
         """
         Write hdl/<name>_stream.v: the module behind a valid/ready interface
         (clk, rst, s_valid/s_ready/s_<input>, m_valid/m_ready/m_<output>).
+        Lists marked 'serial' take or give one element per transfer.
         """
         mode = self._stream_mode()
 
-        def rng(name: str) -> str:
+        def meta(name: str) -> Tuple[int, bool]:
             m = self.attr.get(name, {})
-            w = int(m.get("width", 1))
-            sig = "signed " if int(m.get("signed", 0)) == 1 else ""
-            return f"{sig}[{w - 1}:0]"
+            return int(m.get("width", 1)), int(m.get("signed", 0)) == 1
 
+        def rng(name: str) -> str:
+            w, sgn = meta(name)
+            return f"{'signed ' if sgn else ''}[{w - 1}:0]"
+
+        def joint(ports: List[str]) -> str:
+            """A range holding every element: signed if any is (unsigned ones then need a bit more)."""
+            signed = any(meta(n)[1] for n in ports)
+            w = max(meta(n)[0] + (1 if signed and not meta(n)[1] else 0) for n in ports)
+            return f"{'signed ' if signed else ''}[{w - 1}:0]"
+
+        serial = self._serial["in"] or self._serial["out"]
         ctx = {
+            "module_name": f"{self.t_name}_blocks" if serial else f"{self.t_name}_stream",
             "name": self.t_name,
             "mode": mode,
             "stages": self.pipeline_stages,
@@ -1115,8 +1168,30 @@ class Py2ver:
             "has_vin": self._has_vin,
             "phases": getattr(self, "ram_phases", 1),
         }
+        text = self.get_template("stream_wrapper.txt").render(ctx)
+        if serial:
+            s_in = [p for ports in self._serial["in"].values() for p in ports]
+            s_out = [p for ports in self._serial["out"].values() for p in ports]
+            plain_in = [n for n in self.input_args_list if n not in s_in]
+            plain_out = [n for n in self.output_args_list if n not in s_out]
+            sin = [{"name": p, "range": rng(ports[0])} for p, ports in self._serial["in"].items()]
+            sout = [{"name": n, "range": joint(ports)} for n, ports in self._serial["out"].items()]
+            text += self.get_template("serial_wrapper.txt").render({
+                "name": self.t_name,
+                "m_in": self._serial["m"], "l_out": self._serial["l"],
+                "serial_in": list(self._serial["in"]), "serial_out": list(self._serial["out"]),
+                "in_decls": [f"{s['range']} s_{s['name']}" for s in sin]
+                            + [f"{rng(n)} s_{n}" for n in plain_in],
+                "out_decls": [f"{s['range']} m_{s['name']}" for s in sout]
+                             + [f"{rng(n)} m_{n}" for n in plain_out],
+                "block_in": [{"port": n, "range": rng(n)} for n in self.input_args_list],
+                "block_out": [{"port": n, "range": rng(n)} for n in self.output_args_list],
+                "serial_in_ports": sin, "serial_out_ports": sout,
+                "plain_in": [{"port": n, "range": rng(n)} for n in plain_in],
+                "plain_out": [{"port": n, "range": rng(n)} for n in plain_out],
+            })
         path = self.hdl_dir / f"{self.t_name}_stream.v"
-        path.write_text(self.get_template("stream_wrapper.txt").render(ctx), encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
         log.info("Stream wrapper (%s) written to %s", mode, path)
         return path
 
@@ -1140,6 +1215,21 @@ class Py2ver:
             vecs = [self._input_vector(tuple(v)) for v in vectors]
         masks = [(1 << w) - 1 for w in self.input_args_width_list]
         vecs = [tuple(v & m for v, m in zip(vec, masks)) for vec in vecs]
+        calls = len(vecs)
+        in_names, out_names = self.input_args_list, self.output_args_list
+        ser = self._serial
+        s_in = [p for ports in ser["in"].values() for p in ports]
+        s_out = [p for ports in ser["out"].values() for p in ports]
+        if ser["in"]:
+            # One call -> m element transfers (serial lists one element each)
+            plain = [n for n in in_names if n not in s_in]
+            idx = {n: i for i, n in enumerate(self.input_args_list)}
+            vecs = [tuple(vec[idx[ports[k]]] for ports in ser["in"].values())
+                    + tuple(vec[idx[n]] for n in plain)
+                    for vec in vecs for k in range(ser["m"])]
+            in_names = list(ser["in"]) + plain
+        if ser["out"]:
+            out_names = list(ser["out"]) + [n for n in out_names if n not in s_out]
 
         wrapper = self.stream_wrapper()
         results_path = self.outdir / RESULTS_PATH
@@ -1151,11 +1241,16 @@ class Py2ver:
             "valid_p": float(valid),
             "ready_p": float(ready),
             "seed": int(seed),
-            "max_cycles": 20 * len(vecs) + 100 + 4 * self.pipeline_stages,
-            "in_names": self.input_args_list,
-            "out_args": self.output_args_list,
-            "out_meta": self.out_meta,
+            "max_cycles": (20 + getattr(self, "ram_phases", 1)) * len(vecs) * ser["l"]
+                          + 100 + 4 * self.pipeline_stages,
+            "in_names": in_names,
+            "out_args": out_names,
+            "n_results": calls * ser["l"],
+            "out_meta": {**self.out_meta, **{n: {"signed": int(any(
+                self.attr.get(p, {}).get("signed", 0) for p in ports))}
+                for n, ports in ser["out"].items()}},
         })
+        _drop_bytecode(self.outdir, "tb_handshake")
         (self.outdir / "tb_handshake.py").write_text(tb_src, encoding="utf-8")
         tb_runner.run_cocotb(
             f"{self.t_name}_stream", [self.hdl_dir / "main.v", wrapper], "tb_handshake",
@@ -1168,11 +1263,22 @@ class Py2ver:
             rows = payload["outs"]
             # Clocks from reset release to the last result taken
             self.handshake_cycles = payload["cycles"]
-        if len(rows) != len(vecs):
+        if len(rows) != calls * ser["l"]:
             raise RuntimeError(
-                f"Stream wrapper returned {len(rows)} results for {len(vecs)} inputs"
+                f"Stream wrapper returned {len(rows)} results for {calls * ser['l']} expected"
             )
-        return self._rows_to_outputs(rows, len(vecs))
+        if ser["out"]:
+            # l element transfers -> one call's outputs
+            blocks = []
+            for c in range(calls):
+                group = rows[c * ser["l"]:(c + 1) * ser["l"]]
+                row = dict(group[0])
+                for name, ports in ser["out"].items():
+                    for k, port in enumerate(ports):
+                        row[port] = group[k][name]
+                blocks.append(row)
+            rows = blocks
+        return self._rows_to_outputs(rows, calls)
 
     # ------------------------------------------------------------------------
     # Standalone synthesis (area / timing of the core only, no board)
@@ -1581,16 +1687,7 @@ class Py2ver:
             except OSError as e:
                 log.warning("Failed to remove sim_build: %s", e)
 
-        # 🔥 Remove stale compiled tb.py so Python can't reuse old bytecode
-        pycache_dir = self.outdir / "__pycache__"
-        if pycache_dir.exists():
-            for p in pycache_dir.glob("tb.*.pyc"):
-                try:
-                    log.debug("Removing stale pycache file: %s", p)
-                    p.unlink()
-                except OSError as e:
-                    log.warning("Failed to remove %s: %s", p, e)
-
+        _drop_bytecode(self.outdir, "tb")
         write_tb()
 
         # Run cocotb-based simulation

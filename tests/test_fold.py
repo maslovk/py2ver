@@ -117,10 +117,11 @@ def test_bad_folds_raise_clearly(monkeypatch, tmp_path, kwargs, match):
         Py2ver(fir, FIR, **kwargs)
 
 
-def test_list_writes_in_a_folded_loop_are_rejected(monkeypatch, tmp_path):
+def test_a_folded_loop_can_write_list_elements(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(NotImplementedError, match="can't assign list elements"):
-        Py2ver(writes_list, {"xs": dict(I16, length=4)}, fold="i")
+    p = Py2ver(writes_list, {"xs": dict(I16, length=4)}, fold="i")
+    assert p.ram_phases == 4 and len(p._fold["regs"]) == 4     # one register per element
+    assert p.output_args_list == [f"ys_{i}" for i in range(4)]
 
 
 @pytest.mark.sim

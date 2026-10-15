@@ -17,7 +17,7 @@
 // The result of each input is registered; with state, the state advances
 // exactly once per input taken.
 {% endif %}
-module {{ name }}_stream (
+module {{ module_name }} (
     input  clk,
     input  rst,
     input  s_valid,

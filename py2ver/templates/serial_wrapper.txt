@@ -1,0 +1,161 @@
+
+// {{ name }}_stream: {{ name }} with serial list ports, for multi-rate streams.
+//
+{% if m_in > 1 %}
+// Serial inputs ({{ serial_in | join(", ") }}): {{ m_in }} transfers make one call of
+// {{ name }}, element 0 first. Other inputs are taken with the last element.
+{% endif %}
+{% if l_out > 1 %}
+// Serial outputs ({{ serial_out | join(", ") }}): each result is {{ l_out }} transfers,
+// element 0 first; other outputs repeat on each of them.
+{% endif %}
+// Handshakes as in {{ name }}_blocks: a transfer happens on a clock edge
+// where valid && ready.
+module {{ name }}_stream (
+    input  clk,
+    input  rst,
+    input  s_valid,
+    output s_ready,
+{% for d in in_decls %}
+    input  {{ d }},
+{% endfor %}
+    output m_valid,
+    input  m_ready{% for d in out_decls %},
+    output {{ d }}{% endfor %}
+
+);
+
+    // ---- inputs: elements -> blocks
+    wire b_s_valid, b_s_ready;
+{% for p in block_in %}
+    wire {{ p.range }} b_s_{{ p.port }};
+{% endfor %}
+{% if m_in > 1 %}
+    reg [{{ (m_in - 1).bit_length() - 1 }}:0] in_count;
+    reg in_full;
+{% for s in serial_in_ports %}
+{% for k in range(m_in) %}
+    reg {{ s.range }} {{ s.name }}_buf{{ k }};
+{% endfor %}
+{% endfor %}
+{% for p in plain_in %}
+    reg {{ p.range }} {{ p.port }}_buf;
+{% endfor %}
+    assign b_s_valid = in_full;
+    assign s_ready = !in_full || b_s_ready;      // a block handed on frees the buffer
+    always @(posedge clk) begin
+        if (rst) begin
+            in_count <= 0;
+            in_full  <= 1'b0;
+        end else begin
+            if (in_full && b_s_ready)
+                in_full <= 1'b0;
+            if (s_valid && s_ready) begin
+{% for s in serial_in_ports %}
+{% for k in range(m_in - 1) %}
+                {{ s.name }}_buf{{ k }} <= {{ s.name }}_buf{{ k + 1 }};
+{% endfor %}
+                {{ s.name }}_buf{{ m_in - 1 }} <= s_{{ s.name }};
+{% endfor %}
+{% for p in plain_in %}
+                {{ p.port }}_buf <= s_{{ p.port }};
+{% endfor %}
+                if (in_count == {{ m_in - 1 }}) begin
+                    in_count <= 0;
+                    in_full  <= 1'b1;
+                end else
+                    in_count <= in_count + 1'b1;
+            end
+        end
+    end
+{% for s in serial_in_ports %}
+{% for k in range(m_in) %}
+    assign b_s_{{ s.name }}_{{ k }} = {{ s.name }}_buf{{ k }};
+{% endfor %}
+{% endfor %}
+{% for p in plain_in %}
+    assign b_s_{{ p.port }} = {{ p.port }}_buf;
+{% endfor %}
+{% else %}
+    assign b_s_valid = s_valid;
+    assign s_ready = b_s_ready;
+{% for p in block_in %}
+    assign b_s_{{ p.port }} = s_{{ p.port }};
+{% endfor %}
+{% endif %}
+
+    // ---- the core behind its block handshake
+    wire b_m_valid, b_m_ready;
+{% for p in block_out %}
+    wire {{ p.range }} b_m_{{ p.port }};
+{% endfor %}
+    {{ name }}_blocks u_blocks (
+        .clk(clk),
+        .rst(rst),
+        .s_valid(b_s_valid),
+        .s_ready(b_s_ready),
+{% for p in block_in %}
+        .s_{{ p.port }}(b_s_{{ p.port }}),
+{% endfor %}
+        .m_valid(b_m_valid),
+        .m_ready(b_m_ready){% for p in block_out %},
+        .m_{{ p.port }}(b_m_{{ p.port }}){% endfor %}
+
+    );
+
+    // ---- outputs: blocks -> elements
+{% if l_out > 1 %}
+    reg [{{ (l_out - 1).bit_length() - 1 }}:0] out_idx;
+    reg out_busy;
+{% for s in serial_out_ports %}
+{% for k in range(l_out) %}
+    reg {{ s.range }} {{ s.name }}_obuf{{ k }};
+{% endfor %}
+{% endfor %}
+{% for p in plain_out %}
+    reg {{ p.range }} {{ p.port }}_obuf;
+{% endfor %}
+    wire last_taken = out_busy && m_ready && (out_idx == {{ l_out - 1 }});
+    assign b_m_ready = !out_busy || last_taken;
+    assign m_valid = out_busy;
+    always @(posedge clk) begin
+        if (rst) begin
+            out_busy <= 1'b0;
+            out_idx  <= 0;
+        end else if (b_m_valid && b_m_ready) begin
+            out_busy <= 1'b1;
+            out_idx  <= 0;
+{% for s in serial_out_ports %}
+{% for k in range(l_out) %}
+            {{ s.name }}_obuf{{ k }} <= b_m_{{ s.name }}_{{ k }};
+{% endfor %}
+{% endfor %}
+{% for p in plain_out %}
+            {{ p.port }}_obuf <= b_m_{{ p.port }};
+{% endfor %}
+        end else if (out_busy && m_ready) begin
+            if (out_idx == {{ l_out - 1 }})
+                out_busy <= 1'b0;
+            else
+                out_idx <= out_idx + 1'b1;
+        end
+    end
+{% for s in serial_out_ports %}
+    assign m_{{ s.name }} =
+{% for k in range(l_out - 1) %}
+        (out_idx == {{ k }}) ? {{ s.name }}_obuf{{ k }} :
+{% endfor %}
+        {{ s.name }}_obuf{{ l_out - 1 }};
+{% endfor %}
+{% for p in plain_out %}
+    assign m_{{ p.port }} = {{ p.port }}_obuf;
+{% endfor %}
+{% else %}
+    assign m_valid = b_m_valid;
+    assign b_m_ready = m_ready;
+{% for p in block_out %}
+    assign m_{{ p.port }} = b_m_{{ p.port }};
+{% endfor %}
+{% endif %}
+
+endmodule

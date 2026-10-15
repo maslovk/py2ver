@@ -69,7 +69,7 @@ async def tb_handshake(dut):
         if taken:
             presenting = False
             i += 1
-        if len(outs) == len(VECTORS):
+        if len(outs) == {{ n_results }}:
             break
 
     await save_results({"outs": outs, "cycles": cycles})

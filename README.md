@@ -339,8 +339,10 @@ A 16-tap integer FIR on the DE0-Nano's EP4CE22 (Quartus, `SYN()`):
 | `fold='k'` | 551 | 2 | 68 MHz | 4.2 M |
 | `fold='k', unroll=4` | 637 | 8 | 63 MHz | 16 M |
 
-A folded loop can't assign list elements yet, and folding can't be combined
-with `pipeline`, block RAM or `'reg'` signals.
+A folded loop may assign list elements (`ys[i] = ...`): the list becomes a
+register per element. Its bounds may be constant expressions
+(`range(len(TAPS))`). One loop per design is folded, and folding can't be
+combined with `pipeline`, block RAM or `'reg'` signals.
 
 ### Valid/ready streaming interface
 
@@ -363,6 +365,37 @@ in simulation with inputs and readiness that come and go at random:
 got = p.TB_handshake()(vectors, valid=0.6, ready=0.5, seed=1)
 assert got == p.PY_batch()(vectors)        # PY_stream for designs with state
 ```
+
+### Multi-rate streams (decimation, interpolation)
+
+A decimator takes several input samples per output, an interpolator gives
+several outputs per input. Write one call of the function for one block: a
+decimate-by-4 filter takes a list of 4 new samples, an interpolate-by-4
+filter returns a list of 4. Then mark the list `'serial': True` in attr, and
+the stream wrapper moves it one element per handshake:
+
+```python
+def decimate(xs, delay):                 # xs: 4 new samples, oldest first
+    window = xs[::-1] + delay
+    acc = 0.0
+    for k in range(N):
+        acc += TAPS[k] * window[k]
+    new_delay = window[:N - 1]
+    return acc, new_delay
+
+attr = {'xs': dict(Q15, length=4, serial=True), 'delay': dict(Q15, length=N - 1, next='new_delay'), ...}
+p = Py2ver(decimate, attr, fold='k', unroll=N // 4)
+```
+
+`<name>_stream` then has a single `s_xs` port: 4 transfers make one call,
+element 0 first (other inputs are taken with the last element). For a
+`'serial'` returned list, each result is that many transfers on one `m_<name>`
+port (other outputs repeat on each). The core itself and the Python
+references are per block as before (`PY_stream()` takes blocks);
+`TB_handshake()` feeds and collects the wrapper one element at a time and
+gives the results per block. Folding the filter so it takes as many clocks
+per block as samples per block (`unroll=N // 4` above) keeps up with one
+sample per clock while sharing the multipliers.
 
 ### Area and timing (`SYN()`)
 
@@ -533,7 +566,8 @@ signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
-table, a 32-tap FIR folded onto 4 multipliers, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+table, a 32-tap FIR folded onto 4 multipliers, a decimate-by-4 filter fed one
+sample per handshake, a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```
