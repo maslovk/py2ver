@@ -189,8 +189,8 @@ def foo(a, b):
     ir = FunctionVisitor(attr).visit(tree)
     assert any(" % " in a.right for a in ir.assigns)
 
-def test_list_operations_not_supported():
-    """Test that list literals raise NotImplementedError."""
+def test_list_literal_and_constant_index():
+    """A list literal indexed by a constant is just its element."""
     src = """
 def foo(a):
     my_list = [1, 2, 3]  # List literal
@@ -204,6 +204,5 @@ def foo(a):
 
     tree = ast.parse(src)
     
-    # List literals should raise NotImplementedError
-    with pytest.raises(NotImplementedError, match="Non-empty list literals are not supported"):
-        FunctionVisitor(attr).visit(tree)
+    ir = FunctionVisitor(attr).visit(tree)
+    assert [a.right for a in ir.assigns if a.left == "result"] == ["my_list_0"]

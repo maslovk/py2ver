@@ -94,7 +94,13 @@ class Py2ver:
         # Explicit state: an input with {'next': '<output>'} becomes a register
         # loaded from that output every clock and reset to 'init' (default 0).
         self.func = func
-        self.state_map, self.state_init = self._parse_state(attr)
+        # Parameters as ports: (param, [ports] for a list argument, or None)
+        self.arg_groups = list(f_visitor.arg_groups)
+        self.state_map, self.state_init, self.state_params = self._parse_state(
+            attr, dict(self.arg_groups)
+        )
+        # State updated in place and returned (next = itself) leaves on <name>_out
+        self.state_map = {s: f_visitor.output_renames.get(n, n) for s, n in self.state_map.items()}
         if self.state_map:
             ir = self._lower_state(ir, f_visitor.attr)
 
@@ -224,14 +230,32 @@ class Py2ver:
         return self._tpl_cache[filename]
 
     @staticmethod
-    def _parse_state(attr: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, int]]:
+    def _parse_state(attr: Dict[str, Any], groups: Dict[str, Any]):
+        """
+        Port-level state map (state port -> next-state output) and reset values.
+        A list argument with 'next' maps element by element (xs_k -> nxt_k);
+        its 'init' may be one value or a list.
+        """
         state_map: Dict[str, str] = {}
         state_init: Dict[str, int] = {}
+        params: List[str] = []
         for name, meta in attr.items():
-            if isinstance(meta, dict) and "next" in meta:
-                state_map[name] = str(meta["next"])
-                state_init[name] = int(meta.get("init", 0))
-        return state_map, state_init
+            if not (isinstance(meta, dict) and "next" in meta):
+                continue
+            params.append(name)
+            nxt, init = str(meta["next"]), meta.get("init", 0)
+            ports = groups.get(name)
+            if ports is None:
+                state_map[name] = nxt
+                state_init[name] = int(init)
+                continue
+            inits = list(init) if isinstance(init, (list, tuple)) else [init] * len(ports)
+            if len(inits) != len(ports):
+                raise ValueError(f"'init' of '{name}' needs {len(ports)} values")
+            for k, port in enumerate(ports):
+                state_map[port] = f"{nxt}_{k}"
+                state_init[port] = int(inits[k])
+        return state_map, state_init, params
 
     def _lower_state(self, ir: ModuleIR, attr: Dict[str, Dict[str, Any]]) -> ModuleIR:
         """
@@ -529,7 +553,7 @@ class Py2ver:
         baud = int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE))
         timeout = float(self.syn_attr.get("UART_TIMEOUT", 1.0))
 
-        input_bytes = self._pack_inputs(*in_arg)
+        input_bytes = self._pack_inputs(*self._flatten_args(in_arg))
         output_bytes_expected = (self.tx_width + 7) // 8
 
         try:
@@ -597,7 +621,7 @@ class Py2ver:
             return []
         project_dir = self.gen_hw_project()
         tx_bytes = (self.tx_width + 7) // 8
-        requests = [list(self._pack_inputs(*v)) for v in vectors]
+        requests = [list(self._pack_inputs(*self._flatten_args(v))) for v in vectors]
 
         tb_src = self.get_template("tb_hw.txt").render({
             "baud": DEFAULT_BAUD_RATE,
@@ -892,7 +916,7 @@ class Py2ver:
             raise ValueError("This design has state registers ('next' in attr); use PY_stream().")
         outs: List[Tuple[int, ...]] = []
         for vec in vectors:
-            ret = _flatten_complex(self.func(*vec))
+            ret = _flatten_outputs(self.func(*vec))
             outs.append(tuple(
                 self._wrap(int(v), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
                 for v, n, w in zip(ret, self.output_args_list, self.output_args_width_list)
@@ -905,21 +929,34 @@ class Py2ver:
     def PY_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
         return self.py_stream_fun
 
+    def _flatten_args(self, in_arg: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        """Function arguments (a list argument as a list) -> one value per input port."""
+        groups = [(p, ports) for p, ports in self.arg_groups
+                  if (ports or [p])[0] in self.input_args_list]   # state lives in registers
+        out: List[Any] = []
+        for value, (param, ports) in zip(in_arg, groups):
+            if ports is None:
+                out.append(value)
+                continue
+            value = list(value)
+            if len(value) != len(ports):
+                raise ValueError(f"'{param}' needs {len(ports)} values, got {len(value)}")
+            out.extend(value)
+        return tuple(out)
+
     def _input_vector(self, in_arg: Tuple[Any, ...]) -> Tuple[int, ...]:
         # Missing trailing arguments default to 0
+        flat = self._flatten_args(tuple(in_arg))
         return tuple(
-            int(in_arg[i]) if i < len(in_arg) else 0
+            int(flat[i]) if i < len(flat) else 0
             for i in range(len(self.input_args_list))
         )
 
     def _stream_vectors(self, samples: List[Any]) -> List[Tuple[int, ...]]:
         if not self.state_map:
             raise ValueError("Streams need state registers ('next' in attr); use TB_batch().")
-        # A scalar sample is accepted for single-input designs
-        return [
-            self._input_vector(tuple(s) if isinstance(s, (tuple, list)) else (s,))
-            for s in samples
-        ]
+        # A sample is a tuple of arguments; anything else is the only argument
+        return [self._input_vector(s if isinstance(s, tuple) else (s,)) for s in samples]
 
     def _render_tb(self, template: str, vecs: List[Tuple[int, ...]]) -> None:
         # Write raw bit patterns of each port's width (cocotb rejects e.g. -1
@@ -983,35 +1020,40 @@ class Py2ver:
         per sample, feeding each next-state output back into its state argument
         with the same width/sign wrapping as the hardware registers.
         """
-        vecs = self._stream_vectors(list(samples))
+        samples = list(samples)
+        self._stream_vectors(samples)  # validates
+        groups = dict(self.arg_groups)
 
         params = list(inspect.signature(self.func).parameters)
-        expected = set(self.input_args_list) | set(self.state_map)
-        if set(params) != expected:
-            raise ValueError(
-                f"PY_stream() needs arguments {sorted(expected)}; function has {params}"
-            )
+        if params != [p for p, _ in self.arg_groups]:
+            raise ValueError(f"PY_stream() needs arguments {list(groups)}; function has {params}")
+        inputs = [p for p, _ in self.arg_groups if p not in self.state_params]
 
         def _meta(name: str) -> Tuple[int, bool]:
             m = self.attr.get(name, {})
             return int(m.get("width", 1)), int(m.get("signed", 0)) == 1
 
-        state = {
-            name: self._wrap(self.state_init[name], *_meta(name))
-            for name in self.state_map
-        }
+        def _state_value(param: str, value_of) -> Any:
+            ports = groups[param]
+            if ports is None:
+                return self._wrap(value_of(param), *_meta(param))
+            return [self._wrap(value_of(port), *_meta(port)) for port in ports]
+
+        state = {p: _state_value(p, self.state_init.__getitem__) for p in self.state_params}
         outs: List[Tuple[int, ...]] = []
-        for vec in vecs:
-            ret = _flatten_complex(self.func(**dict(zip(self.input_args_list, vec)), **state))
+        for sample in samples:
+            args = sample if isinstance(sample, tuple) else (sample,)
+            kwargs = dict(zip(inputs, args))
+            for p in inputs[len(args):]:                     # missing trailing args: 0
+                kwargs[p] = 0 if groups[p] is None else [0] * len(groups[p])
+            ret = _flatten_outputs(self.func(**kwargs, **state))
             row = {
                 name: self._wrap(int(v), *_meta(name))
                 for name, v in zip(self.output_args_list, ret)
             }
             outs.append(tuple(row[n] for n in self.output_args_list))
-            state = {
-                name: self._wrap(row[nxt], *_meta(name))
-                for name, nxt in self.state_map.items()
-            }
+            state = {p: _state_value(p, lambda port: row[self.state_map[port]])
+                     for p in self.state_params}
         return outs
 
     def _simulate(self, n_vectors: int, write_tb: Callable[[], None]) -> List[Tuple[int, ...]]:
@@ -1107,14 +1149,24 @@ class Py2ver:
             log.info("FPGA programmed successfully ✅")
 
 
-def _flatten_complex(ret: Any) -> Tuple[Any, ...]:
-    """Python results as output values: a complex value becomes (real, imag)."""
+def _flatten_outputs(ret: Any) -> Tuple[Any, ...]:
+    """
+    Python results as output values, in port order: a complex value becomes
+    (real, imag) and a list its elements.
+    """
     out: List[Any] = []
-    for v in ret if isinstance(ret, tuple) else (ret,):
+
+    def add(v: Any) -> None:
         if isinstance(v, complex):
-            out += [v.real, v.imag]
+            out.extend([v.real, v.imag])
+        elif isinstance(v, (list, tuple)):
+            for e in v:
+                add(e)
         else:
             out.append(v)
+
+    for v in ret if isinstance(ret, tuple) else (ret,):
+        add(v)
     return tuple(out)
 
 

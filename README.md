@@ -196,12 +196,52 @@ vectors).
 - A single `return` of variables or expressions (an expression output is
   named `ret`, or `ret0`, `ret1`, ... for several)
 
+- Lists, tables and memories (see below)
+- Returning an argument: it gets its own output port, `<name>_out`
+
 Not supported: `while`, recursion, early `return`, keyword arguments in
-helper calls, subscripts, list literals, returning an argument unchanged.
+helper calls, dicts and sets, nested lists, lists of complex values.
 
 Variables you don't list in `attr` get the exact width their values need, so
 they never overflow. A listed variable keeps its declared width for every
 reassignment.
+
+### Lists, tables and memories
+
+A list has a length fixed at translation time (like an unrolled loop); list
+`xs` of length N is held as signals `xs_0` ... `xs_{N-1}`. Supported:
+literals, `[v] * n`, `append`/`extend`, slices with constant bounds, `+`,
+`len`, `sum`/`min`/`max` over a list, `list(...)`, `for v in xs`, indexing
+and assignment (`xs[i] = v`, `xs[i] += v`), including Python's negative
+indices. Returning a list gives one output per element, and declaring `xs`
+in `attr` sets every element's width.
+
+- **Tables / ROMs**: a module-level tuple or list of integers (e.g. an
+  S-box, computed in Python if you like) or a constant local list, indexed by
+  a variable, becomes a ROM built from logic; indexed by a constant it is just
+  that constant.
+- **Variable index**: reading `xs[i]` is a balanced mux, writing `xs[i] = v`
+  updates the element that matches. An out-of-range index (an `IndexError` in
+  Python) reads an unspecified element and writes nothing.
+- **List arguments**: `'length': N` in `attr` makes an argument a list of N
+  input ports; call `TB_batch()`, `PY_batch()`, `HW()`, ... with a list there.
+- **Memories**: a list argument with `'next'` is state, a register file that
+  keeps its contents between samples (`'init'` may be one value or a list).
+  `'next'` can name the argument itself when it is updated in place and
+  returned:
+
+```python
+def histogram(bin_, counts):
+    counts[bin_] += 1
+    return max(counts), counts
+
+attr = {'bin_':   {'signed': 0, 'width': 3},
+        'counts': {'signed': 0, 'width': 8, 'length': 8, 'next': 'counts'}}
+```
+
+Lists are copied by value in hardware, so `ys = xs` for a list is rejected
+(Python would make both names the same list); write `ys = list(xs)`. Memories
+are register files, not block RAM, which suits small tables and buffers.
 
 ### How results relate to Python
 
@@ -218,8 +258,9 @@ extra hardware. `and`/`or` give 0/1, not Python's operand values.
 ### Examples
 
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
-signals, complex arithmetic, a randomized regression, a streaming low-pass
-filter and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
+signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
+a streaming low-pass filter, a FIR filter with its delay line in a memory, and
+pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
 
 ```
@@ -228,8 +269,6 @@ python examples/sha256_pipeline.py --board-sim  # + virtual DE0-Nano
 python examples/sha256_pipeline.py --syn        # + Quartus area/timing
 python examples/sha256_pipeline.py --board      # + connected DE0-Nano
 ```
-
-`examples/unsupported/` holds a design py2ver can't handle yet (lists).
 
 ### Tests
 

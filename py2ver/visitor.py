@@ -35,6 +35,8 @@ def normalize_attr(attr: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             'width': int(v.get('width', 1)),
             'type': str(v.get('type', 'wire')),
         }
+        if 'length' in v:
+            out[k]['length'] = int(v['length'])
     return out
 
 
@@ -89,6 +91,15 @@ class FunctionVisitor(ast.NodeVisitor):
         self._declared = set(self.attr)
         # Complex variables (by Python name); z is held as z_re / z_im
         self._complex: set[str] = set()
+        # Lists (by Python name) -> length; element k of xs is variable xs_k
+        self._lists: Dict[str, int] = {}
+        # Versions whose value is a compile-time integer
+        self._const_of: Dict[str, int] = {}
+        # Function parameters as ports: (param, [ports] for a list or None)
+        self.arg_groups: List[tuple[str, List[str] | None]] = []
+        # Returned arguments get their own output port: variable -> port name
+        self.output_renames: Dict[str, str] = {}
+        self._tmp_count = 0
         self._ssa: Dict[str, str] = {}
         self._ssa_count: Dict[str, int] = {}
 
@@ -142,18 +153,31 @@ class FunctionVisitor(ast.NodeVisitor):
         """Assign rhs to a new version of var; returns the version's name."""
         name = self._new_version(var)
         base = var[:-3] if var[-3:] in ("_re", "_im") else None
+        elem = re.match(r"(.+)_(\d+)$", var)
+        list_base = elem.group(1) if elem and elem.group(1) in self._lists else None
         if var in self._declared:
-            self.attr[name] = dict(self.attr[var])
+            self.attr[name] = {k: v for k, v in self.attr[var].items() if k != "length"}
         elif base in self._complex and base in self._declared:
             # Declaring z covers z_re and z_im
             self.attr[name] = dict(self.attr[base])
+        elif list_base in self._declared:
+            # Declaring xs covers its elements xs_0, xs_1, ...
+            self.attr[name] = {k: v for k, v in self.attr[list_base].items() if k != "length"}
         else:
             meta = self._infer_meta(rhs)
             self.attr[name] = {"signed": meta["signed"], "width": meta["width"], "type": "wire"}
         if is_reg is None:
             is_reg = self.attr[name].get("type") == "reg"
+        value = self._fold(rhs)
+        if value is not None and not is_reg:
+            self._const_of[name] = value
         self.assigns.append(Assignment(left=name, right=rhs, is_reg=is_reg))
         return name
+
+    def _temp(self, rhs: str) -> str:
+        """A fresh internal variable holding rhs (used once-computed index/value)."""
+        self._tmp_count += 1
+        return self._assign_var(f"__t{self._tmp_count}", rhs)
 
     @staticmethod
     def _target_name(tgt: ast.expr) -> str:
@@ -244,6 +268,158 @@ class FunctionVisitor(ast.NodeVisitor):
             return re if node.attr == "real" else im
         raise NotImplementedError(f"Unsupported attribute: {ast.unparse(node)}")
 
+    # ---------- lists: list xs of length n is held as variables xs_0 .. xs_{n-1} ----------
+    def _is_list(self, node: ast.AST) -> bool:
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in self._lists
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return self._is_list(node.left) and self._is_list(node.right)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            return self._is_list(node.left) or self._is_list(node.right)
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            return self._is_list(node.value)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return node.func.id in ("list", "tuple")
+        return False
+
+    def _visit_list(self, node: ast.AST) -> List[str]:
+        """Element expressions of a list-valued expression."""
+        if isinstance(node, (ast.List, ast.Tuple)):
+            for e in node.elts:
+                if self._is_list(e) or self._is_complex(e):
+                    raise NotImplementedError(
+                        "List elements must be integers (no nested lists or complex values)"
+                    )
+            return [self.visit(e) for e in node.elts]
+        if isinstance(node, ast.Name):
+            return [self._resolve_name(f"{node.id}_{k}") for k in range(self._lists[node.id])]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return self._visit_list(node.left) + self._visit_list(node.right)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            lst, n = (node.left, node.right) if self._is_list(node.left) else (node.right, node.left)
+            return self._visit_list(lst) * max(self._eval_int(n), 0)
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            sl = node.slice
+            bound = [None if b is None else self._eval_int(b) for b in (sl.lower, sl.upper, sl.step)]
+            return self._visit_list(node.value)[slice(*bound)]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if len(node.args) != 1 or node.keywords:
+                raise NotImplementedError(f"{node.func.id}() takes one argument here")
+            arg = node.args[0]
+            if self._is_list(arg):
+                return self._visit_list(arg)
+            if (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+                    and arg.func.id == "range"):
+                return [str(v) for v in range(*self._parse_range(arg))]
+        raise NotImplementedError(f"Unsupported list expression: {ast.unparse(node)}")
+
+    def _assign_list(self, var: str, value: ast.AST) -> None:
+        if isinstance(value, ast.Name) and value.id in self._lists and value.id != var:
+            raise NotImplementedError(
+                f"'{var} = {value.id}' would make both names the same list in Python; "
+                f"copy it with '{var} = list({value.id})'"
+            )
+        elems = self._visit_list(value)      # read everything before assigning
+        self._complex.discard(var)
+        self._lists[var] = len(elems)
+        for k, e in enumerate(elems):
+            self._assign_var(f"{var}_{k}", e)
+
+    def _index_keys(self, idx: str, n: int) -> List[tuple[int, int]]:
+        """(index value, element) pairs, including Python's negative indices if idx can be < 0."""
+        keys = [(k, k) for k in range(n)]
+        if self._infer_meta(idx)["signed"]:
+            keys = [(k - n, k) for k in range(n)] + keys
+        return keys
+
+    def _select(self, elems: List[str], idx_node: ast.AST) -> str:
+        """elems[idx] for a variable idx: a balanced mux tree (a ROM if elems are constants)."""
+        idx = self._temp(self.visit(idx_node))
+        keys = self._index_keys(idx, len(elems))
+
+        def tree(part):
+            if len(part) == 1:
+                return elems[part[0][1]]
+            mid = len(part) // 2
+            return (f"(({idx}) < ({part[mid][0]})) ? ({tree(part[:mid])}) "
+                    f": ({tree(part[mid:])})")
+        # Out-of-range indices (an IndexError in Python) read an arbitrary element
+        return f"({tree(keys)})"
+
+    def _store_index(self, target: ast.Subscript, rhs: str, env: Dict[str, str] | None = None):
+        """xs[i] = rhs, at top level (env is None) or into a branch environment."""
+        if not (isinstance(target.value, ast.Name) and target.value.id in self._lists):
+            raise NotImplementedError(f"Can only assign into a list variable: {ast.unparse(target)}")
+        var = target.value.id
+        n = self._lists[var]
+        if isinstance(target.slice, ast.Slice):
+            raise NotImplementedError("Slice assignment is not supported")
+
+        def put(k, value):
+            if env is None:
+                self._assign_var(f"{var}_{k}", value)
+            else:
+                env[f"{var}_{k}"] = f"({value})"
+
+        try:
+            k = self._eval_int(target.slice)
+        except NotImplementedError:
+            k = None
+        if k is not None:
+            if not -n <= k < n:
+                raise NotImplementedError(f"Index {k} is out of range for '{var}' (length {n})")
+            put(k % n, rhs)
+            return
+        idx = self._temp(self.visit(target.slice))
+        value = self._temp(rhs)
+        hits: Dict[int, List[int]] = {}
+        for key, k in self._index_keys(idx, n):
+            hits.setdefault(k, []).append(key)
+        for k, keys in hits.items():
+            cond = " || ".join(f"(({idx}) == ({key}))" for key in keys)
+            put(k, f"({cond}) ? ({value}) : ({self._resolve_name(f'{var}_{k}')})")
+
+    def _list_method(self, call: ast.Call, env: Dict[str, str] | None = None) -> None:
+        """xs.append(v) / xs.extend(list) as a statement."""
+        f = call.func
+        if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id in self._lists and f.attr in ("append", "extend")):
+            raise NotImplementedError(f"Unsupported statement: {ast.unparse(call)}")
+        if env is not None:
+            raise NotImplementedError(
+                f"'{ast.unparse(call)}' inside an if changes the list's length on one path only"
+            )
+        var = f.value.id
+        new = [self.visit(call.args[0])] if f.attr == "append" else self._visit_list(call.args[0])
+        n = self._lists[var]
+        self._lists[var] = n + len(new)
+        for k, e in enumerate(new, start=n):
+            self._assign_var(f"{var}_{k}", e)
+
+    def visit_Subscript(self, node: ast.Subscript):
+        if isinstance(node.slice, ast.Slice):
+            raise NotImplementedError("A slice is a list; index it or assign it to a variable")
+        elems = self._visit_list(node.value)
+        n = len(elems)
+        try:
+            k = self._eval_int(node.slice)
+        except NotImplementedError:
+            k = None
+        if k is not None:
+            if not -n <= k < n:
+                raise NotImplementedError(f"Index {k} is out of range (length {n})")
+            return elems[k]
+        return self._select(elems, node.slice)
+
+    def visit_Expr(self, node: ast.Expr):
+        if isinstance(node.value, ast.Constant):
+            return None                      # docstring / bare constant
+        if isinstance(node.value, ast.Call):
+            return self._list_method(node.value)
+        raise NotImplementedError(f"Unsupported statement: {ast.unparse(node)}")
+
     def _finalize_output(self, var: str) -> str:
         """Expose the final version of var on an output port named var."""
         current = self._resolve_name(var)
@@ -254,6 +430,7 @@ class FunctionVisitor(ast.NodeVisitor):
                 out += "_"
             self.attr[out] = dict(self.attr.get(current) or self._attrs(var), type="wire")
             self.assigns.append(Assignment(left=out, right=current, is_reg=False))
+            self.output_renames[var] = out
             return out
         if current == var:
             return var
@@ -288,7 +465,49 @@ class FunctionVisitor(ast.NodeVisitor):
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
             val = self._eval_int(node.operand)
             return -val if isinstance(node.op, ast.USub) else val
-        raise NotImplementedError(f"Only integer literals are allowed in range(): {ast.dump(node)}")
+        value = self._fold(self.visit(node))
+        if value is None:
+            raise NotImplementedError(
+                f"Expected a value known at translation time: {ast.unparse(node)}"
+            )
+        return value
+
+    def _fold(self, expr: str):
+        """Value of an expression made only of constants (and constant versions), else None."""
+        try:
+            tree = parse(expr)
+        except Unsupported:
+            return None
+        ops = {
+            "+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
+            "//": lambda a, b: a // b, "%": lambda a, b: a % b,
+            "/": lambda a, b: int(a / b),
+            "<<": lambda a, b: a << b, ">>": lambda a, b: a >> b, ">>>": lambda a, b: a >> b,
+            "&": lambda a, b: a & b, "|": lambda a, b: a | b, "^": lambda a, b: a ^ b,
+            "<": lambda a, b: int(a < b), "<=": lambda a, b: int(a <= b),
+            ">": lambda a, b: int(a > b), ">=": lambda a, b: int(a >= b),
+            "==": lambda a, b: int(a == b), "!=": lambda a, b: int(a != b),
+        }
+
+        def ev(n):
+            if n.kind == "num":
+                return n.value
+            if n.kind == "id":
+                return self._const_of.get(n.name)
+            vals = [ev(k) for k in n.kids]
+            if any(v is None for v in vals):
+                return None
+            try:
+                if n.kind == "un":
+                    return {"-": lambda a: -a, "+": lambda a: a, "~": lambda a: ~a,
+                            "!": lambda a: int(not a)}[n.op](vals[0])
+                if n.kind == "tern":
+                    return vals[1] if vals[0] else vals[2]
+                return ops[n.op](*vals) if n.op in ops else None
+            except (ZeroDivisionError, ValueError):
+                return None
+
+        return ev(tree)
 
     def _parse_range(self, iter_node: ast.expr) -> tuple[int, int, int]:
         """
@@ -427,13 +646,7 @@ class FunctionVisitor(ast.NodeVisitor):
         for item in node.body:
             # skip docstrings or bare expression statements
             if isinstance(item, ast.Expr):
-                if (
-                    isinstance(getattr(item, "value", None), ast.Constant)
-                    and isinstance(item.value.value, str)
-                ):
-                    # docstring
-                    continue
-                # ignore other bare expressions for now
+                self.visit_Expr(item)
                 continue
 
             if isinstance(item, ast.Assign):
@@ -451,6 +664,16 @@ class FunctionVisitor(ast.NodeVisitor):
                 vals = item.value.elts if isinstance(item.value, ast.Tuple) else [item.value]
                 outs = []
                 for i, v in enumerate(vals):
+                    if isinstance(v, ast.Name) and v.id in self._lists:
+                        # A list is returned as one output per element, <v>_0, <v>_1, ...
+                        for k in range(self._lists[v.id]):
+                            outs.append(self._finalize_output(f"{v.id}_{k}"))
+                        continue
+                    if not isinstance(v, ast.Name) and self._is_list(v):
+                        name = f"ret{i}" if len(vals) > 1 else "ret"
+                        self._assign_list(name, v)
+                        outs += [f"{name}_{k}" for k in range(self._lists[name])]
+                        continue
                     if isinstance(v, ast.Name) and v.id in self._complex:
                         # A complex value is returned as two outputs, <v>_re and <v>_im
                         outs.append(self._finalize_output(f"{v.id}_re"))
@@ -514,13 +737,27 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def visit_arguments(self, node: ast.arguments):
         values = [self.visit(a) for a in node.args]
-        for name in values:
-            self._ssa_count[name] = 1
-            self._ssa[name] = name
-            meta = self._attrs(name)
-            self.input_args_list.append(name)
-            self.input_args_width_list.append(meta['width'])
-            self.input_bit_count += meta['width']
+        for param in values:
+            length = self.attr.get(param, {}).get("length")
+            if length is None:
+                self.arg_groups.append((param, None))
+                self._register_arg(param)
+                continue
+            ports = [f"{param}_{k}" for k in range(length)]
+            self.arg_groups.append((param, ports))
+            self._lists[param] = length
+            for port in ports:
+                self.attr.setdefault(port, {k: v for k, v in self.attr[param].items()
+                                            if k != "length"})
+                self._register_arg(port)
+
+    def _register_arg(self, name: str):
+        self._ssa_count[name] = 1
+        self._ssa[name] = name
+        meta = self._attrs(name)
+        self.input_args_list.append(name)
+        self.input_args_width_list.append(meta['width'])
+        self.input_bit_count += meta['width']
 
     def visit_arg(self, node: ast.arg):
         return node.arg
@@ -603,6 +840,27 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call):
         """Integer builtins: abs(x), min(a, b, ...), max(a, b, ...)."""
+        if (isinstance(node.func, ast.Name) and len(node.args) == 1 and not node.keywords
+                and node.func.id in ("len", "sum", "min", "max")
+                and self._is_list(node.args[0])):
+            elems = self._visit_list(node.args[0])
+            fn = node.func.id
+            if fn == "len":
+                return str(len(elems))
+            if not elems:
+                if fn == "sum":
+                    return "0"
+                raise NotImplementedError(f"{fn}() of an empty list")
+            if fn == "sum":
+                acc = elems[0]
+                for e in elems[1:]:
+                    acc = f"({acc}) + ({e})"
+                return acc
+            op = "<" if fn == "min" else ">"
+            acc = elems[0]
+            for e in elems[1:]:
+                acc = f"((({e}) {op} ({acc})) ? ({e}) : ({acc}))"
+            return acc
         if isinstance(node.func, ast.Name) and not node.keywords:
             fn = node.func.id
             args = [] if any(self._is_complex(a) for a in node.args) else [self.visit(a) for a in node.args]
@@ -640,6 +898,12 @@ class FunctionVisitor(ast.NodeVisitor):
             raise NotImplementedError("Only 'for <var> in range(...)' loops are supported.")
         loop_var = node.target.id
 
+        if self._is_list(node.iter) and not isinstance(node.iter, (ast.Tuple, ast.List)):
+            for e in self._visit_list(node.iter):
+                self._complex.discard(loop_var)
+                self._unroll_body(node.body, {loop_var: e})
+            return
+
         if isinstance(node.iter, (ast.Tuple, ast.List)):
             # for v in (a, b, c): Python evaluates the tuple once, up front
             bindings = []
@@ -674,6 +938,8 @@ class FunctionVisitor(ast.NodeVisitor):
                     self._visit_if(stmt)
                 elif isinstance(stmt, ast.For):
                     self.visit_For(stmt)
+                elif isinstance(stmt, ast.Expr):
+                    self.visit_Expr(stmt)
                 else:
                     self.generic_visit(stmt)
         finally:
@@ -699,6 +965,10 @@ class FunctionVisitor(ast.NodeVisitor):
                     else:
                         self._complex.discard(name)
                         self._assign_var(name, rhs)
+            elif isinstance(tgt, ast.Subscript):
+                self._store_index(tgt, self.visit(node.value))
+            elif self._is_list(node.value):
+                self._assign_list(self._target_name(tgt), node.value)
             else:
                 self._assign_value(self._target_name(tgt), node.value)
 
@@ -725,6 +995,15 @@ class FunctionVisitor(ast.NodeVisitor):
                             "Multiple assignment targets are not supported."
                         )
                     tgt = s.targets[0]
+                    if isinstance(tgt, ast.Subscript):
+                        self._store_index(tgt, self.visit(s.value), env)
+                        continue
+                    if isinstance(tgt, ast.Name) and self._is_list(s.value):
+                        elems = self._visit_list(s.value)
+                        self._lists[tgt.id] = len(elems)
+                        for k, e in enumerate(elems):
+                            env[f"{tgt.id}_{k}"] = f"({e})"
+                        continue
                     if isinstance(tgt, ast.Tuple):
                         vals = s.value.elts if isinstance(s.value, ast.Tuple) else None
                         if vals is None or len(vals) != len(tgt.elts):
@@ -748,6 +1027,8 @@ class FunctionVisitor(ast.NodeVisitor):
                     # Recursively lower nested if/elif/else into expressions
                     for k, v in self._eval_if_expr(s).items():
                         env[k] = f"({v})"
+                elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
+                    self._list_method(s.value, env)
                 else:
                     raise NotImplementedError(
                         f"Unsupported statement type in combinational block: {type(s).__name__}"
@@ -874,13 +1155,18 @@ class _Desugar(ast.NodeTransformer):
     """Rewrite `x op= e` as `x = x op e`."""
 
     def visit_AugAssign(self, node: ast.AugAssign):
-        if not isinstance(node.target, ast.Name):
-            raise NotImplementedError("Augmented assignment target must be a name")
-        value = ast.BinOp(
-            left=ast.Name(id=node.target.id, ctx=ast.Load()), op=node.op, right=node.value
-        )
-        new = ast.Assign(targets=[ast.Name(id=node.target.id, ctx=ast.Store())], value=value)
-        return ast.copy_location(new, node)
+        tgt = node.target
+        if isinstance(tgt, ast.Name):
+            load = ast.Name(id=tgt.id, ctx=ast.Load())
+            store = ast.Name(id=tgt.id, ctx=ast.Store())
+        elif isinstance(tgt, ast.Subscript):
+            # xs[i] op= v -> xs[i] = xs[i] op v (index expressions have no side effects)
+            load = ast.Subscript(value=tgt.value, slice=tgt.slice, ctx=ast.Load())
+            store = ast.Subscript(value=tgt.value, slice=tgt.slice, ctx=ast.Store())
+        else:
+            raise NotImplementedError("Augmented assignment target must be a name or xs[i]")
+        value = ast.BinOp(left=load, op=node.op, right=node.value)
+        return ast.copy_location(ast.Assign(targets=[store], value=value), node)
 
 
 # Small builders for complex parts that keep obvious zeros out of the Verilog

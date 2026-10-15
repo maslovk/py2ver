@@ -20,7 +20,8 @@ Python functions whose source is available. Their body may use anything the
 main function may use, and must end with a single `return` (a tuple return
 works with `x, y = helper(...)`). Helpers may call helpers; recursion is
 rejected. Module-level integer constants used by name (e.g. MASK = 0xFFFF)
-are replaced by their values.
+are replaced by their values, and module-level tuples/lists of integers
+(tables such as an S-box) by literals.
 """
 
 from __future__ import annotations
@@ -74,9 +75,17 @@ class _Inliner:
 
         class _Consts(ast.NodeTransformer):
             def visit_Name(self, node: ast.Name):
-                if (isinstance(node.ctx, ast.Load) and node.id not in locals_
-                        and isinstance(g.get(node.id), int)):
-                    return ast.copy_location(ast.Constant(value=int(g[node.id])), node)
+                if not isinstance(node.ctx, ast.Load) or node.id in locals_:
+                    return node
+                value = g.get(node.id)
+                if isinstance(value, int):
+                    return ast.copy_location(ast.Constant(value=int(value)), node)
+                if (isinstance(value, (tuple, list)) and value
+                        and all(isinstance(v, int) for v in value)):
+                    # A module-level table becomes a literal (a ROM when indexed by a variable)
+                    table = ast.Tuple(elts=[ast.Constant(value=int(v)) for v in value],
+                                      ctx=ast.Load())
+                    return ast.copy_location(table, node)
                 return node
 
         return _Consts()
