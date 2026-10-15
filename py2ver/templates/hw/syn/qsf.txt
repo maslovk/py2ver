@@ -2,6 +2,9 @@ set_global_assignment -name FAMILY "{{ family }}"
 set_global_assignment -name DEVICE {{ device }}
 set_global_assignment -name TOP_LEVEL_ENTITY {{ wrapper }}
 set_global_assignment -name VERILOG_FILE {{ top_name }}.v
+{% for f in extra_files %}
+set_global_assignment -name VERILOG_FILE {{ f }}
+{% endfor %}
 set_global_assignment -name VERILOG_FILE {{ wrapper }}.v
 set_global_assignment -name SDC_FILE {{ wrapper }}.sdc
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files

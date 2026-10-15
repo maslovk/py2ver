@@ -349,7 +349,9 @@ class FunctionVisitor(ast.NodeVisitor):
         raise NotImplementedError(f"Unsupported list expression: {ast.unparse(node)}")
 
     def _assign_list(self, var: str, value: ast.AST) -> None:
-        if isinstance(value, ast.Name) and value.id in self._lists and value.id != var:
+        # (bindings made by inlining a helper, __<helper><k>_..., copy by design)
+        if isinstance(value, ast.Name) and value.id in self._lists and value.id != var \
+                and not var.startswith("__"):
             raise NotImplementedError(
                 f"'{var} = {value.id}' would make both names the same list in Python; "
                 f"copy it with '{var} = list({value.id})'"
@@ -1067,9 +1069,24 @@ class FunctionVisitor(ast.NodeVisitor):
                     )
                 # All right-hand sides are read before anything is assigned
                 names = [self._target_name(t) for t in tgt.elts]
-                rhss = [self._visit_cplx(v) if self._is_complex(v) else self.visit(v) for v in vals]
+                rhss = []
+                for name, v in zip(names, vals):
+                    if self._is_list(v):
+                        if (isinstance(v, ast.Name) and v.id in self._lists and v.id != name
+                                and not name.startswith("__")):
+                            raise NotImplementedError(
+                                f"'{name} = {v.id}' would make both names the same list in "
+                                f"Python; copy it with '{name} = list({v.id})'")
+                        rhss.append(("list", self._visit_list(v)))
+                    else:
+                        rhss.append(self._visit_cplx(v) if self._is_complex(v) else self.visit(v))
                 for name, rhs in zip(names, rhss):
-                    if isinstance(rhs, tuple):
+                    if isinstance(rhs, tuple) and rhs[0] == "list":
+                        self._complex.discard(name)
+                        self._lists[name] = len(rhs[1])
+                        for k, e in enumerate(rhs[1]):
+                            self._assign_var(f"{name}_{k}", e)
+                    elif isinstance(rhs, tuple):
                         self._complex.add(name)
                         self._assign_var(f"{name}_re", rhs[0])
                         self._assign_var(f"{name}_im", rhs[1])

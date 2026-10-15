@@ -437,6 +437,46 @@ target, it matches the bit-exact model in simulation and takes one sample per
 handshake through the stream wrapper. `fold` applies to the chain too (the
 longest loop, here the filter's taps).
 
+**As separate stages.** Built as one design, the chain runs once per block,
+so the downconverter, called for each of the 4 samples, is built 4 times.
+`stages=True` builds each call as its own core behind a stream wrapper, and
+`hdl/<chain>_stages.v` connects them with valid/ready handshakes: one
+downconverter running at the sample rate, the filter taking its 4 samples one
+per transfer (a serial input), and the detector. A stage that gets several
+clocks per call (here 4 per block) has its longest loop folded to use them.
+
+```python
+p = Py2ver(receiver, attr, stages=True)
+p.TB_stages()(blocks) == p.PY_stages()(blocks)     # the staged hardware vs. the chain
+p.SYN_stages(q)                                    # its area and timing
+```
+
+Each stage is a generated function around the call, whose parameters and
+results are the chain's variables, so the chain's attr applies unchanged and
+the stages compute exactly what the fused design does. `TB_stages()` feeds
+the top module one sample per transfer and gives each block's results like
+`PY_stages()` (the chain's `PY_stream()` without its state).
+`stage_options={'decimate': {'fold': ..., 'unroll': ..., 'pipeline': ...}}`
+overrides a stage's folding. The 8-tap receiver on the EP4CE22, both taking
+one sample per clock:
+
+| | logic elements | 9-bit multipliers | Fmax |
+|---|---|---|---|
+| one design | 3569 | 20 | 20 MHz |
+| `stages=True` | 1071 | 24 | 64 MHz |
+
+To be split, the chain function must be a list of stages: calls of your
+functions at its top level (once per block), `for v in xs:` loops holding one
+call and appends of its results (once per sample), `ys = []` for the lists
+they fill, and a return. Data flows only through the calls' arguments and
+results, each stage takes its inputs from the stage before it (the first from
+the chain's one input), state belongs to one stage, and the results come out
+of the last stage; anything else is reported (`NotSplittable`), and the chain
+still builds as one design.
+
+Helpers get copies of list arguments, so a helper can't change a list
+argument in place (copy it first and return it).
+
 ### Area and timing (`SYN()`)
 
 `SYN()` compiles the generated module alone with Quartus (no board needed,

@@ -154,6 +154,23 @@ class _Inliner:
         if any(isinstance(n, ast.Return) for s in body[:-1] for n in ast.walk(s)):
             raise NotImplementedError(f"Helper '{fd.name}' may only return at its end")
 
+        # Arguments are bound by copying (a list too), so a helper may not
+        # change a list argument in place: the caller wouldn't see it
+        for n in (n for st in body for n in ast.walk(st)):
+            base = None
+            if isinstance(n, (ast.Assign, ast.AugAssign)):
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                    if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                        base = t.value.id
+            elif (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and isinstance(n.func.value, ast.Name)
+                  and n.func.attr in ("append", "extend", "insert", "pop", "remove")):
+                base = n.func.value.id
+            if base in params and base not in _assigned_names(body):
+                raise NotImplementedError(
+                    f"Helper '{fd.name}' changes its argument '{base}' in place; copy it first "
+                    f"({base} = list({base})) and return it")
+
         k = next(self.counter)
         prefix = f"__{fd.name}{k}_"
         locals_ = set(params) | _assigned_names(body)

@@ -516,14 +516,14 @@ def split_complex(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[st
     """
     Rewrite the module's first function so complex values are pairs of real
     ones. Returns (tree, attr with complex entries split, set of complex
-    parameter names).
+    parameter names, set of all complex names: values and lists).
     """
     fd = tree.body[0]
     sp = _Split(fd, attr, ns)
     sp.infer(fd)
     if not sp.cplx and not sp.clists and not any(sp.is_c(n) for n in ast.walk(fd)
                                                  if isinstance(n, ast.expr)):
-        return tree, attr, set()
+        return tree, attr, set(), set()
     complex_names = sp.cplx | sp.clists | _returned_complex(fd, sp)
     fd.body = sp.block(fd.body)
     args = []
@@ -549,4 +549,4 @@ def split_complex(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[st
                 m["init"] = ([getattr(complex(v), part) for v in init]
                              if isinstance(init, (list, tuple)) else getattr(complex(init), part))
             out[f"{name}_{k}"] = m
-    return tree, out, {p for p in sp.params if p in sp.cplx or p in sp.clists}
+    return tree, out, {p for p in sp.params if p in sp.cplx or p in sp.clists}, complex_names

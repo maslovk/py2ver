@@ -118,9 +118,9 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
                       if not {"next", "memory"} & set(attr.get(fe.hw_name.get(p, p), {}))]
     # Complex values become real / imaginary pairs (see cplx.py)
     fixed = uses_fixed(attr)
-    fe.cplx_params = set()
+    fe.cplx_params, fe.complex_names = set(), set()
     if fixed or any(isinstance(m, dict) and m.get("complex") for m in attr.values()):
-        tree, attr, fe.cplx_params = split_complex(tree, attr, ns)
+        tree, attr, fe.cplx_params, fe.complex_names = split_complex(tree, attr, ns)
     # Fixed point ('frac' in attr) becomes integer code on raw values, and
     # the same code run in Python is the bit-exact reference (see fixed.py);
     # function tables ('math.sin': {'range': ...}) become ROMs in the code
@@ -177,7 +177,8 @@ class Py2ver:
                  const_bits: int = DEFAULT_CONST_BITS, samples: List[Any] | None = None,
                  width: int | None = None, max_error: Any = None,
                  round: bool = False, saturate: bool = False,
-                 fold: Any = None, unroll: int = 1) -> None:
+                 fold: Any = None, unroll: int = 1,
+                 stages: bool = False, stage_options: Dict[str, Any] | None = None) -> None:
         """
         func: the function, as written. attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
@@ -189,6 +190,9 @@ class Py2ver:
         fold: a loop to run over several clocks instead of unrolling it (its
         variable's name, or True for the longest top-level range loop), with
         `unroll` iterations per clock (see fold.py).
+        stages: build a chain as separate stages connected by streams, in
+        hdl/<name>_stages.v (see stages.py); stage_options: {stage function:
+        {'fold', 'unroll', 'pipeline'}} to override the automatic folding.
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
         if samples is not None:
@@ -205,6 +209,7 @@ class Py2ver:
         self._hw_name, self._py_name = fe.hw_name, fe.py_name
         self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
         self._fx_types, self._model = fe.fx_types, fe.model
+        self._complex_names = fe.complex_names
         # Folding: the loop's body runs once per clock (phase) instead of unrolled
         self._fold: Dict[str, Any] | None = None
         if fold is not None and fold is not False:
@@ -373,6 +378,11 @@ class Py2ver:
         self._hw_ok: bool = False
         self.syn_attr: Dict[str, Any] = {}
         self._uart = None  # type: ignore
+
+        # A chain as separate stages (each its own design), connected by streams
+        self._stages: Dict[str, Any] | None = None
+        if stages:
+            self._build_stages(stage_options or {}, const_bits, template_dir)
 
     # --------------------------------------------------------------------
     # Helpers
@@ -1201,6 +1211,20 @@ class Py2ver:
         log.info("Stream wrapper (%s) written to %s", mode, path)
         return path
 
+    def _transfers(self, vecs: List[Tuple[int, ...]]) -> Tuple[List[Tuple[int, ...]], List[str]]:
+        """Input vectors of calls -> the stream wrapper's transfers (a serial list
+        one element per transfer), and the wrapper's input port names."""
+        ser = self._serial
+        if not ser["in"]:
+            return vecs, list(self.input_args_list)
+        s_in = [p for ports in ser["in"].values() for p in ports]
+        plain = [n for n in self.input_args_list if n not in s_in]
+        idx = {n: i for i, n in enumerate(self.input_args_list)}
+        out = [tuple(vec[idx[ports[k]]] for ports in ser["in"].values())
+               + tuple(vec[idx[n]] for n in plain)
+               for vec in vecs for k in range(ser["m"])]
+        return out, list(ser["in"]) + plain
+
     def TB_handshake(self) -> Callable[..., List[Tuple[int, ...]]]:
         return self._fx_rows(self.tb_handshake_fun)
 
@@ -1222,18 +1246,10 @@ class Py2ver:
         masks = [(1 << w) - 1 for w in self.input_args_width_list]
         vecs = [tuple(v & m for v, m in zip(vec, masks)) for vec in vecs]
         calls = len(vecs)
-        in_names, out_names = self.input_args_list, self.output_args_list
+        out_names = self.output_args_list
         ser = self._serial
-        s_in = [p for ports in ser["in"].values() for p in ports]
         s_out = [p for ports in ser["out"].values() for p in ports]
-        if ser["in"]:
-            # One call -> m element transfers (serial lists one element each)
-            plain = [n for n in in_names if n not in s_in]
-            idx = {n: i for i, n in enumerate(self.input_args_list)}
-            vecs = [tuple(vec[idx[ports[k]]] for ports in ser["in"].values())
-                    + tuple(vec[idx[n]] for n in plain)
-                    for vec in vecs for k in range(ser["m"])]
-            in_names = list(ser["in"]) + plain
+        vecs, in_names = self._transfers(vecs)
         if ser["out"]:
             out_names = list(ser["out"]) + [n for n in out_names if n not in s_out]
 
@@ -1306,6 +1322,13 @@ class Py2ver:
             'FAMILY':        device family (default "Cyclone IV E")
         """
         syn_attr = dict(syn_attr or {})
+        quartus_sh = self._quartus_sh(syn_attr)
+        project_dir = self.gen_syn_project(syn_attr)
+        return self._run_quartus(quartus_sh, project_dir, f"{self.t_name}_syn_top", self.t_name,
+                                 syn_attr)
+
+    @staticmethod
+    def _quartus_sh(syn_attr: Dict[str, Any]) -> str:
         tool_dir = syn_attr.get("QUARTUS_DIR")
         quartus_sh = (
             os.path.join(tool_dir, "quartus_sh") if tool_dir else shutil.which("quartus_sh")
@@ -1315,11 +1338,12 @@ class Py2ver:
                 "quartus_sh not found; set 'QUARTUS_DIR' to Quartus's bin directory "
                 f"(looked for: {quartus_sh or 'quartus_sh on PATH'})"
             )
+        return quartus_sh
 
-        project_dir = self.gen_syn_project(syn_attr)
-        revision = f"{self.t_name}_syn_top"
-
-        log.info("Running Quartus synthesis/fit/timing for %s...", self.t_name)
+    @staticmethod
+    def _run_quartus(quartus_sh: str, project_dir: Path, revision: str, top: str,
+                     syn_attr: Dict[str, Any]) -> SynReport:
+        log.info("Running Quartus synthesis/fit/timing for %s...", top)
         result = subprocess.run(
             [quartus_sh, "--flow", "compile", revision],
             cwd=project_dir,
@@ -1334,10 +1358,10 @@ class Py2ver:
             )
 
         report = read_report(
-            project_dir, revision, self.t_name,
+            project_dir, revision, top,
             float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)),
         )
-        log.info("Synthesis report for %s:\n%s", self.t_name, report)
+        log.info("Synthesis report for %s:\n%s", top, report)
         return report
 
     def gen_syn_project(self, syn_attr: Dict[str, Any]) -> Path:
@@ -1373,6 +1397,7 @@ class Py2ver:
             "family": syn_attr.get("FAMILY", DEFAULT_SYN_FAMILY),
             "device": syn_attr.get("DEVICE", DEFAULT_SYN_DEVICE),
             "period_ns": float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)),
+            "extra_files": [],
         }
 
         project_dir = self._syn_dir
@@ -1725,6 +1750,167 @@ class Py2ver:
                 row.append(v)
             outs.append(tuple(row))
         return outs
+
+    # ------------------------------------------------------------------------
+    # A chain as separate stages (see stages.py)
+    # ------------------------------------------------------------------------
+
+    def _build_stages(self, options: Dict[str, Any], const_bits: int, template_dir: Path) -> None:
+        from . import stages as stg
+        plan, info = stg.plan(self.func, self._py_attr)
+        stg.make_functions(self.func, plan)
+        fused = (self.hdl_dir / "main.v").read_text(encoding="utf-8")
+        files: List[Path] = []
+        for st in plan:
+            sattr = stg.stage_attr(st, plan, info, self._py_attr, self._complex_names)
+            opts = dict(options.get(st.callee, {}))
+            # A block stage has as many clocks per call as samples per block
+            fold, unroll = stg.auto_fold(st, sattr, info["length"], opts, const_bits)
+            st.design = Py2ver(st.func, sattr, template_dir=template_dir, const_bits=const_bits,
+                               fold=fold, unroll=unroll, pipeline=int(opts.get("pipeline", 0)))
+            core = self.hdl_dir / f"{st.name}.v"
+            shutil.copy(self.hdl_dir / "main.v", core)
+            files += [core, st.design.stream_wrapper()]
+            log.info("Stage %d (%s, %s): %d clock(s) per call", st.index, st.callee, st.kind,
+                     getattr(st.design, "ram_phases", 1))
+        (self.hdl_dir / "main.v").write_text(fused, encoding="utf-8")   # the fused core again
+        text, ports = stg.top_module(self.t_name, plan, info)
+        top = self.hdl_dir / f"{self.t_name}_stages.v"
+        top.write_text(text, encoding="utf-8")
+        files.append(top)
+        # The chain's results as PY_stream() gives them: (fused port, top port, transfer)
+        appended = {lst: var for st in plan for lst, var in st.appends.items()}
+        results = []
+        for port in self.output_args_list:
+            for r in info["returns"]:
+                m = re.fullmatch(rf"{re.escape(r)}(_re|_im)?(?:_(\d+))?", port)
+                if m:
+                    results.append((port, appended.get(r, r) + (m.group(1) or ""),
+                                    int(m.group(2) or 0)))
+        last = plan[-1]
+        per_block = (info["per_block"][last.loop_list] if last.kind == "sample"
+                     else last.design._serial["l"])
+        self._stages = {"plan": plan, "info": info, "ports": ports, "files": files,
+                        "results": results, "per_block": per_block}
+
+    @property
+    def stages(self) -> List[Any]:
+        """The stages of a chain built with stages=True (each has .design, its Py2ver)."""
+        if not self._stages:
+            raise ValueError("Build the chain with stages=True")
+        return self._stages["plan"]
+
+    def PY_stages(self) -> Callable[[List[Any]], List[Tuple[Any, ...]]]:
+        """PY_stream() of the chain, only the results the stages give (not state)."""
+        idx = [self.output_args_list.index(port) for port, _, _ in self._stages["results"]]
+        return lambda blocks: [tuple(row[i] for i in idx) for row in self.PY_stream()(blocks)]
+
+    def TB_stages(self) -> Callable[..., List[Tuple[Any, ...]]]:
+        """
+        Simulate <name>_stages: blocks go in one sample per transfer (s_valid
+        with probability `valid`), results are taken with probability `ready`;
+        returns each block's results like PY_stages(). Clocks used: stage_cycles.
+        """
+        return self.tb_stages_fun
+
+    def tb_stages_fun(self, blocks: List[Any], valid: float = 1.0, ready: float = 1.0,
+                      seed: int = 0) -> List[Tuple[Any, ...]]:
+        if not self._stages:
+            raise ValueError("Build the chain with stages=True")
+        plan, info, ports = self._stages["plan"], self._stages["info"], self._stages["ports"]
+        first = plan[0].design
+        blocks = [b if isinstance(b, tuple) else (b,) for b in blocks]
+        calls = []
+        for b in blocks:                   # the first stage's calls for each block
+            if plan[0].kind == "sample":
+                calls += [(e,) for e in (b[0] if info["length"] > 1 else [b[0]])]
+            else:
+                calls.append(b)
+        masks = [(1 << w) - 1 for w in first.input_args_width_list]
+        vecs = [tuple(v & m for v, m in zip(first._input_vector(c), masks)) for c in calls]
+        vecs, in_names = first._transfers(vecs)
+        assert in_names == [n for n, _ in ports["in"]], (in_names, ports["in"])
+        out_names = [n for n, _ in ports["out"]]
+        n_results = len(blocks) * self._stages["per_block"]
+        results_path = self.outdir / RESULTS_PATH
+        if results_path.exists():
+            results_path.unlink()
+        _drop_bytecode(self.outdir, "tb_handshake")
+        (self.outdir / "tb_handshake.py").write_text(self.get_template("tb_handshake.txt").render({
+            "name": f"{self.t_name}_stages",
+            "vectors": repr(vecs),
+            "valid_p": float(valid), "ready_p": float(ready), "seed": int(seed),
+            "max_cycles": 40 * (len(vecs) + n_results) + 200,
+            "in_names": in_names, "out_args": out_names, "n_results": n_results,
+            "out_meta": {n: {"signed": int(r.startswith("signed"))} for n, r in ports["out"]},
+        }), encoding="utf-8")
+        tb_runner.run_cocotb(f"{self.t_name}_stages", self._stages["files"], "tb_handshake",
+                             self.outdir, build_name="sim_build_stages", timescale=("1ns", "1ps"))
+        rows: List[Dict[str, int]] = []
+        if results_path.exists():
+            with results_path.open("rb") as handle:
+                payload = pickle.load(handle)
+            rows = payload["outs"]
+            self.stage_cycles = payload["cycles"]
+        if len(rows) != n_results:
+            raise RuntimeError(f"The stages gave {len(rows)} results for {n_results} expected")
+        # Raw values -> numbers with the last stage's formats
+        last = plan[-1].design
+        fracs = {}
+        for n, _ in ports["out"]:
+            src = last._serial["out"].get(n, [n])[0]
+            fracs[n] = last._fx_out.get(src)
+        per = self._stages["per_block"]
+        out = []
+        for b in range(len(blocks)):
+            group = rows[b * per:(b + 1) * per]
+            row = []
+            for _, top, k in self._stages["results"]:
+                v = group[k][top]
+                row.append(v if fracs.get(top) is None else v / (1 << fracs[top]))
+            out.append(tuple(row))
+        return out
+
+    def SYN_stages(self, syn_attr: Dict[str, Any] | None = None) -> SynReport:
+        """SYN() of <name>_stages: every stage and the streams between them."""
+        if not self._stages:
+            raise ValueError("Build the chain with stages=True")
+        syn_attr = dict(syn_attr or {})
+        quartus_sh = self._quartus_sh(syn_attr)
+        top = f"{self.t_name}_stages"
+        wrapper = f"{top}_syn_top"
+        ports = self._stages["ports"]
+
+        def width(rng: str) -> int:
+            return int(re.search(r"\[(\d+):0\]", rng).group(1)) + 1
+
+        inputs = [Port("rst", 1), Port("s_valid", 1), Port("m_ready", 1)]
+        inputs += [Port(f"s_{n}", width(r)) for n, r in ports["in"]]
+        outputs = [Port("s_ready", 1), Port("m_valid", 1)]
+        outputs += [Port(f"m_{n}", width(r)) for n, r in ports["out"]]
+        rng = lambda w: f"[{w - 1}:0] " if w > 1 else ""  # noqa: E731
+        ctx = {
+            "top_name": top, "wrapper": wrapper, "inputs": inputs, "outputs": outputs,
+            "port_decls": ["  input clk"] + [f"  input {rng(p.width)}{p.name}_in" for p in inputs]
+                          + [f"  output reg {rng(p.width)}{p.name}_out" for p in outputs],
+            "conns": ["    .clk(clk)"] + [f"    .{p.name}({p.name}_q)" for p in inputs]
+                     + [f"    .{p.name}({p.name}_w)" for p in outputs],
+            "family": syn_attr.get("FAMILY", DEFAULT_SYN_FAMILY),
+            "device": syn_attr.get("DEVICE", DEFAULT_SYN_DEVICE),
+            "period_ns": float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)),
+            "extra_files": [f.name for f in self._stages["files"][:-1]],
+        }
+        project_dir = self.outdir / "syn" / top
+        if project_dir.is_dir():
+            shutil.rmtree(project_dir)
+        project_dir.mkdir(parents=True)
+        (project_dir / f"{wrapper}.qpf").write_text(f"PROJECT_REVISION = {wrapper}\n", encoding="utf-8")
+        for tpl, name in (("hw/syn/qsf.txt", f"{wrapper}.qsf"), ("hw/syn/sdc.txt", f"{wrapper}.sdc"),
+                          ("hw/syn/wrapper.txt", f"{wrapper}.v")):
+            self.get_template(tpl).stream(ctx).dump(str(project_dir / name))
+        for f in self._stages["files"]:
+            shutil.copy(f, project_dir / f.name)
+        return self._run_quartus(quartus_sh, project_dir, wrapper, top, syn_attr)
 
     # ------------------------------------------------------------------------
     # FPGA Programmer

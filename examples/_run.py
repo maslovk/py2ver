@@ -66,8 +66,9 @@ def run(p, vectors, stream=False):
         print(f"  {p.t_name}{v} -> {e}")
     ok = _report("simulation", sim, expected, vectors)
     if p._fx_out:                 # fixed point: how far from the float model
+        state_out = {p._py_name.get(n, n) for n in p.state_map.values()}
         for name, (worst, rms) in p.quantization_error(vectors).items():
-            if worst:
+            if worst and name not in state_out:
                 print(f"    {name}: max error {worst:.3g}, rms {rms:.3g} vs. float")
 
     if args.board_sim:
@@ -76,8 +77,16 @@ def run(p, vectors, stream=False):
         got = p.TB_handshake()(vectors, valid=0.6, ready=0.6, seed=1)
         ok &= _report("valid/ready", got, expected, vectors)
         print(f"    wrapper: {p.stream_wrapper().name}, {p.handshake_cycles} clocks")
+    if getattr(p, "_stages", None):
+        ok &= _report("stages", p.TB_stages()(vectors), p.PY_stages()(vectors), vectors)
+        print(f"    {len(p.stages)} stages, {p.stage_cycles} clocks: "
+              + ", ".join(f"{st.callee} ({getattr(st.design, 'ram_phases', 1)} clk/call)"
+                          for st in p.stages))
     if args.syn:
         print(p.SYN(_syn_attr()))
+        if getattr(p, "_stages", None):
+            print("as stages:")
+            print(p.SYN_stages(_syn_attr()))
     if args.board:
         hw = p.HW(_syn_attr())
         ok &= _report("board", [hw(*v) for v in vectors], expected, vectors)
