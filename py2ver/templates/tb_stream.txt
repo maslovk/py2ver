@@ -32,6 +32,9 @@ async def tb_test(dut):
     # Synchronous reset: state registers load their init values on the first edge
     dut.rst.value = 1
     dut.ce.value = 1
+{% if has_vin|default(false) %}
+    dut.vin.value = 0
+{% endif %}
 {% for name in in_names %}
     dut.{{ name }}.value = 0
 {% endfor %}
@@ -41,6 +44,30 @@ async def tb_test(dut):
     dut.rst.value = 0
 
     return_val = []
+{% if stream_latency|default(0) > 0 %}
+    # Pipelined with state: one sample per clock, each result {{ stream_latency }} clocks later
+    for i in range(len(VECTORS) + {{ stream_latency }}):
+        if i < len(VECTORS):
+            vec = VECTORS[i]
+{% for name in in_names %}
+            dut.{{ name }}.value = vec[{{ loop.index0 }}]
+{% endfor %}
+        dut.vin.value = int(i < len(VECTORS))
+        await Timer(10, unit="ns")
+        if i >= {{ stream_latency }}:
+            assert int(dut.vout.value) == 1, f"vout low for sample {i - {{ stream_latency }}}"
+            return_val.append({
+{% for arg in out_args %}
+{% if out_meta.get(arg, {}).get("signed", 0) == 1 %}
+                "{{ arg }}": int(dut.{{ arg }}.value.to_signed()),
+{% else %}
+                "{{ arg }}": int(dut.{{ arg }}.value),
+{% endif %}
+{% endfor %}
+            })
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+{% else %}
     for vec in VECTORS:
 {% for name in in_names %}
         dut.{{ name }}.value = vec[{{ loop.index0 }}]
@@ -67,5 +94,6 @@ async def tb_test(dut):
         # Clock edge loads the next state
         await RisingEdge(dut.clk)
         await Timer(1, unit="ns")
+{% endif %}
 
     await save_results(return_val)

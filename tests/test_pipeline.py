@@ -153,7 +153,6 @@ def test_expr_cost():
 @pytest.mark.parametrize(
     "kwargs, attr, func, exc",
     [
-        ({"pipeline": 2}, LPF_ATTR, lpf_step, NotImplementedError),
         ({"pipeline": 2},
          {"a": {"width": 8}, "b": {"width": 8}, "s": {"width": 9, "type": "reg"}},
          None, NotImplementedError),

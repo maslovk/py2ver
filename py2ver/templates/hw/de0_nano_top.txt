@@ -108,6 +108,10 @@ input       [1:0]  GPIO_1_IN;
 wire input_valid;
 wire ready;
 wire core_step;
+wire core_vout;
+{% if not has_vin %}
+assign core_vout = 1'b0;
+{% endif %}
 
 {% if has_state %}
 // Core state reset: KEY[0] (active-low) or power-on
@@ -180,7 +184,8 @@ wire en_pat  = sw2_on & ~lb_en;
 //=======================================================
 delayed_registers #(
     .LATENCY    ({{ latency }}),
-    .PRE_STEP   ({{ pre_step }})
+    .PRE_STEP   ({{ pre_step }}),
+    .USE_VOUT   ({{ 1 if has_vin else 0 }})
 ) delayed_registers_inst (
     .clk        (CLOCK_50),
     .rst_n      (KEY[0]),
@@ -189,6 +194,7 @@ delayed_registers #(
     .{{ output.name }}    ({{ output.name }}_int),
     .{{ output.name }}_out({{ output.name }}_out_int),
 {% endfor %}
+    .vout       (core_vout),
     .ready      (ready),
     .step       (core_step)
 );
@@ -312,7 +318,12 @@ assign LED[7:5] = 3'b000;
 {% if has_clk %}
     .clk(CLOCK_50),
 {% endif %}
-{% if has_state %}
+{% if has_vin %}
+    .rst(core_rst),
+    .ce(1'b1),
+    .vin(input_valid),
+    .vout(core_vout),
+{% elif has_state %}
     .rst(core_rst),
     .ce(core_step),
 {% elif has_ce %}

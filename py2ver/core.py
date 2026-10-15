@@ -116,36 +116,43 @@ class Py2ver:
         self.rams = {m: dict(r) for m, r in f_visitor._rams.items()}
         self._ram_ports = dict(f_visitor.ram_ports)
         self._ram_init = {m: attr[m].get("init", 0) for m in self.rams}
+        # Automatic pipelining: `pipeline` register stages, balanced so every
+        # output appears exactly `pipeline` clocks after its inputs. With state,
+        # the state loop stays in one stage (see pipeline.py).
+        self.pipeline_stages = int(pipeline)
+        self._pipe = None
+        if self.pipeline_stages:
+            if self.rams:
+                raise NotImplementedError("pipeline cannot be combined with block-RAM memories yet.")
+            if ir.has_clk:
+                raise NotImplementedError(
+                    "Automatic pipelining needs a design without 'reg' signals."
+                )
+            self._pipe = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages,
+                                     state=self.state_map or None)
+            ir = self._pipe.ir
+            f_visitor.attr.clear()
+            f_visitor.attr.update(self._pipe.attr)
+            log.info(
+                "Pipelined into %d stages: +%d register bits, est. stage delays %s%s",
+                self.pipeline_stages + 1, self._pipe.register_bits,
+                [round(d, 2) for d in self._pipe.stage_delay],
+                f", state loop in stage {self._pipe.loop_stage}" if self.state_map else "",
+            )
         if self.state_map or self.rams:
             ir = self._lower_state(ir, f_visitor.attr)
-
-        # Automatic pipelining: `pipeline` register stages, balanced so every
-        # output appears exactly `pipeline` clocks after its inputs.
-        self.pipeline_stages = int(pipeline)
-        if self.pipeline_stages:
-            if self.state_map or self.rams:
-                raise NotImplementedError(
-                    "pipeline cannot be combined with state registers or memories yet."
-                )
-            res = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages)
-            ir = res.ir
-            f_visitor.attr.clear()
-            f_visitor.attr.update(res.attr)
-            log.info(
-                "Pipelined into %d stages: +%d register bits, est. stage delays %s",
-                self.pipeline_stages + 1, res.register_bits,
-                [round(d, 2) for d in res.stage_delay],
-            )
         self.ir = ir
 
         self.has_clk = bool(ir.has_clk)
         self._has_ce = any(p.kind == "ce" for p in ir.inputs)
 
         self.t_name = ir.name
-        self.input_args_list = [p.name for p in ir.inputs if p.kind not in ("clk", "rst", "ce")]
-        self.output_args_list = [p.name for p in ir.outputs]
-        self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in ("clk", "rst", "ce")]
-        self.output_args_width_list = [p.width for p in ir.outputs]
+        control = ("clk", "rst", "ce", "vin")
+        self.input_args_list = [p.name for p in ir.inputs if p.kind not in control]
+        self.output_args_list = [p.name for p in ir.outputs if p.kind != "vout"]
+        self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in control]
+        self.output_args_width_list = [p.width for p in ir.outputs if p.kind != "vout"]
+        self._has_vin = any(p.kind == "vin" for p in ir.inputs)
 
         # Raw IR bit widths (core widths)
         self.input_args_bits = sum(self.input_args_width_list)
@@ -216,6 +223,7 @@ class Py2ver:
             "has_clk": self.has_clk,
             "has_state": bool(self.state_map or self.rams),
             "has_ce": self._has_ce,
+            "has_vin": self._has_vin,
             "outputs_size": self.output_bits,
             # UART / loopback params for DE0_Nano template
             "CLK_HZ": DEFAULT_CLK_FREQ,
@@ -286,12 +294,14 @@ class Py2ver:
         in_names = [p.name for p in ir.inputs]
         out_names = [p.name for p in ir.outputs]
 
-        if ir.has_clk:
+        if ir.has_clk and self._pipe is None:
             raise NotImplementedError(
                 "State registers ('next') cannot be combined with 'reg' signals yet."
             )
-        for reserved in ("clk", "rst", "ce"):
-            if reserved in in_names or reserved in out_names:
+        user_ports = ({q.name for q in ir.inputs if q.kind == "input"}
+                      | {q.name for q in ir.outputs if q.kind != "vout"})
+        for reserved in ("clk", "rst", "ce", "vin", "vout"):
+            if reserved in user_ports:
                 raise ValueError(f"'{reserved}' is a reserved port name in designs with state.")
         for s, n in self.state_map.items():
             if s not in in_names:
@@ -305,11 +315,15 @@ class Py2ver:
         # With a block RAM, a sample takes two clocks (read, then compute and
         # write); state commits in the second one.
         commit = "(ce && __phase)" if self.rams else "ce"
+        if self._pipe is not None:
+            # Only a real sample reaching the loop stage updates the state
+            commit = f"(ce && {self._pipe.valid_at_loop})"
         for p in ir.inputs:
             if p.name not in self.state_map:
                 continue
             n = self.state_map[p.name]
             init = self.state_init[p.name] & ((1 << p.width) - 1)
+            n_value = self._pipe.next_at_loop.get(n, n) if self._pipe else n
             # Literal takes the next value's signedness so n is extended by its
             # own sign, matching how PY_stream() wraps it.
             n_signed = int(attr.get(n, {}).get("signed", 0)) == 1
@@ -318,13 +332,15 @@ class Py2ver:
             # selection would turn unsigned and zero-extend a signed n
             hold = f"$signed({p.name})" if n_signed else f"$unsigned({p.name})"
             assigns.append(
-                Assignment(left=p.name, right=f"rst ? {lit} : ({commit} ? {n} : {hold})", is_reg=True)
+                Assignment(left=p.name, right=f"rst ? {lit} : ({commit} ? {n_value} : {hold})",
+                           is_reg=True)
             )
 
         inputs = [p for p in ir.inputs if p.name not in self.state_map]
-        inputs.append(Port(name="clk", width=1, signed=False, kind="clk"))
-        inputs.append(Port(name="rst", width=1, signed=False, kind="rst"))
-        inputs.append(Port(name="ce", width=1, signed=False, kind="ce"))
+        have = {p.name for p in inputs}
+        for name, kind in (("clk", "clk"), ("rst", "rst"), ("ce", "ce")):
+            if name not in have:
+                inputs.append(Port(name=name, width=1, signed=False, kind=kind))
 
         return ModuleIR(
             name=ir.name,
@@ -889,6 +905,7 @@ class Py2ver:
             "has_clk": self.has_clk,
             "has_rst": any(p.kind == "rst" for p in self.ir.inputs),
             "has_ce": self._has_ce,
+            "has_vin": self._has_vin,
         }
         path = self.hdl_dir / f"{self.t_name}_stream.v"
         path.write_text(self.get_template("stream_wrapper.txt").render(ctx), encoding="utf-8")
@@ -1138,6 +1155,9 @@ class Py2ver:
             "pipeline_stages": self.pipeline_stages,
             "has_ce": self._has_ce,
             "two_phase": bool(self.rams),
+            "has_vin": self._has_vin,
+            # With state and a pipeline, results come out this many clocks later
+            "stream_latency": self.pipeline_stages if self._has_vin else 0,
         })
         (self.outdir / "tb.py").write_text(tb_out, encoding="utf-8")
 

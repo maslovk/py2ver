@@ -34,6 +34,11 @@ module {{ name }}_stream (
 {% if mode == "pipe" %}
     wire ce = !m_valid || m_ready;
     assign s_ready = ce;
+{% if has_vin %}
+    // The core carries the valid bit itself (its state only updates for real samples)
+    wire core_vout;
+    assign m_valid = core_vout;
+{% else %}
 
     // valid bit travelling alongside the data
     reg [{{ stages - 1 }}:0] vpipe;
@@ -48,10 +53,16 @@ module {{ name }}_stream (
 {% endif %}
     end
     assign m_valid = vpipe[{{ stages - 1 }}];
+{% endif %}
 
     {{ name }} u_core (
         .clk(clk),
         .ce(ce),
+{% if has_vin %}
+        .rst(rst),
+        .vin(s_valid),
+        .vout(core_vout),
+{% endif %}
 {% for c in in_conns %}
         .{{ c[0] }}(s_{{ c[0] }}),
 {% endfor %}

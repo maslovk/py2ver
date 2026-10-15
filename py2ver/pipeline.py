@@ -53,13 +53,27 @@ class PipelineResult:
     stage: Dict[str, int] = field(default_factory=dict)
     register_bits: int = 0
     stage_delay: List[float] = field(default_factory=list)
+    # With state: the stage holding the state loop, the valid bit of the
+    # sample in that stage, and each next-state output's value at that stage
+    loop_stage: int = 0
+    valid_at_loop: str = ""
+    next_at_loop: Dict[str, str] = field(default_factory=dict)
 
 
 def _rename(expr: str, mapping: Dict[str, str]) -> str:
     return _IDENT.sub(lambda m: mapping.get(m.group(0), m.group(0)), expr)
 
 
-def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> PipelineResult:
+def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
+                state: Dict[str, str] | None = None) -> PipelineResult:
+    """
+    state maps state inputs to their next-state outputs (before the state
+    registers are added). The state loop (state -> ... -> next state) stays in
+    one stage so a sample per clock still works; logic that only depends on
+    inputs is pipelined before it, logic from the state to the outputs after
+    it. A valid bit (vin -> vout) travels with each sample so the state only
+    updates for real samples.
+    """
     if stages < 0:
         raise ValueError("pipeline stages must be >= 0")
     if stages == 0:
@@ -71,6 +85,7 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
         )
 
     attr = {k: dict(v) for k, v in attr.items()}
+    state = dict(state or {})
     inputs = [p.name for p in ir.inputs if p.kind == "input"]
     outputs = [p.name for p in ir.outputs]
     ports = {p.name: p for p in ir.inputs + ir.outputs}
@@ -97,17 +112,17 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
 
     # Topological order (program order normally already is)
     order: List[str] = []
-    state: Dict[str, int] = {}
+    mark: Dict[str, int] = {}
 
     def _visit(n: str) -> None:
-        if n not in deps or state.get(n) == 2:
+        if n not in deps or mark.get(n) == 2:
             return
-        if state.get(n) == 1:
+        if mark.get(n) == 1:
             raise ValueError(f"Combinational loop through '{n}'")
-        state[n] = 1
+        mark[n] = 1
         for d in deps[n]:
             _visit(d)
-        state[n] = 2
+        mark[n] = 2
         order.append(n)
 
     for a in assigns:
@@ -123,22 +138,50 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
     nonconst = [n for n in order if n not in const]
     cost = {n: expr_cost(by_left[n].right) for n in nonconst}
 
+    # State loop: signals on a path from a state input to a next-state output
+    state_inputs = set(state)
+    next_c = {out_c[n] for n in state.values()}
+    fwd: Set[str] = set(state_inputs)            # depends on the state
+    for n in order:
+        if any(d in fwd for d in deps[n]):
+            fwd.add(n)
+    bwd: Set[str] = set(next_c)                  # feeds a next-state output
+    for n in reversed(order):
+        if n in bwd:
+            bwd.update(deps[n])
+    loop = fwd & bwd
+
     def _schedule(limit: float) -> Tuple[Dict[str, int], Dict[str, float]]:
         """
         Greedy ASAP stages: a signal joins the latest stage of its inputs unless
         that would push the stage's delay past `limit`, then it starts the next
-        stage (its inputs from earlier stages arrive through registers).
+        stage (its inputs from earlier stages arrive through registers). With
+        state, input-only logic is placed first, the loop goes in the stage
+        after its latest input-only operand, and is never split.
         """
         stg: Dict[str, int] = {i: 0 for i in inputs}
         rel: Dict[str, float] = {i: 0.0 for i in inputs}
-        for n in nonconst:
+
+        def place(n: str, split: bool) -> None:
             ds = [d for d in deps[n] if d not in const]
             s = max((stg[d] for d in ds), default=0)
             begin = max((rel[d] for d in ds if stg[d] == s), default=0.0)
-            if begin > 0 and begin + cost[n] > limit + 1e-9:
+            if split and begin > 0 and begin + cost[n] > limit + 1e-9:
                 s, begin = s + 1, 0.0
             stg[n] = s
             rel[n] = begin + cost[n]
+
+        for n in nonconst:
+            if n not in fwd:
+                place(n, split=True)
+        if state:
+            k = max((stg[d] for n in loop if n in deps for d in deps[n]
+                     if d not in fwd and d not in const), default=0)
+            for si in state_inputs:
+                stg[si], rel[si] = k, 0.0
+            for n in nonconst:
+                if n in fwd:
+                    place(n, split=n not in loop)
         return stg, rel
 
     # Smallest per-stage delay limit that fits in stages + 1 segments
@@ -152,6 +195,9 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
         else:
             lo = mid
     stage, rel = _schedule(hi)
+    if max(stage.values(), default=0) > stages:
+        raise NotImplementedError("Could not fit the design into the requested stages")
+    loop_stage = stage[next(iter(state_inputs))] if state else 0
 
     stage_delay = [0.0] * (stages + 1)
     for n in nonconst:
@@ -180,6 +226,10 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
         src = c if c in const else _at(c, stages)
         new_assigns.append(Assignment(y, src, False))
 
+    # Next-state values as the state registers see them (in the loop stage)
+    next_at_loop = {n: (out_c[n] if out_c[n] in const else _at(out_c[n], loop_stage))
+                    for n in state.values()}
+
     register_bits = 0
     for name, k in sorted(need.items()):
         meta = _meta(name, attr, ports)
@@ -194,12 +244,26 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int) -> P
         Port(name="clk", width=1, signed=False, kind="clk"),
         Port(name="ce", width=1, signed=False, kind="ce"),
     ]
+    new_outputs = list(ir.outputs)
+    valid_at_loop = ""
+    if state:
+        # Valid bit travelling with the samples: vin -> __v1 .. __vN -> vout
+        new_inputs.append(Port(name="vin", width=1, signed=False, kind="vin"))
+        new_outputs.append(Port(name="vout", width=1, signed=False, kind="vout"))
+        for j in range(1, stages + 1):
+            prev = "vin" if j == 1 else f"__v{j - 1}"
+            attr[f"__v{j}"] = {"width": 1, "signed": 0, "type": "reg"}
+            # Cleared by rst (added with the state registers), so no stale valids
+            new_assigns.append(Assignment(f"__v{j}", f"rst ? 1'b0 : (ce ? {prev} : __v{j})", True))
+        new_assigns.append(Assignment("vout", f"__v{stages}", False))
+        valid_at_loop = "vin" if loop_stage == 0 else f"__v{loop_stage}"
     new_ir = ModuleIR(
         name=ir.name,
         inputs=new_inputs,
-        outputs=list(ir.outputs),
+        outputs=new_outputs,
         assigns=new_assigns,
         has_clk=True,
         items=list(ir.items),
     )
-    return PipelineResult(new_ir, attr, stage, register_bits, stage_delay)
+    return PipelineResult(new_ir, attr, stage, register_bits, stage_delay,
+                          loop_stage, valid_at_loop, next_at_loop)

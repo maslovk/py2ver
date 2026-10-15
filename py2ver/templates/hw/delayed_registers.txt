@@ -5,14 +5,18 @@
 // `ready` (send the outputs) and `step` (advance a stateful core by one
 // sample, after its outputs were captured). With PRE_STEP = 1 (a core with
 // block RAM), `step` is also pulsed right after input_valid, for the clock
-// in which the core reads its RAM.
+// in which the core reads its RAM. With USE_VOUT = 1 (a pipelined core with
+// state, which tracks its samples itself), the outputs are latched when the
+// core raises vout instead of after LATENCY clocks.
 module delayed_registers #(
     parameter int LATENCY = 0,
-    parameter int PRE_STEP = 0
+    parameter int PRE_STEP = 0,
+    parameter int USE_VOUT = 0
 ) (
     input  logic clk,
     input  logic rst_n, // Active-low reset
     input  logic input_valid,
+    input  logic vout,
 {%- for output in outputs %}
     input  logic [{{ output.width - 1 }}:0] {{ output.name }},
     output logic [{{ output.width - 1 }}:0] {{ output.name }}_out,
@@ -41,7 +45,7 @@ module delayed_registers #(
                 count <= '0;
                 step  <= (PRE_STEP != 0);
             end else if (busy) begin
-                if (count == LATENCY + PRE_STEP) begin
+                if (USE_VOUT != 0 ? vout : (count == LATENCY + PRE_STEP)) begin
 {%- for output in outputs %}
                     {{ output.name }}_out <= {{ output.name }};
 {%- endfor %}

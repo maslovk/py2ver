@@ -118,8 +118,16 @@ p.SYN(syn_attr)          # SHA-256 4 rounds on EP4CE22: 31 MHz -> 88 MHz
 
 Delay is estimated per assignment from its operators, and one assignment is
 never split, so break long expressions into temporaries for finer stages.
-Constants are not registered. Pipelining can't yet be combined with state
-registers or `'type': 'reg'` signals.
+Constants are not registered. Pipelining can't be combined with `'type':
+'reg'` signals or block-RAM memories.
+
+With state (`'next'`), the state loop (state -> ... -> next state) must finish
+in one clock to keep a sample per clock, so it stays in one stage: logic that
+only depends on inputs is pipelined before it, logic from the state to the
+outputs after it. A valid bit travels with each sample (`vin` -> `vout` on
+the module) so gaps in the input never update the state; `TB_stream()`,
+`HW()` and the stream wrapper drive it for you. A FIR filter whose delay line
+is state goes from 84 to 126 MHz with `pipeline=2`.
 
 ### Valid/ready streaming interface
 
