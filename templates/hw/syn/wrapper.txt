@@ -1,0 +1,28 @@
+`timescale 1ns/1ps
+
+// Synthesis wrapper for {{ top_name }}: registers every core input and output
+// so timing analysis measures register-to-register paths through the core.
+module {{ wrapper }}(
+{{ port_decls|join(",\n") }}
+);
+{% for p in inputs %}
+  reg [{{ p.width - 1 }}:0] {{ p.name }}_q;
+{%- endfor %}
+{%- for p in outputs %}
+  wire [{{ p.width - 1 }}:0] {{ p.name }}_w;
+{%- endfor %}
+
+  always @(posedge clk) begin
+{%- for p in inputs %}
+    {{ p.name }}_q <= {{ p.name }}_in;
+{%- endfor %}
+{%- for p in outputs %}
+    {{ p.name }}_out <= {{ p.name }}_w;
+{%- endfor %}
+  end
+
+  {{ top_name }} u_core (
+{{ conns|join(",\n") }}
+  );
+
+endmodule

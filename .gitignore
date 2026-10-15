@@ -10,6 +10,7 @@ hdl/
 sim_build/
 results/
 /hw/
+/syn/
 tb.py
 *.vcd
 *.fst

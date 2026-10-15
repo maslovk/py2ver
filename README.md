@@ -51,7 +51,7 @@ foo_hw = p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
 print(foo_hw(3, 1))        # synthesizes, programs the board, runs over UART
 ```
 
-Generated files (`hdl/`, `sim_build/`, `tb.py`, `results/`, `hw/`) are written
+Generated files (`hdl/`, `sim_build/`, `tb.py`, `results/`, `hw/`, `syn/`) are written
 to the current working directory.
 
 ### Attributes
@@ -94,6 +94,32 @@ returns every output for each sample, read before the clock edge that loads
 the next state. State cannot yet be combined with `'type': 'reg'` signals,
 and `HW()` does not support stateful designs yet.
 
+### Area and timing (`SYN()`)
+
+`SYN()` compiles the generated module alone with Quartus (no board needed,
+nothing is programmed) and reports what it costs:
+
+```python
+r = p.SYN({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
+print(r)
+# Device:          EP4CE22F17C6
+# Combinational:   48
+# Registers:       16
+# 9-bit mults:     0
+# Memory bits:     0
+# Fmax:            194.21 MHz
+# Timing @ 50 MHz: met (worst setup slack 14.851 ns)
+r.fmax_mhz, r.meets_timing, r.fit_summary   # fields for scripting
+```
+
+The module is wrapped with registers on all inputs and outputs, so Fmax is
+for register-to-register paths through your logic, and its I/O uses virtual
+pins, so wide designs fit. Logic, multiplier and memory counts are the
+module's alone; registers are the module's own (state or `reg` signals).
+Options: `QUARTUS_DIR` (default: `quartus_sh` on `PATH`), `CLK_PERIOD_NS`
+(default 20), `DEVICE` (default `EP4CE22F17C6`), `FAMILY` (default
+`Cyclone IV E`). The project is written to `syn/<name>/`.
+
 `HW()` options: `QUARTUS_DIR` (required), `UART_PORT` (default `/dev/ttyUSB0`),
 `UART_BAUD` (default `115200`), `UART_TIMEOUT` (default `1.0` s).
 
@@ -114,6 +140,7 @@ multiple `return` statements.
 
 ```
 .venv/bin/python -m pytest -q
+QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # also runs the Quartus test
 ```
 
 Simulation tests compare the Python function against the cocotb + Icarus

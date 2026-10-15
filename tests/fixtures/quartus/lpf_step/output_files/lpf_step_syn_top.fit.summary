@@ -1,0 +1,16 @@
+Fitter Status : Successful - Thu Oct 15 06:28:53 2026
+Quartus Prime Version : 22.1std.0 Build 915 10/25/2022 SC Standard Edition
+Revision Name : lpf_step_syn_top
+Top-level Entity Name : lpf_step_syn_top
+Family : Cyclone IV E
+Device : EP4CE22F17C6
+Timing Models : Final
+Total logic elements : 49 / 22,320 ( < 1 % )
+    Total combinational functions : 48 / 22,320 ( < 1 % )
+    Dedicated logic registers : 45 / 22,320 ( < 1 % )
+Total registers : 45
+Total pins : 1 / 154 ( < 1 % )
+Total virtual pins : 29
+Total memory bits : 0 / 608,256 ( 0 % )
+Embedded Multiplier 9-bit elements : 0 / 132 ( 0 % )
+Total PLLs : 0 / 4 ( 0 % )

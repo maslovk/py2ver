@@ -37,6 +37,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 import tb_runner
 from renderer import Renderer
+from syn_report import SynReport, read_report
 from visitor import FunctionVisitor
 from ast_ir import Assignment, ModuleIR, Port
 
@@ -53,6 +54,11 @@ DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 DEFAULT_CLK_FREQ = 50_000_000
 DEFAULT_BAUD_RATE = 115_200
 DEFAULT_TB_PERIOD = 2000
+
+# Standalone synthesis defaults (DE0-Nano device, 50 MHz)
+DEFAULT_SYN_FAMILY = "Cyclone IV E"
+DEFAULT_SYN_DEVICE = "EP4CE22F17C6"
+DEFAULT_SYN_PERIOD_NS = 20.0
 
 log = logging.getLogger(__name__)
 
@@ -645,6 +651,114 @@ class Py2ver:
 
         self._program_fpga(syn_tool_dir, project_dir, project_name)
         return True
+
+    # ------------------------------------------------------------------------
+    # Standalone synthesis (area / timing of the core only, no board)
+    # ------------------------------------------------------------------------
+
+    @property
+    def _syn_dir(self) -> Path:
+        return self.outdir / "syn" / self.t_name
+
+    def SYN(self, syn_attr: Dict[str, Any] | None = None) -> SynReport:
+        """
+        Compile the core alone with Quartus (no board, no programming) and
+        return its area and timing.
+
+        syn_attr may contain:
+            'QUARTUS_DIR':   path to quartus/bin (default: quartus_sh on PATH)
+            'CLK_PERIOD_NS': target clock period (default 20.0, i.e. 50 MHz)
+            'DEVICE':        FPGA part (default EP4CE22F17C6, DE0-Nano)
+            'FAMILY':        device family (default "Cyclone IV E")
+        """
+        syn_attr = dict(syn_attr or {})
+        tool_dir = syn_attr.get("QUARTUS_DIR")
+        quartus_sh = (
+            os.path.join(tool_dir, "quartus_sh") if tool_dir else shutil.which("quartus_sh")
+        )
+        if not quartus_sh or not os.path.exists(quartus_sh):
+            raise RuntimeError(
+                "quartus_sh not found; set 'QUARTUS_DIR' to Quartus's bin directory "
+                f"(looked for: {quartus_sh or 'quartus_sh on PATH'})"
+            )
+
+        project_dir = self.gen_syn_project(syn_attr)
+        revision = f"{self.t_name}_syn_top"
+
+        log.info("Running Quartus synthesis/fit/timing for %s...", self.t_name)
+        result = subprocess.run(
+            [quartus_sh, "--flow", "compile", revision],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            errors = [l for l in result.stdout.splitlines() if l.lstrip().startswith("Error")]
+            raise RuntimeError(
+                f"Quartus compile failed (rc={result.returncode}) in {project_dir}:\n"
+                + "\n".join(errors[:20] or result.stdout.splitlines()[-20:])
+            )
+
+        report = read_report(
+            project_dir, revision, self.t_name,
+            float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)),
+        )
+        log.info("Synthesis report for %s:\n%s", self.t_name, report)
+        return report
+
+    def gen_syn_project(self, syn_attr: Dict[str, Any]) -> Path:
+        """
+        Write a Quartus project that compiles only the generated core inside a
+        wrapper that registers all of its inputs and outputs (virtual pins, so
+        wide cores fit). Returns the project directory.
+        """
+        wrapper = f"{self.t_name}_syn_top"
+        core_in = [p for p in self.ir.inputs if p.kind != "clk"]
+        core_out = list(self.ir.outputs)
+
+        def _rng(w: int) -> str:
+            return f"[{w - 1}:0] " if w > 1 else ""
+
+        port_decls = ["  input clk"]
+        port_decls += [f"  input {_rng(p.width)}{p.name}_in" for p in core_in]
+        port_decls += [f"  output reg {_rng(p.width)}{p.name}_out" for p in core_out]
+
+        conns = []
+        if self.has_clk:
+            conns.append("    .clk(clk)")
+        conns += [f"    .{p.name}({p.name}_q)" for p in core_in]
+        conns += [f"    .{p.name}({p.name}_w)" for p in core_out]
+
+        ctx = {
+            "top_name": self.t_name,
+            "wrapper": wrapper,
+            "inputs": core_in,
+            "outputs": core_out,
+            "port_decls": port_decls,
+            "conns": conns,
+            "family": syn_attr.get("FAMILY", DEFAULT_SYN_FAMILY),
+            "device": syn_attr.get("DEVICE", DEFAULT_SYN_DEVICE),
+            "period_ns": float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)),
+        }
+
+        project_dir = self._syn_dir
+        if project_dir.is_dir():
+            shutil.rmtree(project_dir)
+        project_dir.mkdir(parents=True)
+
+        (project_dir / f"{wrapper}.qpf").write_text(
+            f"PROJECT_REVISION = {wrapper}\n", encoding="utf-8"
+        )
+        for tpl, name in (
+            ("hw/syn/qsf.txt", f"{wrapper}.qsf"),
+            ("hw/syn/sdc.txt", f"{wrapper}.sdc"),
+            ("hw/syn/wrapper.txt", f"{wrapper}.v"),
+        ):
+            self.get_template(tpl).stream(ctx).dump(str(project_dir / name))
+        shutil.copy(self.hdl_dir / "main.v", project_dir / f"{self.t_name}.v")
+
+        log.info("Synthesis project created at %s", project_dir)
+        return project_dir
 
     # ------------------------------------------------------------------------
     # Testbench

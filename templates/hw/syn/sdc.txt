@@ -1,0 +1,2 @@
+create_clock -name clk -period {{ period_ns }} [get_ports clk]
+derive_clock_uncertainty

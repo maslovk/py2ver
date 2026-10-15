@@ -1,0 +1,12 @@
+set_global_assignment -name FAMILY "{{ family }}"
+set_global_assignment -name DEVICE {{ device }}
+set_global_assignment -name TOP_LEVEL_ENTITY {{ wrapper }}
+set_global_assignment -name VERILOG_FILE {{ top_name }}.v
+set_global_assignment -name VERILOG_FILE {{ wrapper }}.v
+set_global_assignment -name SDC_FILE {{ wrapper }}.sdc
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+# Area/timing only: no bitstream needed
+set_global_assignment -name FLOW_DISABLE_ASSEMBLER ON
+# Core I/O does not need real pins; only clk is placed
+set_instance_assignment -name VIRTUAL_PIN ON -to *_in*
+set_instance_assignment -name VIRTUAL_PIN ON -to *_out*
