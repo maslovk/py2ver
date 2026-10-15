@@ -38,6 +38,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 import tb_runner
 from renderer import Renderer
 from syn_report import SynReport, read_report
+from pipeline import pipeline_ir
 from visitor import FunctionVisitor
 from ast_ir import Assignment, ModuleIR, Port
 
@@ -69,7 +70,7 @@ class Py2ver:
     t_name: str = ""
 
     def __init__(self, func: Callable, attr: Dict[str, Any],
-                 template_dir: Path = DEFAULT_TEMPLATE_DIR) -> None:
+                 template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0) -> None:
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
 
         try:
@@ -87,6 +88,24 @@ class Py2ver:
         self.state_map, self.state_init = self._parse_state(attr)
         if self.state_map:
             ir = self._lower_state(ir, f_visitor.attr)
+
+        # Automatic pipelining: `pipeline` register stages, balanced so every
+        # output appears exactly `pipeline` clocks after its inputs.
+        self.pipeline_stages = int(pipeline)
+        if self.pipeline_stages:
+            if self.state_map:
+                raise NotImplementedError(
+                    "pipeline cannot be combined with state registers ('next') yet."
+                )
+            res = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages)
+            ir = res.ir
+            f_visitor.attr.clear()
+            f_visitor.attr.update(res.attr)
+            log.info(
+                "Pipelined into %d stages: +%d register bits, est. stage delays %s",
+                self.pipeline_stages + 1, res.register_bits,
+                [round(d, 2) for d in res.stage_delay],
+            )
         self.ir = ir
 
         self.has_clk = bool(ir.has_clk)
@@ -454,6 +473,8 @@ class Py2ver:
             raise NotImplementedError(
                 "HW() does not support state registers ('next') yet; use TB_stream()."
             )
+        if self.pipeline_stages:
+            raise NotImplementedError("HW() does not support pipelined designs yet.")
         self.syn_attr = syn_attr
         self._hw_ok = self.createHWproject()
         return self.hw_fun
@@ -802,6 +823,7 @@ class Py2ver:
             "out_meta": self.out_meta,
             "latency_cycles": int(getattr(self, "tb_latency_cycles", 0)),
             "out_latency": dict(getattr(self, "out_latency", {})),
+            "pipeline_stages": self.pipeline_stages,
         })
         (self.outdir / "tb.py").write_text(tb_out, encoding="utf-8")
 

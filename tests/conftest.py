@@ -66,8 +66,8 @@ def assert_python_matches_sim(monkeypatch):
     monkeypatch.chdir(ROOT)
     monkeypatch.setenv("SIM", "icarus")
 
-    def _run(func, attr, vectors):
-        p = Py2ver(func, attr)
+    def _run(func, attr, vectors, **py2ver_kwargs):
+        p = Py2ver(func, attr, **py2ver_kwargs)
         vectors = [tuple(vec) for vec in vectors]
         sim_outs = p.TB_batch()(vectors)
         assert len(sim_outs) == len(vectors)

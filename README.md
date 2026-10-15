@@ -94,6 +94,26 @@ returns every output for each sample, read before the clock edge that loads
 the next state. State cannot yet be combined with `'type': 'reg'` signals,
 and `HW()` does not support stateful designs yet.
 
+### Automatic pipelining
+
+`Py2ver(func, attr, pipeline=N)` splits a combinational design into `N + 1`
+stages of roughly equal estimated delay. It adds registers where values cross
+a stage boundary, plus delay registers for values that skip stages, so every
+output appears exactly `N` clocks after its inputs and a new input can be
+applied every clock. `TB()`/`TB_batch()` simulate it that way (one vector per
+clock) and compare as usual.
+
+```python
+p = Py2ver(sha4_round_core, attr, pipeline=3)
+p.TB_batch()(vectors)    # same results as unpipelined, 3 clocks later
+p.SYN(syn_attr)          # SHA-256 4 rounds on EP4CE22: 31 MHz -> 88 MHz
+```
+
+Delay is estimated per assignment from its operators, and one assignment is
+never split, so break long expressions into temporaries for finer stages.
+Constants are not registered. Pipelining can't yet be combined with state
+registers or `'type': 'reg'` signals, and `HW()` does not support it yet.
+
 ### Area and timing (`SYN()`)
 
 `SYN()` compiles the generated module alone with Quartus (no board needed,

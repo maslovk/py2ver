@@ -40,6 +40,33 @@ async def tb_test(dut):
     {% endif %}
 
     return_val = []
+    {% set ps = pipeline_stages|default(0)|int %}
+    {% if ps > 0 %}
+    # Balanced pipeline: a new vector every clock, its outputs {{ ps }} clocks later
+    for i in range(len(VECTORS) + {{ ps }}):
+        if i < len(VECTORS):
+            vec = VECTORS[i]
+    {% for name in in_names %}
+            dut.{{ name }}.value = vec[{{ loop.index0 }}]
+    {% endfor %}
+
+        await Timer(10, unit="ns")
+
+        if i >= {{ ps }}:
+            return_val.append({
+            {% for arg in out_args %}
+                {% if out_meta.get(arg, {}).get("signed", 0) == 1 %}
+                "{{ arg }}": int(dut.{{ arg }}.value.to_signed()),
+                {% else %}
+                "{{ arg }}": int(dut.{{ arg }}.value),
+                {% endif %}
+            {% endfor %}
+            })
+
+        await RisingEdge(dut.clk)
+        await Timer(1, unit="ns")
+
+    {% else %}
     for vec in VECTORS:
     {% for name in in_names %}
         dut.{{ name }}.value = vec[{{ loop.index0 }}]
@@ -65,5 +92,6 @@ async def tb_test(dut):
             {% endif %}
         {% endfor %}
         })
+    {% endif %}
 
     await save_results(return_val)
