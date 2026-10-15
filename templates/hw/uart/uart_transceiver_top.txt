@@ -12,9 +12,9 @@ module uart_transceiver #(
     parameter bit RX_MAJ3         = 1'b1, // 3-sample majority around mid-bit
     // RX tuning knobs
     // For OSR=16, center 7–8 is a more typical mid-bit sampling region.
-    parameter int unsigned RX_CENTER     = 8,
+    parameter int RX_CENTER     = 8,
     // Require a few consecutive low samples to qualify start bit
-    parameter int unsigned RX_START_QUAL = 2    // 0..n os_ticks low to qualify start
+    parameter int RX_START_QUAL = 2    // 0..n os_ticks low to qualify start
 )(
     input  logic                   clk,
     input  logic                   rst_n,

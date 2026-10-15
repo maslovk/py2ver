@@ -44,12 +44,44 @@ module uart_fixed_pattern_tx #(
     );
 
     // --------------------- Pattern ROM -----------------
-    localparam logic [7:0] PATTERN [0:NUM_BYTES-1] = '{
-        8'h55, 8'hAA, 8'h33, 8'hCC, 8'hF0, 8'h0F, 8'h69, 8'h96,
-        8'h00, 8'hFF, 8'h77, 8'h88, 8'h3C, 8'hC3, 8'h5A, 8'hA5,
-        8'h12, 8'h34, 8'h56, 8'h78, 8'h9A, 8'hBC, 8'hDE, 8'hEF,
-        8'h13, 8'h37, 8'h7B, 8'hDB, 8'hF5, 8'hAF, 8'hC1, 8'h1C
-    };
+    // (case function rather than an array constant, for simulator portability)
+    function automatic [7:0] pattern_byte(input integer i);
+        case (i)
+            0: pattern_byte = 8'h55;
+            1: pattern_byte = 8'hAA;
+            2: pattern_byte = 8'h33;
+            3: pattern_byte = 8'hCC;
+            4: pattern_byte = 8'hF0;
+            5: pattern_byte = 8'h0F;
+            6: pattern_byte = 8'h69;
+            7: pattern_byte = 8'h96;
+            8: pattern_byte = 8'h00;
+            9: pattern_byte = 8'hFF;
+            10: pattern_byte = 8'h77;
+            11: pattern_byte = 8'h88;
+            12: pattern_byte = 8'h3C;
+            13: pattern_byte = 8'hC3;
+            14: pattern_byte = 8'h5A;
+            15: pattern_byte = 8'hA5;
+            16: pattern_byte = 8'h12;
+            17: pattern_byte = 8'h34;
+            18: pattern_byte = 8'h56;
+            19: pattern_byte = 8'h78;
+            20: pattern_byte = 8'h9A;
+            21: pattern_byte = 8'hBC;
+            22: pattern_byte = 8'hDE;
+            23: pattern_byte = 8'hEF;
+            24: pattern_byte = 8'h13;
+            25: pattern_byte = 8'h37;
+            26: pattern_byte = 8'h7B;
+            27: pattern_byte = 8'hDB;
+            28: pattern_byte = 8'hF5;
+            29: pattern_byte = 8'hAF;
+            30: pattern_byte = 8'hC1;
+            31: pattern_byte = 8'h1C;
+            default: pattern_byte = 8'h00;
+        endcase
+    endfunction
 
     logic [$clog2(NUM_BYTES)-1:0] idx;
 
@@ -128,7 +160,7 @@ module uart_fixed_pattern_tx #(
                     end else begin
                         // 1) Launch exactly one byte while TX is idle
                         if (!launch_pending && !tx_busy_b) begin
-                            tx_byte_b      <= PATTERN[idx];
+                            tx_byte_b      <= pattern_byte(idx);
                             tx_start_b     <= 1'b1;   // 1-cycle pulse
                             launch_pending <= 1'b1;   // wait for acceptance
                         end

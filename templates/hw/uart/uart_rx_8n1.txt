@@ -10,8 +10,8 @@
 module uart_rx_8n1 #(
     parameter bit RX_ENA_STOPCHK = 1'b1,
     parameter bit RX_MAJ3        = 1'b1,   // majority disabled by default
-    parameter int unsigned CENTER = 8,     // safe range 2..13
-    parameter int unsigned START_QUAL = 0,
+    parameter int CENTER = 8,     // safe range 2..13
+    parameter int START_QUAL = 0,
     parameter bit RX_INVERT      = 1'b0
 )(
     input  logic clk,
@@ -81,7 +81,7 @@ module uart_rx_8n1 #(
             sample_bit_w = rx_eff;
         end else begin
             // Majority of last 3 samples in rx_hist
-            int unsigned sum;
+            int sum;
             sum = rx_hist[0] + rx_hist[1] + rx_hist[2];
             sample_bit_w = (sum >= 2);
         end

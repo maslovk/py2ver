@@ -17,8 +17,8 @@ module uart_baud_gen #(
     // ---------------- Fractional divider (Bresenham) ----------------
     // Each clk: acc += INC; if acc >= MOD -> os_tick=1 and acc -= MOD.
     // Average tick rate = (INC / MOD) * fclk = (BAUD*OSR) exactly (on average).
-    localparam int unsigned INC = BAUD * OSR;   // e.g. 115200*16 = 1_843_200
-    localparam int unsigned MOD = CLK_HZ;       // e.g. 50_000_000
+    localparam int INC = BAUD * OSR;   // e.g. 115200*16 = 1_843_200
+    localparam int MOD = CLK_HZ;       // e.g. 50_000_000
 
     // State
     logic [31:0] acc;            // accumulator
