@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 from cocotb_tools.runner import get_runner
 
@@ -44,10 +45,16 @@ def test_runner(top_name: str, proj_path: Path | None = None):
         build_args=build_test_args,
     )
 
-    # Run cocotb tests in the same build_dir, using tb.py as test_module
-    runner.test(
-        hdl_toplevel=top_name,
-        test_module="tb",
-        build_dir=str(build_dir),
-        test_args=build_test_args,
-    )
+    # Run cocotb tests in the same build_dir, using tb.py as test_module.
+    # The runner derives the simulator's PYTHONPATH from sys.path, so put
+    # proj_path first to import this tb.py rather than any other on the path.
+    sys.path.insert(0, str(proj_path))
+    try:
+        runner.test(
+            hdl_toplevel=top_name,
+            test_module="tb",
+            build_dir=str(build_dir),
+            test_args=build_test_args,
+        )
+    finally:
+        sys.path.remove(str(proj_path))
