@@ -54,6 +54,7 @@ from .fold import fold_loop
 from .share import ROM_MIN, share
 from .comprehend import expand_comprehensions
 from .control import structure, while_bound
+from .choose import choose
 from .fixed import DEFAULT_CONST_BITS, build_model, is_table, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
@@ -188,7 +189,8 @@ class Py2ver:
                  round: bool = False, saturate: bool = False,
                  fold: Any = None, unroll: int = 1,
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
-                 multipliers: int | None = None) -> None:
+                 multipliers: int | None = None, rate: float | None = None,
+                 clock: float = DEFAULT_CLK_FREQ) -> None:
         """
         func: the function, as written. attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
@@ -206,6 +208,9 @@ class Py2ver:
         multipliers: run the design over several clocks on this many
         shared multipliers, with each function table in block RAM (see
         share.py).
+        rate: samples per second the design must keep up with at `clock` Hz
+        (default 50 MHz): fold / unroll / multipliers are chosen to fit, as
+        small as possible, and the choice is printed (see choose.py).
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
         # numpy / methods: translated into a scalar function first (see numpy_fe.py)
@@ -237,6 +242,24 @@ class Py2ver:
         self._complex_names = fe.complex_names
         # Folding: the loop's body runs once per clock (phase) instead of unrolled
         self._fold: Dict[str, Any] | None = None
+        # rate=: the smallest structure that keeps up (fold, multipliers= or unrolled)
+        self.choice = None
+        if rate is not None:
+            if multipliers or (fold is not None and fold is not False):
+                raise ValueError("rate= chooses fold / multipliers itself; give rate= or those")
+            budget = int(clock // rate)
+            if budget < 1:
+                raise ValueError(f"{rate:g} samples/s is more than one sample per clock at "
+                                 f"{clock / 1e6:g} MHz")
+            self.choice = choose(tree, attr, budget)
+            if pipeline and self.choice.kind != "unrolled":
+                raise ValueError(f"pipeline= keeps one sample per clock; {rate:g} samples/s "
+                                 f"allows {budget} clocks per sample (drop pipeline=)")
+            opts = self.choice.options()
+            fold, unroll = opts.get("fold", fold), opts.get("unroll", unroll)
+            multipliers = opts.get("multipliers")
+            print(f"py2ver: {rate:g} samples/s at {clock / 1e6:g} MHz leaves {budget} "
+                  f"clock{'s' if budget != 1 else ''} per sample: {self.choice}")
         if multipliers:
             if pipeline or (fold is not None and fold is not False):
                 raise NotImplementedError("multipliers= can't be combined with fold= or pipeline=")

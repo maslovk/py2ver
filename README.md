@@ -408,6 +408,34 @@ The XOR network's training step (`examples/xor_hardware.py`) on the EP4CE22:
 | unshared | doesn't fit: 152 multipliers | | | | 1 |
 | `multipliers=4` | 10503 (47 %) | 39 | 62592 | 56 MHz | 45 |
 
+### Choosing the structure from a rate (`rate=`)
+
+Instead of picking `fold`, `unroll` or `multipliers` yourself, give the rate
+the design must keep up with: `rate=` samples per second at `clock=` Hz (50
+MHz, the DE0-Nano's, by default). Each sample may then take `clock / rate`
+clocks, and py2ver builds the smallest structure that finishes in time:
+
+- one clock per sample: every operation its own hardware (unrolled)
+- a loop holding most of the products: that loop folded, onto the fewest
+  copies of its body (`unroll`) that finish in time
+- else: the fewest shared multipliers (`multipliers=N`) whose schedule fits
+
+```python
+p = Py2ver(fir_step, attr, rate=10e6)
+# py2ver: 1e+07 samples/s at 50 MHz leaves 5 clocks per sample: fold=True, unroll=4
+#         (4 clocks per sample; the loop folded onto 4 copies of its body)
+train = Py2ver(net.train, samples=[(X, Y)] * 600, width=24, rate=1e6)
+# py2ver: 1e+06 samples/s at 50 MHz leaves 50 clocks per sample: multipliers=4
+#         (45 clocks per sample; 152 products on 4 multipliers)
+```
+
+The choice is printed and kept in `p.choice` (pass its options to keep it).
+When no shared schedule is fast enough (a chain of dependent steps longer than
+the clocks allowed), the design is built unrolled and the message says how
+many clocks the fastest shared schedule needs. Whether the clock itself is
+met is for `SYN()` to tell (add `pipeline=` to an unrolled design to speed it
+up).
+
 ### Valid/ready streaming interface
 
 `p.stream_wrapper()` writes `hdl/<name>_stream.v`: the module behind a

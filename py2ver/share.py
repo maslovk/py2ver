@@ -1055,8 +1055,7 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
     fd = tree.body[0]
     if not isinstance(fd, ast.FunctionDef):
         raise NotShareable("Expected a function")
-    from .visitor import _Desugar
-    fd = _Desugar().visit(copy.deepcopy(fd))
+    fd = _desugared(fd)
     conv = _ToOps(fd, attr)
     conv.body(fd.body)
     if not conv.outputs:
@@ -1299,6 +1298,12 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
         "mux_input_bits": mux_inputs[0],
     })
     return new_tree, info
+
+
+def _desugared(fd: ast.FunctionDef) -> ast.FunctionDef:
+    """A copy with x op= e written as x = x op e."""
+    from .visitor import _Desugar
+    return _Desugar().visit(copy.deepcopy(fd))
 
 
 def _fill(pick: List[int], used_phases: List[int]) -> None:
