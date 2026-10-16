@@ -31,7 +31,7 @@ def poly(x, y):
 def dot4(xs, ws):
     acc = xs[0] * ws[0] + xs[1] * ws[1] - xs[2] * ws[2] + xs[3] * ws[3]
     top = max(acc, 0.25)
-    scaled = [acc * ws[0], acc * ws[1], acc * ws[2], acc * ws[3]]
+    scaled = [acc * w for w in ws]
     return scaled, top
 
 

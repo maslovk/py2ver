@@ -646,6 +646,11 @@ vectors).
   named `ret`, or `ret0`, `ret1`, ... for several)
 
 - Lists, tables and memories (see below)
+- List comprehensions and generator expressions (`[x * g for x in xs]`,
+  `sum(x * y for x, y in zip(xs, ys))`), written out as lists: over lists of
+  known length, `range(...)` of constants, `enumerate` and `zip` of those,
+  with several `for`s; an `if` may test the index but not the values (the
+  list's length must be known when translating)
 - Returning an argument: it gets its own output port, `<name>_out`
 
 Not supported: `while`, recursion, early `return`, keyword arguments in

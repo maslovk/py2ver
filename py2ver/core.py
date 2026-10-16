@@ -52,6 +52,7 @@ from .hwtypes import _namespace, normalize_attr, read_annotations
 from .cplx import split_complex
 from .fold import fold_loop
 from .share import ROM_MIN, share
+from .comprehend import expand_comprehensions
 from .fixed import DEFAULT_CONST_BITS, build_model, is_table, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
@@ -103,6 +104,8 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
     fe.py_params = list(inspect.signature(func).parameters)
     # Inline calls to your own helper functions and module-level int constants
     tree = inline_helpers(tree, getattr(func, "__globals__", {}))
+    # List comprehensions as list literals (their lengths are known now)
+    tree = expand_comprehensions(tree, attr, _namespace(func))
     # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
     tree, fe.hw_name = rename_keywords(tree)
     fe.py_name = {v: k for k, v in fe.hw_name.items()}
