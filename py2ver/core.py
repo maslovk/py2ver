@@ -51,6 +51,7 @@ from .auto import auto_fixed
 from .hwtypes import _namespace, normalize_attr, read_annotations
 from .cplx import split_complex
 from .fold import fold_loop
+from .share import ROM_MIN, share
 from .fixed import DEFAULT_CONST_BITS, build_model, is_table, lower_fixed, quantize, uses_fixed
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
@@ -178,7 +179,8 @@ class Py2ver:
                  width: int | None = None, max_error: Any = None,
                  round: bool = False, saturate: bool = False,
                  fold: Any = None, unroll: int = 1,
-                 stages: bool = False, stage_options: Dict[str, Any] | None = None) -> None:
+                 stages: bool = False, stage_options: Dict[str, Any] | None = None,
+                 multipliers: int | None = None) -> None:
         """
         func: the function, as written. attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
@@ -193,6 +195,9 @@ class Py2ver:
         stages: build a chain as separate stages connected by streams, in
         hdl/<name>_stages.v (see stages.py); stage_options: {stage function:
         {'fold', 'unroll', 'pipeline'}} to override the automatic folding.
+        multipliers: run straight-line code over several clocks on this many
+        shared multipliers, with each function table in block RAM (see
+        share.py).
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
         # numpy / methods: translated into a scalar function first (see numpy_fe.py)
@@ -224,7 +229,17 @@ class Py2ver:
         self._complex_names = fe.complex_names
         # Folding: the loop's body runs once per clock (phase) instead of unrolled
         self._fold: Dict[str, Any] | None = None
-        if fold is not None and fold is not False:
+        if multipliers:
+            if pipeline or (fold is not None and fold is not False):
+                raise NotImplementedError("multipliers= can't be combined with fold= or pipeline=")
+            shared, info = share(tree, attr, multipliers)
+            if info["phases"] > 1:
+                tree, self._fold = shared, info
+                attr = dict(attr, **info["attr"])
+                log.info("Shared: %d clocks per sample, multipliers %s, %d table(s) in block "
+                         "RAM, %d register bits", info["phases"], info["mul_widths"],
+                         len(info["roms"]), info["register_bits"])
+        elif fold is not None and fold is not False:
             if pipeline:
                 raise NotImplementedError("fold can't be combined with pipeline yet")
             unfolded = FunctionVisitor(attr)
@@ -243,6 +258,9 @@ class Py2ver:
                 log.info("Folded loop '%s': %d clocks per sample, %d register(s)",
                          info["loop"], info["phases"], len(info["regs"]))
         f_visitor = FunctionVisitor(attr)
+        # A pipelined design (without state) reads its function tables from block RAM
+        if pipeline and not any(isinstance(m, dict) and "next" in m for m in attr.values()):
+            f_visitor.rom_min = ROM_MIN
         ir = f_visitor.visit(tree)
 
         # Rewrite expressions so the Verilog computes what Python computes
@@ -278,13 +296,14 @@ class Py2ver:
                     "Automatic pipelining needs a design without 'reg' signals."
                 )
             self._pipe = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages,
-                                     state=self.state_map or None)
+                                     state=self.state_map or None, roms=f_visitor.rom_reads)
             ir = self._pipe.ir
             f_visitor.attr.clear()
             f_visitor.attr.update(self._pipe.attr)
             log.info(
-                "Pipelined into %d stages: +%d register bits, est. stage delays %s%s",
-                self.pipeline_stages + 1, self._pipe.register_bits,
+                "Pipelined into %d stages: +%d register bits, %d table(s) in block RAM, "
+                "est. stage delays %s%s",
+                self.pipeline_stages + 1, self._pipe.register_bits, self._pipe.roms,
                 [builtins.round(d, 2) for d in self._pipe.stage_delay],   # ('round' is a parameter)
                 f", state loop in stage {self._pipe.loop_stage}" if self.state_map else "",
             )
@@ -512,7 +531,8 @@ class Py2ver:
             for reg, nxt in fold["regs"].items():
                 assigns.append(Assignment(left=reg, right=f"rst ? 0 : (ce ? {nxt} : {reg})",
                                           is_reg=True))
-        fold_ports = {fold["phase"], *fold["regs"]}
+        roms = fold.get("roms", {})
+        fold_ports = {fold["phase"], *fold["regs"], *roms}
         inputs = [p for p in ir.inputs if p.name not in self.state_map and p.name not in fold_ports]
         have = {p.name for p in inputs}
         for name, kind in (("clk", "clk"), ("rst", "rst"), ("ce", "ce")):
@@ -522,10 +542,11 @@ class Py2ver:
         return ModuleIR(
             name=ir.name,
             inputs=inputs,
-            outputs=[p for p in ir.outputs if p.name not in set(fold["regs"].values())],
+            outputs=[p for p in ir.outputs if p.name not in
+                     set(fold["regs"].values()) | {r["index"] for r in roms.values()}],
             assigns=assigns,
             has_clk=True,
-            items=list(ir.items) + self._phase_items() + self._ram_items(),
+            items=list(ir.items) + self._phase_items() + self._ram_items() + self._rom_items(roms, attr),
         )
 
     def _schedule_rams(self, ir: ModuleIR) -> Tuple[int, Dict[str, Any]]:
@@ -579,7 +600,8 @@ class Py2ver:
         P, pb = self.ram_phases, self._phase_bits
         if P <= 1:
             return []
-        what = (f"the folded loop's iterations" if self._fold
+        what = ("shared multipliers and tables" if self._fold and self._fold.get("roms") is not None
+                else "the folded loop's iterations" if self._fold
                 else "RAM reads, then compute, then writes")
         return [
             f"// {P} clocks per sample: {what}",
@@ -589,6 +611,27 @@ class Py2ver:
             f"  else if (ce) __phase <= (__phase == {pb}'d{P - 1}) ? {pb}'d0 : __phase + {pb}'d1;",
             "end",
         ]
+
+    @staticmethod
+    def _rom_items(roms: Dict[str, Dict[str, Any]], attr: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Function tables in block RAM: q is the entry the index addressed a clock before."""
+        items: List[str] = []
+        for q, rom in roms.items():
+            entries, w, aw = rom["entries"], int(rom["width"]), int(rom["address_bits"])
+            sig = "signed " if rom["signed"] else ""
+            mask = (1 << w) - 1
+            arr = f"{q}__rom"
+            items.append(f"// Table in block RAM: {len(entries)} x {w} bits")
+            items.append(f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];")
+            items.append(f"reg {sig}[{w - 1}:0] {q};")
+            items.append("initial begin")
+            items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+            items.append("end")
+            idx = rom["index"]
+            if int(attr.get(idx, {}).get("width", aw + 1)) > aw:      # (the index is never out of range)
+                idx = f"{idx}[{aw - 1}:0]"
+            items.append(f"always @(posedge clk) if (ce) {q} <= {arr}[{idx}];")
+        return items
 
     def _ram_items(self) -> List[str]:
         """

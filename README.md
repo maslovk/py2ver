@@ -308,6 +308,15 @@ never split, so break long expressions into temporaries for finer stages.
 Constants are not registered. Pipelining can't be combined with `'type':
 'reg'` signals or block-RAM memories.
 
+In a pipelined design without state, function tables (a fixed-point
+`math.tanh` or `np.tanh`, a `sigmoid` helper: tables of 64 entries or more)
+are ROMs in block RAM instead of logic. A table read is a stage of its own (the
+RAM latches the index at the end of one stage and gives the entry in the next),
+so `pipeline` must be at least the number of tables one after another on a
+path. The XOR network's forward pass (`examples/xor_hardware.py`) goes from
+6624 logic cells at 23 MHz unpipelined to 1736 cells and 5 block RAMs at 61 MHz
+with `pipeline=3`.
+
 With state (`'next'`), the state loop (state -> ... -> next state) must finish
 in one clock to keep a sample per clock, so it stays in one stage: logic that
 only depends on inputs is pipelined before it, logic from the state to the
@@ -349,6 +358,40 @@ A folded loop may assign list elements (`ys[i] = ...`): the list becomes a
 register per element. Its bounds may be constant expressions
 (`range(len(TAPS))`). One loop per design is folded, and folding can't be
 combined with `pipeline`, block RAM or `'reg'` signals.
+
+### Sharing multipliers (straight-line code)
+
+Code without loops, such as numpy code written out element by element, can't
+be folded. `multipliers=N` schedules it over as many clocks as it needs
+instead:
+
+```python
+p = Py2ver(train_step, attr, multipliers=4)     # 4 multipliers, p.ram_phases clocks per sample
+```
+
+- every product of two variables runs on one of N shared multipliers, and a
+  sum of products accumulates in the multipliers' adders (multiply-accumulate)
+- every function table is a ROM in block RAM, read once per clock
+- the rest (additions, shifts, comparisons, clamps) is built as it is, chained
+  within a clock up to an estimated 12 ns
+- a value used in a later clock than the one making it is kept in a register;
+  values from the same multiplier or ROM share registers
+- the multipliers' inputs are registered, so a product comes a clock after
+  its operands; a few wide products share one wide multiplier
+
+Every operation keeps the width the unshared design gives it, so the results
+don't change: the Python references are the same, and simulation must match
+them exactly. Like a folded design it takes `p.ram_phases` clocks per sample,
+which the testbenches, `HW()` and the stream wrapper account for. It needs
+straight-line code (no loops or `if` statements; use `fold` for a loop) and
+can't be combined with `fold` or `pipeline`.
+
+The XOR network's training step (`examples/xor_hardware.py`) on the EP4CE22:
+
+| | logic elements | 9-bit multipliers | block RAM bits | Fmax | clocks per step |
+|---|---|---|---|---|---|
+| unshared | doesn't fit: 152 multipliers | | | | 1 |
+| `multipliers=4` | 10265 (46 %) | 39 | 62592 | 56 MHz | 43 |
 
 ### Valid/ready streaming interface
 
@@ -489,12 +532,14 @@ step and its trained forward pass:
 
 ```python
 net = XORNetwork()
-train = Py2ver(net.train, samples=[(X, Y)] * 600, width=24)     # one training step
+train = Py2ver(net.train, samples=[(X, Y)] * 600, width=24,    # one training step, on 4
+               multipliers=4)                                   # shared multipliers
 steps = train.PY_stream()([(X, Y)] * 600)                       # loss < 0.01 at step 397
 for name, value in train.state_values(steps[396]).items():      # {'W1': array, ...}
     setattr(net, name, value)                                   # the weights trained in hardware
 
-infer = Py2ver(net.predict, samples=points, max_error=1e-2)     # weights: constants
+infer = Py2ver(net.predict, samples=points, max_error=1e-2,     # weights: constants,
+               pipeline=3)                                      # one input per clock
 infer.TB()(np.array([0.8, 0.3]))                                # -> 0.875 (numpy: 0.876)
 ```
 
@@ -520,7 +565,9 @@ original in float on the examples, and builds that:
 Calls take the arguments the original does (numpy arrays); results come out
 flat, in row-major order. `samples=` is needed (for the shapes), and the
 examples should cover the inputs' real range: formats and tables are chosen
-from them.
+from them. Written out, numpy code is large and has no loops: build a
+training step with `multipliers=` (see Sharing multipliers) and a forward
+pass with `pipeline=` (its tables then go to block RAM).
 
 ### Area and timing (`SYN()`)
 
@@ -691,8 +738,8 @@ signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
-table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained and run
-in hardware, a decimate-by-4 filter fed one
+table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained on 4
+shared multipliers and run pipelined in hardware, a decimate-by-4 filter fed one
 sample per handshake, a receiver chain built from plain Python functions, a
 histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:

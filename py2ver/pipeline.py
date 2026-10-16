@@ -13,6 +13,9 @@ estimated delay, with a register boundary between segments:
   - constants (signals that do not depend on any input) are never registered
   - all pipeline registers share a clock enable `ce` (tie it to 1, or use it
     to stall the pipeline, as the valid/ready stream wrapper does)
+  - a table read in block RAM (`roms`, from the translator) is a register
+    stage of its own: the ROM latches the index at the end of one stage and
+    gives the entry in the next
 
 Delay is estimated per assignment by summing operator costs in units of
 roughly one 32-bit adder. It is a heuristic; SYN() measures the real result.
@@ -58,14 +61,34 @@ class PipelineResult:
     loop_stage: int = 0
     valid_at_loop: str = ""
     next_at_loop: Dict[str, str] = field(default_factory=dict)
+    roms: int = 0
 
 
 def _rename(expr: str, mapping: Dict[str, str]) -> str:
     return _IDENT.sub(lambda m: mapping.get(m.group(0), m.group(0)), expr)
 
 
+ROM_COST = 1.5          # a block RAM's clock-to-output, in adder units
+
+
+def _rom_items(name: str, rom: Dict[str, Any], index: str, index_width: int) -> List[str]:
+    entries, w, aw = rom["entries"], int(rom["width"]), int(rom["address_bits"])
+    sig = "signed " if rom.get("signed") else ""
+    mask = (1 << w) - 1
+    arr = f"{name}__rom"
+    if index_width > aw:                    # (a table index is never out of range)
+        index = f"{index}[{aw - 1}:0]"
+    return ([f"// Table in block RAM: {len(entries)} x {w} bits",
+             f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];",
+             f"reg {sig}[{w - 1}:0] {name};",
+             "initial begin"]
+            + [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+            + ["end", f"always @(posedge clk) if (ce) {name} <= {arr}[{index}];"])
+
+
 def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
-                state: Dict[str, str] | None = None) -> PipelineResult:
+                state: Dict[str, str] | None = None,
+                roms: Dict[str, Dict[str, Any]] | None = None) -> PipelineResult:
     """
     state maps state inputs to their next-state outputs (before the state
     registers are added). The state loop (state -> ... -> next state) stays in
@@ -86,6 +109,7 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
 
     attr = {k: dict(v) for k, v in attr.items()}
     state = dict(state or {})
+    roms = dict(roms or {})
     inputs = [p.name for p in ir.inputs if p.kind == "input"]
     outputs = [p.name for p in ir.outputs]
     ports = {p.name: p for p in ir.inputs + ir.outputs}
@@ -136,7 +160,7 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
             const.add(n)
 
     nonconst = [n for n in order if n not in const]
-    cost = {n: expr_cost(by_left[n].right) for n in nonconst}
+    cost = {n: ROM_COST if n in roms else expr_cost(by_left[n].right) for n in nonconst}
 
     # State loop: signals on a path from a state input to a next-state output
     state_inputs = set(state)
@@ -150,6 +174,8 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
         if n in bwd:
             bwd.update(deps[n])
     loop = fwd & bwd
+    if loop & set(roms):
+        raise NotImplementedError("A table in block RAM can't be in the state loop of a pipeline")
 
     def _schedule(limit: float) -> Tuple[Dict[str, int], Dict[str, float]]:
         """
@@ -166,7 +192,9 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
             ds = [d for d in deps[n] if d not in const]
             s = max((stg[d] for d in ds), default=0)
             begin = max((rel[d] for d in ds if stg[d] == s), default=0.0)
-            if split and begin > 0 and begin + cost[n] > limit + 1e-9:
+            if n in roms:                       # the ROM's own register: the next stage
+                s, begin = s + 1, 0.0
+            elif split and begin > 0 and begin + cost[n] > limit + 1e-9:
                 s, begin = s + 1, 0.0
             stg[n] = s
             rel[n] = begin + cost[n]
@@ -196,6 +224,10 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
             lo = mid
     stage, rel = _schedule(hi)
     if max(stage.values(), default=0) > stages:
+        if roms:
+            raise NotImplementedError(
+                f"The design needs at least {max(stage.values())} pipeline stages "
+                "(each table read in block RAM takes one)")
         raise NotImplementedError("Could not fit the design into the requested stages")
     loop_stage = stage[next(iter(state_inputs))] if state else 0
 
@@ -214,10 +246,16 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
         return f"{name}__p{k}"
 
     new_assigns: List[Assignment] = []
+    rom_items: List[str] = []
     for n in order:
         a = by_left[n]
         if n in const:
             new_assigns.append(a)
+            continue
+        if n in roms:                           # reads the index of the stage before
+            idx = roms[n]["index"]
+            rom_items += _rom_items(n, roms[n], _at(idx, stage[n] - 1),
+                                    int(_meta(idx, attr, ports).get("width", 1)))
             continue
         mapping = {d: _at(d, stage[n]) for d in deps[n] if d not in const}
         new_assigns.append(Assignment(n, _rename(a.right, mapping), False))
@@ -263,7 +301,7 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
         outputs=new_outputs,
         assigns=new_assigns,
         has_clk=True,
-        items=list(ir.items),
+        items=list(ir.items) + rom_items,
     )
     return PipelineResult(new_ir, attr, stage, register_bits, stage_delay,
-                          loop_stage, valid_at_loop, next_at_loop)
+                          loop_stage, valid_at_loop, next_at_loop, len(roms))
