@@ -222,13 +222,16 @@ def _element(meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def stage_attr(st: Stage, stages: List[Stage], info: Dict[str, Any], attr: Dict[str, Any],
-               complex_names: set) -> Dict[str, Dict[str, Any]]:
-    """The chain's attr for a stage's generated function."""
+               complex_names: set, inferred) -> Dict[str, Dict[str, Any]]:
+    """The chain's attr for a stage's generated function. A port without a
+    format in attr takes the one the fused design inferred: inferred(var)."""
     out: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in attr.items() if "range" in v}   # tables
     appended = {lst: var for s in stages for lst, var in s.appends.items()}
 
     def fmt(var: str) -> Dict[str, Any]:
         m = dict(attr.get(var, {}))
+        if "width" not in m:
+            m = dict(inferred(var), **m)
         if var in complex_names:
             m["complex"] = True
         return m

@@ -98,12 +98,16 @@ def _traced(func: Callable, record: Callable[[str, Any], None]):
     """The function, recording every value assigned to a name (and its parameters)."""
     tree = ast.parse(inspect.getsource(func))
     tree, ann = read_annotations(tree, func)
+    # Traced with its helpers inlined, as it is built (math calls in helpers
+    # included); the helpers' own variables (__<helper><k>_...) get no format
+    from .inline import inline_helpers
+    tree = inline_helpers(tree, func.__globals__)
     fd = tree.body[0]
     order: List[str] = [a.arg for a in fd.args.args]
 
     def trace(names: List[str]) -> List[ast.stmt]:
         for n in names:
-            if n not in order:
+            if n not in order and not n.startswith("__"):
                 order.append(n)
         return [ast.Expr(ast.Call(func=ast.Name(id="__py2ver_trace", ctx=ast.Load()), keywords=[],
                                   args=[ast.Constant(n), ast.Name(id=n, ctx=ast.Load())]))
@@ -402,7 +406,25 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     ranges, order, returned = _profile(func, samples, base)
     params = list(inspect.signature(func).parameters)
     state = [p for p in params if "next" in base.get(p, {}) or "memory" in base.get(p, {})]
-    nexts = {base[p]["next"] for p in state if base[p].get("next") not in (None, p)}
+    nexts = {base[p]["next"] for p in state
+             if base[p].get("next") not in (None, p) and base[p]["next"] not in params}
+    # A state loaded from another parameter (d2 <- d1 <- x) shares its format:
+    # group them (union-find)
+    parent = {p: p for p in params}
+
+    def find(p: str) -> str:
+        while parent[p] != p:
+            p = parent[p]
+        return p
+
+    for p in state:
+        nxt = base[p].get("next")
+        if nxt in params and nxt != p:
+            parent[find(p)] = find(nxt)
+    groups: Dict[str, List[str]] = {}
+    for p in params:
+        groups.setdefault(find(p), []).append(p)
+    group_of = {p: g for g in groups.values() if len(g) > 1 for p in g}
     extra = {"round": True} if round else {}
     if saturate:
         extra["saturate"] = True
@@ -435,6 +457,12 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             continue                                 # integer locals keep exact widths
         auto[name] = (r, r.int_bits() + margin)
 
+    for g in {tuple(g) for g in group_of.values()}:      # one integer part per group
+        members = [m for m in g if m in auto]
+        if members:
+            ib = max(auto[m][1] for m in members)
+            for m in members:
+                auto[m] = (auto[m][0], ib)
     bits = {n: DEFAULT_TABLE_BITS for n in auto if n in tables}
 
     def formats(fracs: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
@@ -469,6 +497,14 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             result[p] = dict(base.get(p, {}), **_fmt(r, ib, max(0, width - 1 - ib)))
             if r.is_complex:
                 result[p]["complex"] = True
+            # State loaded from this input takes its format too
+            for m in group_of.get(p, []):
+                if m in auto:
+                    rm, _ = auto.pop(m)
+                    result[m] = dict(base.get(m, {}), **{k: v for k, v in result[p].items()
+                                                        if k in ("signed", "width", "frac")})
+                    if rm.is_complex:
+                        result[m]["complex"] = True
 
     def target(port: str) -> Optional[float]:
         if not isinstance(max_error, dict):
@@ -524,15 +560,19 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     for _ in range(3):
         changed = False
         for name in auto:
+            same = [m for m in group_of.get(name, [name]) if m in auto] or [name]
+            if name != same[0]:
+                continue                             # a group is searched as one
             lo, hi = 0, fracs[name]
             while lo < hi:
                 mid = (lo + hi) // 2
-                if error_ok(dict(fracs, **{name: mid})):
+                if error_ok(dict(fracs, **{m: mid for m in same})):
                     hi = mid
                 else:
                     lo = mid + 1
             if hi != fracs[name]:
-                fracs[name], changed = hi, True
+                fracs.update({m: hi for m in same})
+                changed = True
         if not changed:
             break
     # Then the fewest entries for each table

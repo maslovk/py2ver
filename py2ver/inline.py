@@ -90,6 +90,27 @@ class _Inliner:
                     return ast.copy_location(table, node)
                 return node
 
+            def visit_Call(self, node: ast.Call):
+                # math / cmath functions (and complex()) of constants: their value
+                self.generic_visit(node)
+                root = node.func
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                if (node.keywords or not isinstance(root, ast.Name) or root.id in locals_
+                        or any(isinstance(n, ast.Name) and n.id in locals_
+                               for a in node.args for n in ast.walk(a))):
+                    return node
+                try:
+                    fn = eval(compile(ast.Expression(node.func), "<call>", "eval"), dict(g))
+                    if fn is not complex and getattr(fn, "__module__", None) not in ("math", "cmath"):
+                        return node
+                    value = eval(compile(ast.Expression(node), "<call>", "eval"), dict(g))
+                except Exception:
+                    return node
+                if isinstance(value, (int, float, complex)) and not isinstance(value, bool):
+                    return ast.copy_location(ast.Constant(value=value), node)
+                return node
+
         return _Consts()
 
     # --- statements ---

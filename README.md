@@ -138,7 +138,8 @@ What the hardware computes:
   significant bits, else rounded to that many: `Py2ver(f, attr,
   const_bits=18)` (the default).
 - `int(x)` truncates toward zero, `math.floor` / `math.ceil` work, `float(x)`
-  is `x`, and `math.pi` and other module-level numbers are constants. `//`,
+  is `x`, and `math.pi` and other module-level numbers are constants, as are
+  `math` / `cmath` functions of constants (`cmath.exp(0.3j)`). `//`,
   `%`, `round()` and bitwise operators aren't supported on fixed-point
   values. `/` between two integers keeps its integer meaning (`int(a / b)`).
 - Complex values and math functions work too, see below.
@@ -243,7 +244,8 @@ format with enough integer bits for its range (plus `margin=1`):
 The result is an ordinary `attr` dict to read, adjust and keep. Entries you
 pass with a `'width'` are kept as they are, and `'next'`, `'init'`,
 `'length'` and `'memory'` are kept; a state's next value takes the state's
-format. Integer inputs get integer formats (just wide enough), integer
+format, and states loaded from one another (`d2` from `d1` from `x`) share
+one. Integer inputs get integer formats (just wide enough), integer
 variables keep their exact widths, and float values are signed. `round=True`
 / `saturate=True` add those options to every chosen format.
 
@@ -326,7 +328,8 @@ p = Py2ver(fir_step, attr, fold='k', unroll=4)   # 4 copies, N / 4 clocks per sa
 ```
 
 `fold` names the loop variable of a top-level `for ... in range(...)` loop
-(`fold=True` takes the longest one), and `unroll` (dividing the number of
+(`fold=True` takes the longest one, and builds a design without loops
+unfolded), and `unroll` (dividing the number of
 iterations) is how many iterations run per clock. Variables the loop updates
 (an accumulator, a running maximum) become registers as wide as their widest
 value in the unrolled design, so the results don't change: the Python
@@ -667,4 +670,8 @@ QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   #
 ```
 
 Simulation tests compare the Python function against the cocotb + Icarus
-result and are skipped if Icarus or cocotb is missing.
+result and are skipped if Icarus or cocotb is missing. `tests/test_combinations.py`
+builds a set of designs (state, lists, complex values, tables, block RAM,
+helpers, keyword names) with each option (pipelining, folding, automatic
+formats, serial ports, stages, annotations) and checks every result against
+the references.

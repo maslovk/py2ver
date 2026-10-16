@@ -144,8 +144,15 @@ def fold_loop(tree: ast.Module, loop: Any, unroll: int,
     if node.orelse:
         raise NotImplementedError("A folded loop can't have an else block")
     before, after = fd.body[:index], fd.body[index + 1:]
-    if k in {n.id for s in after for n in ast.walk(s) if isinstance(n, ast.Name)}:
-        raise NotImplementedError(f"The folded loop's variable '{k}' is used after the loop")
+    for s in after:                     # k after the loop, before something sets it again
+        if isinstance(s, ast.For) and isinstance(s.target, ast.Name) and s.target.id == k:
+            break
+        if isinstance(s, ast.Assign) and any(isinstance(t, ast.Name) and t.id == k
+                                             for t in s.targets) \
+                and k not in {n.id for n in ast.walk(s.value) if isinstance(n, ast.Name)}:
+            break
+        if k in {n.id for n in ast.walk(s) if isinstance(n, ast.Name)}:
+            raise NotImplementedError(f"The folded loop's variable '{k}' is used after the loop")
     params = [a.arg for a in fd.args.args]
     defined = _assigned(before) | set(params)
     carried = sorted((_assigned(node.body) - {k}) & defined)

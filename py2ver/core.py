@@ -218,7 +218,13 @@ class Py2ver:
             unfolded = FunctionVisitor(attr)
             unfolded.visit(copy.deepcopy(tree))
             loop = fe.hw_name.get(fold, fold) if isinstance(fold, str) else fold
-            folded, info = fold_loop(tree, loop, unroll, unfolded.attr, dict(unfolded._lists))
+            try:
+                folded, info = fold_loop(tree, loop, unroll, unfolded.attr, dict(unfolded._lists))
+            except ValueError as e:
+                if loop is not True or "No top-level" not in str(e):
+                    raise
+                log.info("fold=True: no loop to fold")   # (fold=True: if there is one)
+                info = {"phases": 1}
             if info["phases"] > 1:                 # (all iterations in one clock: nothing to fold)
                 tree, self._fold = folded, info
                 attr = dict(attr, **info["attr"])
@@ -301,6 +307,7 @@ class Py2ver:
 
         # IMPORTANT: use visitor's attr (includes acc_0, acc_1, ...)
         self.attr = f_visitor.attr
+        self._ssa_final = dict(f_visitor._ssa)     # variable -> its last version
 
         self.out_meta = {n: dict(self.attr.get(n, {})) for n in self.output_args_list}
 
@@ -1762,7 +1769,8 @@ class Py2ver:
         fused = (self.hdl_dir / "main.v").read_text(encoding="utf-8")
         files: List[Path] = []
         for st in plan:
-            sattr = stg.stage_attr(st, plan, info, self._py_attr, self._complex_names)
+            sattr = stg.stage_attr(st, plan, info, self._py_attr, self._complex_names,
+                                   self._inferred_format)
             opts = dict(options.get(st.callee, {}))
             # A block stage has as many clocks per call as samples per block
             fold, unroll = stg.auto_fold(st, sattr, info["length"], opts, const_bits)
@@ -1793,6 +1801,28 @@ class Py2ver:
         self._stages = {"plan": plan, "info": info, "ports": ports, "files": files,
                         "results": results, "per_block": per_block}
 
+    def _inferred_format(self, var: str) -> Dict[str, Any]:
+        """The format this design gives a variable without one in attr: its last
+        version's width and sign (both parts of a complex value, every element
+        of a list), and its fraction bits."""
+        hw = self._hw_name.get(var, var)
+        metas = []
+        for cand in (hw, f"{hw}_re", f"{hw}_im", f"{hw}_0", f"{hw}_re_0", f"{hw}_im_0"):
+            final = self._ssa_final.get(cand, cand)
+            if final in self.attr:
+                metas.append(self.attr[final])
+        if not metas:
+            return {}
+        signed = any(int(m.get("signed", 0)) for m in metas)
+        out = {"signed": int(signed),
+               "width": max(int(m["width"]) + (1 if signed and not int(m.get("signed", 0)) else 0)
+                            for m in metas)}
+        t = self._fx_types.get(hw)
+        t = t[1] if t is not None and t[0] == "l" else t
+        if t is not None and t[0] == "f":
+            out["frac"] = t[1]
+        return out
+
     @property
     def stages(self) -> List[Any]:
         """The stages of a chain built with stages=True (each has .design, its Py2ver)."""
@@ -1803,7 +1833,9 @@ class Py2ver:
     def PY_stages(self) -> Callable[[List[Any]], List[Tuple[Any, ...]]]:
         """PY_stream() of the chain, only the results the stages give (not state)."""
         idx = [self.output_args_list.index(port) for port, _, _ in self._stages["results"]]
-        return lambda blocks: [tuple(row[i] for i in idx) for row in self.PY_stream()(blocks)]
+        ref = self.PY_stream() if (self.state_map or self.rams or self._fold) else (
+            lambda blocks: self.PY_batch()([b if isinstance(b, tuple) else (b,) for b in blocks]))
+        return lambda blocks: [tuple(row[i] for i in idx) for row in ref(blocks)]
 
     def TB_stages(self) -> Callable[..., List[Tuple[Any, ...]]]:
         """
