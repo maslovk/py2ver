@@ -72,7 +72,8 @@ ROM_COST = 1.5          # a block RAM's clock-to-output, in adder units
 
 
 def _rom_items(name: str, rom: Dict[str, Any], index: str, index_width: int) -> List[str]:
-    entries, w, aw = rom["entries"], int(rom["width"]), int(rom["address_bits"])
+    entries, w, aw = list(rom["entries"]), int(rom["width"]), int(rom["address_bits"])
+    entries += [entries[-1]] * ((1 << aw) - len(entries))      # (padded: no index reads x)
     sig = "signed " if rom.get("signed") else ""
     mask = (1 << w) - 1
     arr = f"{name}__rom"

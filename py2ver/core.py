@@ -289,9 +289,10 @@ class Py2ver:
                 log.info("Folded loop '%s': %d clocks per sample, %d register(s)",
                          info["loop"], info["phases"], len(info["regs"]))
         f_visitor = FunctionVisitor(attr)
-        # A pipelined design (without state) reads its function tables from block RAM
-        if pipeline and not any(isinstance(m, dict) and "next" in m for m in attr.values()):
-            f_visitor.rom_min = ROM_MIN
+        # Large constant tables are ROMs: in block RAM in a pipelined design without
+        # state, else arrays read asynchronously (both readable by any simulator)
+        f_visitor.rom_min = ROM_MIN
+        stateless = not any(isinstance(m, dict) and "next" in m for m in attr.values())
         ir = f_visitor.visit(tree)
 
         # Rewrite expressions so the Verilog computes what Python computes
@@ -327,7 +328,8 @@ class Py2ver:
                     "Automatic pipelining needs a design without 'reg' signals."
                 )
             self._pipe = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages,
-                                     state=self.state_map or None, roms=f_visitor.rom_reads)
+                                     state=self.state_map or None,
+                                     roms=f_visitor.rom_reads if stateless else None)
             ir = self._pipe.ir
             f_visitor.attr.clear()
             f_visitor.attr.update(self._pipe.attr)
@@ -342,6 +344,7 @@ class Py2ver:
             raise NotImplementedError("fold can't be combined with block RAM or 'reg' signals yet")
         if self.state_map or self.rams or self._fold:
             ir = self._lower_state(ir, f_visitor.attr)
+        ir = self._rom_arrays(ir, f_visitor.rom_reads, f_visitor.attr)
         self.ir = ir
 
         self.has_clk = bool(ir.has_clk)
@@ -645,6 +648,41 @@ class Py2ver:
             f"  else if (ce) __phase <= (__phase == {pb}'d{P - 1}) ? {pb}'d0 : __phase + {pb}'d1;",
             "end",
         ]
+
+    @staticmethod
+    def _rom_arrays(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],
+                    attr: Dict[str, Dict[str, Any]]) -> ModuleIR:
+        """Table reads still in the assignments (not block RAM) as arrays read by
+        their index: compact Verilog, and readable by Verilator (an expression of
+        1024 cases is not). The array is padded to a power of two."""
+        reads = {a.left: a for a in ir.assigns if a.left in rom_reads}
+        if not reads:
+            return ir
+        items: List[str] = []
+        for name, a in reads.items():
+            rom = rom_reads[name]
+            # (the index as the assignment reads it: renamed by pipelining, or a
+            # sign-adjusted copy, but the one signal on the right)
+            names = set(re.findall(r"(?<![$\w'])[A-Za-z_]\w*", a.right))
+            if len(names) != 1:
+                raise RuntimeError(f"Can't find the index of table read {name}: {a.right}")
+            idx = names.pop()
+            w, ab = int(rom["width"]), int(rom["address_bits"])
+            entries = list(rom["entries"])
+            entries += [entries[-1]] * ((1 << ab) - len(entries))
+            sig = "signed " if rom.get("signed") else ""
+            mask = (1 << w) - 1
+            arr = f"{name}__table"
+            iw = int(attr.get(idx, attr.get(rom["index"], {})).get("width", ab + 1))
+            addr = f"{idx}[{ab - 1}:0]" if iw > ab else idx
+            items += [f"// Table: {len(rom['entries'])} x {w} bits",
+                      f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];",
+                      "initial begin"]
+            items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+            items += ["end", f"wire {sig}[{w - 1}:0] {name} = {arr}[{addr}];"]
+        return ModuleIR(name=ir.name, inputs=ir.inputs, outputs=ir.outputs,
+                        assigns=[a for a in ir.assigns if a.left not in reads],
+                        has_clk=ir.has_clk, items=list(ir.items) + items)
 
     @staticmethod
     def _rom_items(roms: Dict[str, Dict[str, Any]], attr: Dict[str, Dict[str, Any]]) -> List[str]:

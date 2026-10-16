@@ -92,3 +92,23 @@ def test_long_runs_choose_verilator(monkeypatch, tmp_path):
         assert native.choose_simulator(p, 10 ** 9) == "verilator"
     monkeypatch.setenv("PY2VER_SIM", "cocotb")
     assert native.choose_simulator(p, 10 ** 9) == "cocotb"
+
+
+@pytest.mark.sim
+def test_tables_are_arrays_any_simulator_reads(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    from test_share import _samples, neuron
+    monkeypatch.chdir(tmp_path)
+    samples = _samples(neuron)
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(neuron, samples=samples, width=18)         # a tanh table, unpipelined
+    verilog = (tmp_path / "hdl" / "main.v").read_text()
+    assert "// Table:" in verilog and max(map(len, verilog.splitlines())) < 2000
+    expected = p.PY_batch()(samples[:15])
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    assert p.TB_batch()(samples[:15]) == expected
+    if shutil.which("verilator"):
+        monkeypatch.setenv("PY2VER_SIM", "verilator")
+        assert p.TB_batch()(samples[:15]) == expected
+        assert not list((tmp_path / "native_build").glob("verilator_failed_*"))

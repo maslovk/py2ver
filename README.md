@@ -634,9 +634,8 @@ On a small design the time went to cocotb's Python round trip per clock; on
 a large one it is Icarus's own evaluation, which only Verilator cuts.
 
 `PY2VER_SIM=icarus`, `verilator` or `cocotb` picks one (cocotb runs the older
-Python testbenches). A design Verilator can't build (its preprocessor takes at
-most 20000 tokens on a line, less than a large table written out) runs on
-Icarus, with a warning. `TB_handshake()`, `HW_sim()` and designs with `'reg'`
+Python testbenches). A design Verilator can't build runs on Icarus, with a
+warning. `TB_handshake()`, `HW_sim()` and designs with `'reg'`
 signals use cocotb.
 
 ### Area and timing (`SYN()`)
@@ -756,8 +755,13 @@ in `attr` sets every element's width.
 
 - **Tables / ROMs**: a module-level tuple or list of integers (e.g. an
   S-box, computed in Python if you like) or a constant local list, indexed by
-  a variable, becomes a ROM built from logic; indexed by a constant it is just
-  that constant.
+  a variable, becomes a ROM; indexed by a constant it is just that constant.
+  A table of 64 entries or more (a fixed-point function table, too) is written
+  as an array read by its index (padded to a power of two), which Quartus
+  builds compactly and any simulator reads; in a pipelined design it is in
+  block RAM. Smaller ones, and tables whose index might be negative, are
+  balanced muxes. The XOR network's forward pass, unpipelined: 6624 logic
+  cells at 23 MHz as muxes, 2550 at 30 MHz as arrays.
 - **Variable index**: reading `xs[i]` is a balanced mux, writing `xs[i] = v`
   updates the element that matches. An out-of-range index (an `IndexError` in
   Python) reads an unspecified element and writes nothing.

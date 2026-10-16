@@ -110,9 +110,9 @@ class FunctionVisitor(ast.NodeVisitor):
         self._tmp_count = 0
         self._ssa: Dict[str, str] = {}
         self._ssa_count: Dict[str, int] = {}
-        # Tables of at least rom_min constants become block-RAM ROM reads (for a
-        # pipelined design): the read's signal -> {'index', 'entries', ...}; the
-        # pipeliner gives the read its own register stage
+        # Tables of at least rom_min constants become ROM reads: the read's signal ->
+        # {'index', 'entries', ...}. A pipelined design reads them from block RAM
+        # (a register stage of its own), others as arrays (see core._rom_arrays)
         self.rom_min = 0
         self.rom_reads: Dict[str, Dict[str, Any]] = {}
         self._defs: Dict[str, ast.expr] = {}
@@ -468,8 +468,12 @@ class FunctionVisitor(ast.NodeVisitor):
         return self._select(elems, node.slice)
 
     def _rom_read(self, values: List[int], index: ast.expr) -> str | None:
-        """values[index] as a block-RAM read, if the index is always in range (a
-        table index as fixed.py writes it: max(0, min(n - 1, ...)))."""
+        """values[index] as a ROM read (an array indexed by the low address bits),
+        if every index Python allows reads the same entry that way: an index that
+        can't be negative, one clamped as fixed.py writes a table index
+        (max(0, min(n - 1, ...))), or any for a power-of-two table (the low bits of
+        -k are n - k). Out-of-range indices, an IndexError in Python, read some
+        entry (the array is padded to a power of two)."""
         try:
             self._eval_int(index)
             return None                                    # a constant index
@@ -477,16 +481,18 @@ class FunctionVisitor(ast.NodeVisitor):
             pass
         n = len(values)
         node = self._defs.get(index.id) if isinstance(index, ast.Name) else index
-        if not (self._ssa_count.get(getattr(index, "id", ""), 1) == 1
-                and isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "max" and len(node.args) == 2
-                and isinstance(node.args[0], ast.Constant) and node.args[0].value == 0
-                and isinstance(node.args[1], ast.Call) and isinstance(node.args[1].func, ast.Name)
-                and node.args[1].func.id == "min" and len(node.args[1].args) == 2
-                and isinstance(node.args[1].args[0], ast.Constant)
-                and node.args[1].args[0].value == n - 1):
-            return None
+        clamped = (self._ssa_count.get(getattr(index, "id", ""), 1) == 1
+                   and isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                   and node.func.id == "max" and len(node.args) == 2
+                   and isinstance(node.args[0], ast.Constant) and node.args[0].value == 0
+                   and isinstance(node.args[1], ast.Call)
+                   and isinstance(node.args[1].func, ast.Name)
+                   and node.args[1].func.id == "min" and len(node.args[1].args) == 2
+                   and isinstance(node.args[1].args[0], ast.Constant)
+                   and node.args[1].args[0].value == n - 1)
         idx = self._temp(self.visit(index))
+        if not (clamped or n & (n - 1) == 0 or not self._attrs(idx).get("signed")):
+            return None
         lo, hi = min(values), max(values)
         if lo >= 0:
             fmt = {"width": max(1, hi.bit_length()), "signed": 0}
