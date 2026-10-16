@@ -198,7 +198,7 @@ class Py2ver:
         stages: build a chain as separate stages connected by streams, in
         hdl/<name>_stages.v (see stages.py); stage_options: {stage function:
         {'fold', 'unroll', 'pipeline'}} to override the automatic folding.
-        multipliers: run straight-line code over several clocks on this many
+        multipliers: run the design over several clocks on this many
         shared multipliers, with each function table in block RAM (see
         share.py).
         """

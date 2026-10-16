@@ -359,18 +359,24 @@ register per element. Its bounds may be constant expressions
 (`range(len(TAPS))`). One loop per design is folded, and folding can't be
 combined with `pipeline`, block RAM or `'reg'` signals.
 
-### Sharing multipliers (straight-line code)
+### Sharing multipliers (`multipliers=N`)
 
-Code without loops, such as numpy code written out element by element, can't
-be folded. `multipliers=N` schedules it over as many clocks as it needs
-instead:
+`multipliers=N` runs a design over as many clocks as it needs on N shared
+multipliers. Unlike `fold`, it takes any design without `while`: numpy code
+written out element by element, several loops one after another, loops with
+`if`s inside:
 
 ```python
 p = Py2ver(train_step, attr, multipliers=4)     # 4 multipliers, p.ram_phases clocks per sample
 ```
 
-- every product of two variables runs on one of N shared multipliers, and a
-  sum of products accumulates in the multipliers' adders (multiply-accumulate)
+- `for` loops over constants or lists are unrolled, and `if` / `else` becomes
+  a selection: both branches are computed and each variable they assign is
+  chosen by the condition
+- every product runs on one of N shared multipliers (a product by a constant
+  too, unless the constant is a power of two), and a sum of products
+  accumulates in the multipliers' adders (multiply-accumulate); a long sum is
+  split over the multipliers and the parts added at the end
 - every function table is a ROM in block RAM, read once per clock
 - the rest (additions, shifts, comparisons, clamps) is built as it is, chained
   within a clock up to an estimated 12 ns
@@ -382,16 +388,25 @@ p = Py2ver(train_step, attr, multipliers=4)     # 4 multipliers, p.ram_phases cl
 Every operation keeps the width the unshared design gives it, so the results
 don't change: the Python references are the same, and simulation must match
 them exactly. Like a folded design it takes `p.ram_phases` clocks per sample,
-which the testbenches, `HW()` and the stream wrapper account for. It needs
-straight-line code (no loops or `if` statements; use `fold` for a loop) and
-can't be combined with `fold` or `pipeline`.
+which the testbenches, `HW()` and the stream wrapper account for. Not
+supported: `while`, `break` / `continue`, a `return` inside a loop or an
+`if`; it can't be combined with `fold` or `pipeline`.
+
+For one loop, `fold` is smaller; `multipliers=` registers its multipliers'
+inputs, so it clocks faster. The 16-tap FIR from the folding section:
+
+| | logic elements | 9-bit multipliers | Fmax | clocks per sample |
+|---|---|---|---|---|
+| `fold='k'` | 551 | 2 | 68 MHz | 16 |
+| `multipliers=1` | 791 | 2 | 115 MHz | 17 |
+| `multipliers=4` | 1063 | 8 | 88 MHz | 8 |
 
 The XOR network's training step (`examples/xor_hardware.py`) on the EP4CE22:
 
 | | logic elements | 9-bit multipliers | block RAM bits | Fmax | clocks per step |
 |---|---|---|---|---|---|
 | unshared | doesn't fit: 152 multipliers | | | | 1 |
-| `multipliers=4` | 10265 (46 %) | 39 | 62592 | 56 MHz | 43 |
+| `multipliers=4` | 10503 (47 %) | 39 | 62592 | 56 MHz | 45 |
 
 ### Valid/ready streaming interface
 

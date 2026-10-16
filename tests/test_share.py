@@ -104,16 +104,49 @@ def test_tables_go_to_block_ram():
     assert len(rom["entries"]) >= 64 and rom["address_bits"] == (len(rom["entries"]) - 1).bit_length()
 
 
-def looped(xs):
+def looped(xs, g):
     acc = 0
+    best = -1000
     for k in range(4):
-        acc += xs[k] * xs[k]
-    return acc
+        p = xs[k] * g
+        acc += p * xs[(k + 1) % 4]
+        if p > best:
+            best = p
+    window = [g] + xs[:-1]
+    return acc, best, window
 
 
-def test_loops_are_refused():
-    fe = front_end(looped, {"xs": dict(I16, length=4)})
-    with pytest.raises(NotShareable, match="straight-line"):
+LOOPED = {"xs": dict(I16, length=4), "g": I16}
+
+
+def waits(xs):
+    k = 0
+    while xs[k] > 0:
+        k += 1
+    return k
+
+
+def early(x, y):
+    if x > y:
+        return x * y
+    return x
+
+
+def test_loops_and_ifs_are_unrolled_and_selected():
+    fe = front_end(looped, LOOPED)
+    tree, info = share(fe.tree, fe.attr, 2)
+    model = build_model(tree, dict(fe.attr, **info["attr"]), _namespace(looped))
+    for _ in range(40):
+        args = ([_rng.randint(-300, 300) for _ in range(4)], _rng.randint(-50, 50))
+        assert simulate(info, model, args) == looped(*args)
+
+
+def test_what_cant_be_shared_is_refused():
+    fe = front_end(waits, {"xs": dict(I16, length=4)})
+    with pytest.raises(NotShareable, match="While"):
+        share(fe.tree, fe.attr, 2)
+    fe = front_end(early, {"x": I16, "y": I16})
+    with pytest.raises(NotShareable, match="return inside"):
         share(fe.tree, fe.attr, 2)
     with pytest.raises(NotImplementedError, match="can't be combined"):
         Py2ver(counter, COUNTER, multipliers=2, pipeline=2)
@@ -129,6 +162,26 @@ def test_shared_design_matches_in_simulation(monkeypatch, tmp_path):
     expected = p.PY_batch()(samples[:12])
     assert p.TB_batch()(samples[:12]) == expected
     assert p.TB_handshake()(samples[:12], valid=0.6, ready=0.5, seed=3) == expected
+
+
+@pytest.mark.sim
+@pytest.mark.parametrize("k", [1, 4])
+def test_a_shared_fir(monkeypatch, tmp_path, k):
+    from test_fold import FIR, fir
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(fir, FIR, multipliers=k)          # 16 constant taps, an accumulation
+    assert len(p._fold["mul_widths"]) == k and p.ram_phases <= 17 // k + 4
+    xs = [_rng.randint(-30000, 30000) for _ in range(10)]
+    assert p.TB_stream()(xs) == p.PY_stream()(xs)
+
+
+@pytest.mark.sim
+def test_loops_and_ifs_in_simulation(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(looped, LOOPED, multipliers=2)
+    vectors = [([_rng.randint(-300, 300) for _ in range(4)], _rng.randint(-50, 50))
+               for _ in range(10)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
 
 
 @pytest.mark.sim

@@ -1,13 +1,16 @@
 # share.py
 """
-Share multipliers and block-RAM tables: straight-line code over several clocks.
+Share multipliers and block-RAM tables: a design over several clocks.
 
-Code without loops (a numpy design written out element by element, say)
-normally becomes one big combinational circuit: every product its own
-multiplier, every table lookup its own copy of the table in logic. With
-`multipliers=N` it is scheduled over as many clocks as it needs instead:
+A design normally becomes one big combinational circuit: every product its
+own multiplier, every table lookup its own copy of the table in logic (a
+numpy design written out element by element, say). With `multipliers=N` it
+is scheduled over as many clocks as it needs instead:
 
-  - every product of two variables runs on one of N shared multipliers
+  - loops over constants or lists are unrolled, and if / else becomes a
+    selection (both branches computed, each variable chosen by the test)
+  - every product runs on one of N shared multipliers (a product by a
+    constant too, unless the constant is a power of two)
   - every function table (a fixed-point np.tanh, sigmoid, math.sin, ...) is
     a ROM in block RAM with one read per clock; a read gives its value one
     clock later
@@ -46,7 +49,7 @@ SEL_DECODE = 2.0          # which input a multiplexer takes in this clock
 
 
 class NotShareable(NotImplementedError):
-    """Code the scheduler can't take (loops, ifs, whole-list uses)."""
+    """Code the scheduler can't take (while, break, whole-list uses, ...)."""
 
 
 @dataclass
@@ -101,6 +104,7 @@ class _ToOps:
         used = {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)} | set(self.params)
         self.used = used
         self.count = 0
+        self.depth = 0                            # inside a loop or an if
         self.outputs: List[Tuple[str, Any]] = []
 
     def fresh(self, base: str) -> str:
@@ -150,6 +154,28 @@ class _ToOps:
                                       slice=ast.Constant(k), ctx=ast.Load())
                         for k in range(int(self.attr[node.id]["length"]))]
             return None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            a, b = self.elements(node.left), self.elements(node.right)
+            return None if a is None or b is None else a + b
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            for lst, k in ((node.left, node.right), (node.right, node.left)):
+                xs = self.elements(lst) if isinstance(lst, (ast.List, ast.Tuple)) else None
+                if xs is not None:
+                    n = self.expr(k)
+                    if not _is_const(n):
+                        raise NotShareable(f"[...] * n needs a constant n: {ast.unparse(node)}")
+                    return [copy.deepcopy(x) for _ in range(int(_const_value(n))) for x in xs]
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            xs = self.elements(node.value)
+            if xs is None:
+                return None
+            bounds = []
+            for b in (node.slice.lower, node.slice.upper, node.slice.step):
+                v = None if b is None else self.expr(b)
+                if v is not None and not _is_const(v):
+                    raise NotShareable(f"A slice needs constant bounds: {ast.unparse(node)}")
+                bounds.append(None if v is None else int(_const_value(v)))
+            return xs[slice(*bounds)]
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in ("list", "tuple") and len(node.args) == 1:
                 return self.elements(node.args[0])
@@ -175,7 +201,10 @@ class _ToOps:
         node = ast.BinOp(left=l, op=op, right=r)
         if _is_const(l) and _is_const(r):
             return node
-        mul = isinstance(op, ast.Mult) and not _is_const(l) and not _is_const(r)
+        mul = isinstance(op, ast.Mult) and not (_is_const(l) and _is_const(r))
+        if mul and (_is_const(l) or _is_const(r)):
+            c = abs(int(_const_value(l if _is_const(l) else r)))
+            mul = c & (c - 1) != 0                     # (0, 1 and powers of two: shifts)
         return self.op("mul" if mul else "free", node)
 
     def _call(self, fn: str, args: List[ast.expr]) -> ast.expr:
@@ -262,10 +291,7 @@ class _ToOps:
 
     # ---------------------------------------------------------------- statements
     def assign(self, var: str, value: ast.expr) -> None:
-        declared_list = "length" in self.attr.get(var, {})
-        elems = self.elements(value) if (declared_list or isinstance(value, (ast.List, ast.Tuple))
-                                         or isinstance(self.env.get(_name(value)), list)
-                                         or _name(value) in self.lists) else None
+        elems = self.elements(value)
         if elems is not None:
             self.env[var] = [self.declare(e, var) for e in elems]
         else:
@@ -304,7 +330,18 @@ class _ToOps:
                         self.env[name] = ([self.declare(x, name) for x in v]
                                           if isinstance(v, list) else self.declare(v, name))
                     continue
+            if isinstance(s, ast.For):
+                self.loop(s)
+                continue
+            if isinstance(s, ast.If):
+                self.branch(s)
+                continue
+            if isinstance(s, ast.Pass):
+                continue
             if isinstance(s, ast.Return):
+                if self.depth:
+                    raise NotShareable(f"A return inside a loop or an if (line {s.lineno}) "
+                                       "isn't supported")
                 vals = (s.value.elts if isinstance(s.value, ast.Tuple)
                         else [] if s.value is None else [s.value])
                 for i, v in enumerate(vals):
@@ -315,8 +352,92 @@ class _ToOps:
                 continue
             kind = type(s).__name__
             raise NotShareable(
-                f"multipliers= schedules straight-line code; a '{kind}' statement "
-                f"(line {getattr(s, 'lineno', '?')}) isn't (use fold= for a loop)")
+                f"multipliers= can't schedule a '{kind}' statement "
+                f"(line {getattr(s, 'lineno', '?')})")
+
+    def loop(self, s: ast.For) -> None:
+        """A for loop over items known now, unrolled."""
+        if s.orelse:
+            raise NotShareable(f"A for loop with an else (line {s.lineno}) isn't supported")
+        for n in ast.walk(s):
+            if isinstance(n, (ast.Break, ast.Continue, ast.While)):
+                raise NotShareable(f"'{type(n).__name__.lower()}' in a loop (line {n.lineno}) "
+                                   "isn't supported")
+        items = self.items(s.iter)
+        if items is None:
+            raise NotShareable(f"Can't unroll 'for ... in {ast.unparse(s.iter)}' (line {s.lineno}):"
+                               " it needs constant bounds or a list of known length")
+        self.depth += 1
+        for item in items:
+            self.bind(s.target, item)
+            self.body(s.body)
+        self.depth -= 1
+
+    def items(self, it: ast.expr) -> Optional[List[ast.expr]]:
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and not it.keywords:
+            fn, args = it.func.id, it.args
+            if fn == "range":
+                vals = [self.expr(a) for a in args]
+                if not all(_is_const(v) for v in vals):
+                    return None
+                return [ast.Constant(v) for v in range(*(int(_const_value(v)) for v in vals))]
+            if fn in ("enumerate", "zip", "reversed"):
+                cols = [self.items(a) for a in args]
+                if any(c is None for c in cols):
+                    return None
+                if fn == "reversed":
+                    return cols[0][::-1]
+                if fn == "enumerate":
+                    return [ast.Tuple(elts=[ast.Constant(k), x], ctx=ast.Load())
+                            for k, x in enumerate(cols[0])]
+                return [ast.Tuple(elts=list(row), ctx=ast.Load()) for row in zip(*cols)]
+        return self.elements(it)
+
+    def bind(self, target: ast.expr, item: ast.expr) -> None:
+        if isinstance(target, ast.Name):
+            self.env[target.id] = item
+        elif isinstance(target, ast.Tuple) and isinstance(item, ast.Tuple) \
+                and len(target.elts) == len(item.elts):
+            for t, v in zip(target.elts, item.elts):
+                self.bind(t, v)
+        else:
+            raise NotShareable(f"Can't unpack {ast.unparse(item)} into {ast.unparse(target)}")
+
+    def branch(self, s: ast.If) -> None:
+        """if / else as selections: both branches computed, each variable they
+        assign then chosen by the condition (element by element for a list)."""
+        test = self.expr(s.test)
+        if _is_const(test):                          # known now: only that branch
+            self.body(s.body if _const_value(test) else s.orelse)
+            return
+        before = dict(self.env)
+        self.depth += 1
+        self.body(s.body)
+        taken = self.env
+        self.env = dict(before)
+        self.body(s.orelse)
+        other = self.env
+        self.depth -= 1
+        self.env = dict(before)
+        for var in dict.fromkeys([*taken, *other]):
+            a, b = taken.get(var), other.get(var)
+            if a is None or b is None:               # (assigned in one branch only)
+                self.env[var] = a if b is None else b
+                continue
+            if isinstance(a, list) != isinstance(b, list) or (
+                    isinstance(a, list) and len(a) != len(b)):
+                raise NotShareable(f"'{var}' is a different kind of value in the two branches "
+                                   f"of the if on line {s.lineno}")
+            if isinstance(a, list):
+                self.env[var] = [self.pick(test, x, y) for x, y in zip(a, b)]
+            else:
+                self.env[var] = self.pick(test, a, b)
+
+    def pick(self, test: ast.expr, a: ast.expr, b: ast.expr) -> ast.expr:
+        if ast.dump(a) == ast.dump(b):
+            return a
+        node = ast.IfExp(test=copy.deepcopy(test), body=a, orelse=b)
+        return node if _is_const(node) else self.op("free", node)
 
 
 def _name(node: ast.expr) -> Optional[str]:
@@ -751,7 +872,7 @@ def _uses(ops: List[Op], outputs) -> Dict[str, int]:
     return count
 
 
-def _fuse_macs(ops: List[Op], outputs, fresh) -> List[Op]:
+def _fuse_macs(ops: List[Op], outputs, fresh, chains: int = 1) -> List[Op]:
     """
     Sums with products in them as multiply-accumulates: a sum of terms (an
     Add / Sub / negation tree whose inner sums are read only there) adds its
@@ -831,13 +952,25 @@ def _fuse_macs(ops: List[Op], outputs, fresh) -> List[Op]:
         if const:
             acc = ast.Constant(const) if acc is None else make(
                 "free", ast.BinOp(left=acc, op=ast.Add(), right=ast.Constant(const)))
-        for i, (sg, prod) in enumerate(prods):
-            prod = copy.deepcopy(prod)
-            if acc is None:
-                acc = ast.Constant(0) if sg < 0 else None
-            node = prod if acc is None else ast.BinOp(
-                left=acc, op=ast.Add() if sg > 0 else ast.Sub(), right=prod)
-            acc = make("mul", node, o.name if i == len(prods) - 1 else None)
+        # Up to `chains` accumulations side by side (one per multiplier), then summed
+        g = max(1, min(chains, len(prods) // 4))      # (at least 4 products each)
+        parts: List[Optional[ast.expr]] = []
+        for j in range(g):
+            part = acc if j == 0 else None
+            mine = prods[j::g]
+            for i, (sg, prod) in enumerate(mine):
+                prod = copy.deepcopy(prod)
+                if part is None and sg < 0:
+                    part = ast.Constant(0)
+                node = prod if part is None else ast.BinOp(
+                    left=part, op=ast.Add() if sg > 0 else ast.Sub(), right=prod)
+                last = g == 1 and i == len(mine) - 1
+                part = make("mul", node, o.name if last else None)
+            parts.append(part)
+        total = parts[0]
+        for j, part in enumerate(parts[1:]):
+            total = make("free", ast.BinOp(left=total, op=ast.Add(), right=part),
+                         o.name if j == len(parts) - 2 else None)
     return out
 
 
@@ -930,7 +1063,7 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
         raise NotShareable("The function must return something")
     ops = _live(list(conv.ops.values()), conv.outputs)
     _simplify(ops, conv.outputs)
-    ops = _live(_fuse_macs(ops, conv.outputs, lambda: conv.fresh("s")), conv.outputs)
+    ops = _live(_fuse_macs(ops, conv.outputs, lambda: conv.fresh("s"), multipliers), conv.outputs)
     rng = _ranges(ops, attr)
     widths = {n: _fmt_of(r) for n, r in rng.items()}
     by = {o.name: o for o in ops}
