@@ -228,3 +228,28 @@ def test_fixed_point_on_the_virtual_board_and_handshake(monkeypatch, tmp_path):
     vectors = _vectors(4, 3, 6)
     assert p.HW_sim()(vectors) == p.PY_batch()(vectors)
     assert p.TB_handshake()(vectors, valid=0.6, ready=0.5, seed=1) == p.PY_batch()(vectors)
+
+
+def _fx_scale(x):
+    return x * 0.3 + 0.1
+
+
+def test_copy_tree_shares_tables_only():
+    import ast as _ast
+    from py2ver.fixed import copy_tree, table_node
+    table = table_node(tuple(range(100)))
+    tree = _ast.parse("y = T[i] + 1")
+    tree.body[0].value.left.value = table
+    copied = copy_tree(tree)
+    assert copied is not tree and copied.body[0] is not tree.body[0]
+    assert copied.body[0].value.left.value is table                    # (shared)
+    assert _ast.unparse(copied) == _ast.unparse(tree)
+
+
+def test_front_end_cache_keeps_formats_apart():
+    from py2ver.core import front_end
+    q = {"signed": 1, "width": 16}
+    coarse = front_end(_fx_scale, {"x": dict(q, frac=8), "ret": dict(q, frac=4)})
+    fine = front_end(_fx_scale, {"x": dict(q, frac=8), "ret": dict(q, frac=12)})
+    # 1.0 * 0.3 + 0.1 = 0.4, floored to 4 / 12 fraction bits
+    assert (coarse.model(256), fine.model(256)) == (6, 1638)

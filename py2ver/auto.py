@@ -94,9 +94,36 @@ def _returned_names(fd: ast.FunctionDef) -> List[str]:
             for i, v in enumerate(vals)]
 
 
+_TRACED: Dict[Any, Any] = {}
+
+
 def _traced(func: Callable, record: Callable[[str, Any], None]):
     """The function, recording every value assigned to a name (and its parameters)."""
-    tree = ast.parse(inspect.getsource(func))
+    source = inspect.getsource(func)
+    key = (func, source)
+    if key not in _TRACED:                     # (instrumented once, run many times)
+        if len(_TRACED) >= 32:
+            _TRACED.pop(next(iter(_TRACED)))
+        _TRACED[key] = _traced_code(func, source)
+    code, name, names, returned, ann = _TRACED[key]
+    ns = _namespace(func)
+
+    def call(key: str, fn: Callable, *args: Any) -> Any:
+        y = fn(*args)
+        record(f"{key}{_TABLE_IN}", args[0])
+        record(key, y)
+        return y
+
+    ns["__py2ver_trace"] = record
+    ns["__py2ver_call"] = call
+    exec(code, ns)
+    return ns[name], list(names), list(returned), copy.deepcopy(ann)
+
+
+def _traced_code(func: Callable, source: str):
+    """The instrumented function, compiled: (code, name, names in order of first
+    assignment, returned names, annotations)."""
+    tree = ast.parse(source)
     tree, ann = read_annotations(tree, func)
     # Traced with its helpers inlined, as it is built (math calls in helpers
     # included); the helpers' own variables (__<helper><k>_...) get no format
@@ -168,16 +195,8 @@ def _traced(func: Callable, record: Callable[[str, Any], None]):
     fd.body = [s for item in fd.body for s in (item if isinstance(item, list) else [item])]
     fd.decorator_list = []
 
-    def call(key: str, fn: Callable, *args: Any) -> Any:
-        y = fn(*args)
-        record(f"{key}{_TABLE_IN}", args[0])
-        record(key, y)
-        return y
-
-    ns["__py2ver_trace"] = record
-    ns["__py2ver_call"] = call
-    exec(compile(ast.fix_missing_locations(tree), f"<traced {fd.name}>", "exec"), ns)
-    return ns[fd.name], order + list(tables), returned, ann
+    code = compile(ast.fix_missing_locations(tree), f"<traced {fd.name}>", "exec")
+    return code, fd.name, order + list(tables), returned, ann
 
 
 _TABLE_IN = ":in"               # range key of a table function's argument
@@ -540,6 +559,7 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
 
     from .core import front_end
     n_evals = 0
+    ideals: Dict[str, Any] = {}
 
     def error_ok(fracs: Dict[str, int]) -> bool:
         """Does the design with these formats meet max_error on the samples?
@@ -548,7 +568,11 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
         n_evals += 1
         attr = formats(fracs)
         ports, exact = model_outputs(front_end(func, attr, const_bits), samples)
-        ideal = float_reference(func, attr, samples)
+        # The float reference depends only on the inputs' formats (not searched)
+        key = repr([attr.get(p) for p in params])
+        if key not in ideals:
+            ideals[key] = float_reference(func, attr, samples)
+        ideal = ideals[key]
         for i, port in enumerate(ports):
             t = target(port)
             if t is not None and any(abs(float(e[i]) - float(r[i])) > t

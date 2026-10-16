@@ -55,7 +55,8 @@ from .share import ROM_MIN, share
 from .comprehend import expand_comprehensions
 from .control import structure, while_bound
 from .choose import choose
-from .fixed import DEFAULT_CONST_BITS, build_model, is_table, lower_fixed, quantize, uses_fixed
+from .fixed import (DEFAULT_CONST_BITS, build_model, copy_tree, is_table, lower_fixed, quantize,
+                    uses_fixed)
 from .visitor import FunctionVisitor
 from .ast_ir import Assignment, ModuleIR, Port
 
@@ -93,9 +94,9 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
     except Exception as e:
         raise RuntimeError(f"Unable to load source for {func}: {e}") from e
     fe = SimpleNamespace()
-    tree = ast.parse(source_foo)
     # Types from annotations (U[8], State(...), ...); attr entries merge over them
-    tree, ann = read_annotations(tree, func)
+    tree, ann = _cached(("parse", func, source_foo),
+                        lambda: read_annotations(ast.parse(source_foo), func))
     if attr is None and not ann:
         raise ValueError("Give attr (widths and formats), annotations, or samples=<example "
                          "inputs> to choose them automatically")
@@ -106,14 +107,19 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
     # The function's own parameters and attr, for running it as written (PY_float)
     fe.py_attr = attr
     fe.py_params = list(inspect.signature(func).parameters)
-    # Inline calls to your own helper functions and module-level int constants
-    tree = inline_helpers(tree, getattr(func, "__globals__", {}))
-    # List comprehensions as list literals (their lengths are known now)
-    tree = expand_comprehensions(tree, attr, _namespace(func))
-    # while / break / continue / early return as flags and guarded statements
-    tree = structure(tree, {"while": bound})
-    # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
-    tree, fe.hw_name = rename_keywords(tree)
+    def prepare():
+        t = inline_helpers(tree, getattr(func, "__globals__", {}))
+        # List comprehensions as list literals (their lengths are known now)
+        t = expand_comprehensions(t, attr, _namespace(func))
+        # while / break / continue / early return as flags and guarded statements
+        t = structure(t, {"while": bound})
+        # Python names that are Verilog keywords (buf, time, ...) get a '_' suffix
+        return rename_keywords(t)
+    # Inline calls to your own helper functions and module-level int constants,
+    # and the rest that doesn't depend on formats (kept for the next formats tried)
+    lengths = tuple(sorted((k, m["length"]) for k, m in attr.items()
+                           if isinstance(m, dict) and "length" in m))
+    tree, fe.hw_name = _cached(("prepare", func, source_foo, lengths, bound), prepare)
     fe.py_name = {v: k for k, v in fe.hw_name.items()}
     attr = {
         fe.hw_name.get(k, k): (
@@ -143,6 +149,23 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
     fe.model = build_model(tree, attr, ns) if fixed or fe.cplx_params else None
     fe.tree, fe.attr = tree, attr
     return fe
+
+
+_CACHE: Dict[Any, Any] = {}
+_CACHE_SIZE = 64
+
+
+def _cached(key: Any, make: Callable[[], Any]) -> Any:
+    """make(), remembered by key (a few recent ones); each call gets its own copy,
+    sharing only the constant tables (see fixed.copy_tree)."""
+    if key not in _CACHE:
+        if len(_CACHE) >= _CACHE_SIZE:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = make()
+    value = _CACHE[key]
+    if isinstance(value, tuple):
+        return tuple(copy_tree(v) if isinstance(v, ast.AST) else copy.deepcopy(v) for v in value)
+    return copy_tree(value)
 
 
 def _drop_bytecode(directory: Path, module: str) -> None:

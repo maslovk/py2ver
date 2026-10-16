@@ -45,6 +45,96 @@ FIT_LIST = "py2ver_fit_list"
 _INTERNAL = re.compile(r"(cx|fxq)\d+(_re|_im)?$")
 
 
+TABLE_MIN = 16          # a tuple of this many constants is a table: shared, not copied
+
+
+@functools.lru_cache(maxsize=256)
+def table_node(values: Tuple[int, ...]) -> ast.Tuple:
+    """A constant table as a tuple literal whose nodes already have positions
+    (so copy_tree can share it and fix_locations can skip it). One node per
+    table: nothing modifies it, so every use shares it."""
+    pos = {"lineno": 1, "col_offset": 0, "end_lineno": 1, "end_col_offset": 0}
+    return ast.Tuple(elts=[ast.Constant(v, **pos) for v in values], ctx=ast.Load(), **pos)
+
+
+def _is_table_node(n: ast.AST) -> bool:
+    if type(n) is not ast.Tuple or len(n.elts) < TABLE_MIN:
+        return False
+    known = getattr(n, "_py2ver_table", None)       # (worked out once per node)
+    if known is None:
+        known = all(type(e) is ast.Constant for e in n.elts)
+        n._py2ver_table = known
+    return known
+
+
+def _tables_in(node: ast.AST) -> List[ast.AST]:
+    out, stack = [], [node]
+    while stack:
+        n = stack.pop()
+        if _is_table_node(n):
+            out.append(n)
+        else:
+            stack.extend(ast.iter_child_nodes(n))
+    return out
+
+
+_SHARED = (ast.expr_context, ast.operator, ast.unaryop, ast.cmpop, ast.boolop)
+
+
+def copy_tree(node):
+    """A deep copy of an AST (a node or a list of them), sharing its constant
+    tables and the stateless nodes (Load, Add, ...): nothing changes those, and
+    copying them made each candidate format slow to try."""
+    if isinstance(node, list):
+        return [copy_tree(n) for n in node]
+    if not isinstance(node, ast.AST):
+        return copy.deepcopy(node)
+    if isinstance(node, _SHARED) or _is_table_node(node):
+        return node
+    new = node.__class__.__new__(node.__class__)
+    for name in node._fields:
+        if not hasattr(node, name):
+            continue
+        v = getattr(node, name)
+        if isinstance(v, ast.AST):
+            v = copy_tree(v)
+        elif isinstance(v, list):
+            v = [copy_tree(x) if isinstance(x, ast.AST) else x for x in v]
+        setattr(new, name, v)
+    for name in node._attributes:
+        if hasattr(node, name):
+            setattr(new, name, getattr(node, name))
+    return new
+
+
+def fix_locations(node: ast.AST) -> ast.AST:
+    """ast.fix_missing_locations, not walking into tables (made with positions)."""
+    def fix(n, lineno, col, end_lineno, end_col):
+        if "lineno" in n._attributes:
+            if getattr(n, "lineno", None) is None:
+                n.lineno = lineno
+            else:
+                lineno = n.lineno
+            if getattr(n, "end_lineno", None) is None:
+                n.end_lineno = end_lineno
+            else:
+                end_lineno = n.end_lineno
+            if getattr(n, "col_offset", None) is None:
+                n.col_offset = col
+            else:
+                col = n.col_offset
+            if getattr(n, "end_col_offset", None) is None:
+                n.end_col_offset = end_col
+            else:
+                end_col = n.end_col_offset
+        if _is_table_node(n) and all(hasattr(e, "lineno") for e in n.elts[:1]):
+            return
+        for child in ast.iter_child_nodes(n):
+            fix(child, lineno, col, end_lineno, end_col)
+    fix(node, 1, 0, 1, 0)
+    return node
+
+
 def fit_list(xs, shift: int, rnd: bool, lo, hi):
     """Each element: shifted right by `shift` (rounding half up if rnd; left if
     negative), then clamped to [lo, hi] unless lo is None."""
@@ -559,7 +649,7 @@ class _Lower:
         except (ValueError, OverflowError, ZeroDivisionError) as e:
             self._err(n, f"Table {key} over {meta['range']}: {e}")
         count = len(values)
-        entries = [ast.Constant(v) for v in values]
+        table = table_node(values)
         fa = _frac(t)
         top = max(fa, s)                               # index in units of the step
         index = ast.BinOp(left=self._shl(v, top - fa), op=ast.Sub(),
@@ -570,8 +660,7 @@ class _Lower:
             ast.Constant(0), ast.Call(func=ast.Name(id="min", ctx=ast.Load()), keywords=[],
                                       args=[ast.Constant(count - 1), index])])
         index = self._named(index)
-        return ast.Subscript(value=ast.Tuple(elts=entries, ctx=ast.Load()), slice=index,
-                             ctx=ast.Load()), out
+        return ast.Subscript(value=table, slice=index, ctx=ast.Load()), out
 
     def _call(self, n: ast.Call):
         f = n.func
@@ -812,13 +901,13 @@ def lower_fixed(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str,
     for _ in range(MAX_FRAC + 2):
         low.changed = False
         low.n_temps = 0
-        low.block(copy.deepcopy(fd.body))
+        low.block(copy_tree(fd.body))
         if not low.changed:
             break
     low.final = True
     low.n_temps = 0
     fd.body = low.block(fd.body)
-    ast.fix_missing_locations(tree)
+    fix_locations(tree)
     return tree, low.new_attr, dict(low.env)
 
 
@@ -839,7 +928,7 @@ def build_model(tree: ast.Module, attr: Dict[str, Dict[str, Any]],
     wrapped to its width on assignment (as its hardware wire is), integer /
     truncating, and and/or giving 0/1.
     """
-    fd = copy.deepcopy(tree.body[0])
+    fd = copy_tree(tree.body[0])
     fd.decorator_list = []
     fd.name = "__py2ver_model"
     declared = {k: (int(m["width"]), bool(m.get("signed")), "length" in m)
@@ -887,10 +976,21 @@ def build_model(tree: ast.Module, attr: Dict[str, Dict[str, Any]],
             self.generic_visit(node)
             return ast.IfExp(test=node, body=ast.Constant(1), orelse=ast.Constant(0))
 
+        def visit_Tuple(self, node: ast.Tuple):
+            # A table: a tuple in the model's namespace (compiling the literal at
+            # each use made building a model slow)
+            if not _is_table_node(node):
+                return self.generic_visit(node)
+            key = tables.setdefault(id(node), (f"__py2ver_t{len(tables)}",
+                                               tuple(e.value for e in node.elts)))
+            return ast.copy_location(ast.Name(id=key[0], ctx=ast.Load()), node)
+
+    tables: Dict[int, Tuple[str, Tuple[Any, ...]]] = {}
     fd = _Model().visit(fd)
-    module = ast.fix_missing_locations(ast.Module(body=[fd], type_ignores=[]))
+    module = fix_locations(ast.Module(body=[fd], type_ignores=[]))
     env = dict(ns)
     env.update(__py2ver_wrap=wrap, __py2ver_tdiv=_tdiv, **{FIT_LIST: fit_list},
                __py2ver_wrapl=lambda xs, w, s: [wrap(int(x), w, s) for x in xs])
+    env.update(dict(tables.values()))
     exec(compile(module, "<py2ver bit-exact model>", "exec"), env)
     return env[fd.name]

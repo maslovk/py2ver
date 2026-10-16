@@ -512,6 +512,26 @@ def _returned_complex(fd: ast.FunctionDef, sp: _Split) -> Set[str]:
             for i, v in enumerate(vals) if not isinstance(v, ast.Name) and (sp.is_c(v) or sp.is_cl(v))}
 
 
+def _may_be_complex(fd: ast.FunctionDef, attr: Dict[str, Dict[str, Any]],
+                    ns: Dict[str, Any]) -> bool:
+    """Could anything in the function be complex? (A quick look, so designs
+    without complex values skip the type inference.)"""
+    if any(isinstance(m, dict) and m.get("complex") for m in attr.values()):
+        return True
+    for n in ast.walk(fd):
+        if isinstance(n, ast.Constant) and isinstance(n.value, complex):
+            return True
+        if isinstance(n, ast.Attribute) and n.attr in ("real", "imag", "conjugate"):
+            return True
+        if isinstance(n, ast.Name):
+            v = ns.get(n.id)
+            if n.id == "complex" or isinstance(v, complex) or getattr(v, "__name__", "") == "cmath":
+                return True
+            if isinstance(v, (list, tuple)) and any(isinstance(x, complex) for x in v):
+                return True
+    return False
+
+
 def split_complex(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, Any]):
     """
     Rewrite the module's first function so complex values are pairs of real
@@ -519,6 +539,8 @@ def split_complex(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[st
     parameter names, set of all complex names: values and lists).
     """
     fd = tree.body[0]
+    if not _may_be_complex(fd, attr, ns):
+        return tree, attr, set(), set()
     sp = _Split(fd, attr, ns)
     sp.infer(fd)
     if not sp.cplx and not sp.clists and not any(sp.is_c(n) for n in ast.walk(fd)
