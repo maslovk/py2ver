@@ -8,6 +8,12 @@ import py2ver.core as py2ver_mod
 from py2ver import Py2ver
 
 
+@pytest.fixture(autouse=True)
+def _cocotb_testbench(monkeypatch):
+    """These tests look at the cocotb testbench itself (not the native one)."""
+    monkeypatch.setenv("PY2VER_SIM", "cocotb")
+
+
 def _batch_add_sub(a, b):
     s = a + b
     d = a - b

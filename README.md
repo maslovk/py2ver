@@ -616,6 +616,29 @@ from them. Written out, numpy code is large and has no loops: build a
 training step with `multipliers=` (see Sharing multipliers) and a forward
 pass with `pipeline=` (its tables then go to block RAM).
 
+### Simulation speed (Icarus, Verilator)
+
+`TB()`, `TB_batch()` and `TB_stream()` run a plain Verilog testbench: it reads
+the input vectors from a file, steps the design as described above, and writes
+the outputs to a file, with no Python in the loop. A long run on a large design
+goes to Verilator when it is installed (any version, 4.x included); the rest
+to Icarus. A compiled simulation is kept (in `native_build/`) and reused until
+the design changes, so a second run costs only the simulation itself:
+
+| | Icarus | Verilator, first run | Verilator, again | cocotb + Icarus (before) |
+|---|---|---|---|---|
+| XOR training step on 4 multipliers, 600 steps (27000 clocks) | 80 s | 9.3 s | 0.1 s | 67 s |
+| 16-tap FIR, 20000 samples | 3.6 s | 3.8 s | 0.5 s | 7.5 s |
+
+On a small design the time went to cocotb's Python round trip per clock; on
+a large one it is Icarus's own evaluation, which only Verilator cuts.
+
+`PY2VER_SIM=icarus`, `verilator` or `cocotb` picks one (cocotb runs the older
+Python testbenches). A design Verilator can't build (its preprocessor takes at
+most 20000 tokens on a line, less than a large table written out) runs on
+Icarus, with a warning. `TB_handshake()`, `HW_sim()` and designs with `'reg'`
+signals use cocotb.
+
 ### Area and timing (`SYN()`)
 
 `SYN()` compiles the generated module alone with Quartus (no board needed,

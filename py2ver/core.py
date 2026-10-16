@@ -1768,6 +1768,9 @@ class Py2ver:
             return []
         if self._fold:              # several clocks per vector: the stream testbench
             return self.tb_stream_fun(vectors)
+        native_rows = self._simulate_native([self._input_vector(v) for v in vectors])
+        if native_rows is not None:
+            return native_rows
         return self._simulate(len(vectors), lambda: self.gen_tb(vectors))
 
     def tb_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:
@@ -1781,7 +1784,21 @@ class Py2ver:
         log.info("TB stream called with %d sample(s)", len(samples))
         if not samples:
             return []
+        native_rows = self._simulate_native(self._stream_vectors(samples))
+        if native_rows is not None:
+            return native_rows
         return self._simulate(len(samples), lambda: self.gen_tb_stream(samples))
+
+    def _simulate_native(self, vecs: List[Tuple[int, ...]]) -> List[Tuple[int, ...]] | None:
+        """The vectors through a plain Verilog testbench on Icarus or Verilator (see
+        native.py), or None where the cocotb testbench is used."""
+        from . import native
+        clocks = len(vecs) * int(getattr(self, "ram_phases", 1)) + self.pipeline_stages
+        sim = native.choose_simulator(self, clocks)
+        if sim == "cocotb" or native.mode_of(self) is None:
+            return None
+        log.info("Simulating %d vector(s) with %s (native testbench)", len(vecs), sim)
+        return self._rows_to_outputs(native.run(self, vecs, sim), len(vecs))
 
     def py_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:
         """
