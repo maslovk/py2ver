@@ -57,8 +57,8 @@ class _Inliner:
 
     # --- lookups ---
     def _helper(self, name: str) -> Optional[ast.FunctionDef]:
-        if name in _BUILTINS:
-            return None
+        if name in _BUILTINS or name in self.globals.get("__py2ver_tables__", ()):
+            return None                     # (a function built as a table isn't inlined)
         obj = self.globals.get(name)
         if not inspect.isfunction(obj):
             return None

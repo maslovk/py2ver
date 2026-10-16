@@ -480,6 +480,48 @@ still builds as one design.
 Helpers get copies of list arguments, so a helper can't change a list
 argument in place (copy it first and return it).
 
+### numpy and classes
+
+Code written with numpy arrays, and methods of objects, works as it is
+(install the `numpy` extra). `examples/xor_network.py` is a small numpy
+neural network, unchanged; `examples/xor_hardware.py` builds its training
+step and its trained forward pass:
+
+```python
+net = XORNetwork()
+train = Py2ver(net.train, samples=[(X, Y)] * 600, width=24)     # one training step
+steps = train.PY_stream()([(X, Y)] * 600)                       # loss < 0.01 at step 397
+for name, value in train.state_values(steps[396]).items():      # {'W1': array, ...}
+    setattr(net, name, value)                                   # the weights trained in hardware
+
+infer = Py2ver(net.predict, samples=points, max_error=1e-2)     # weights: constants
+infer.TB()(np.array([0.8, 0.3]))                                # -> 0.875 (numpy: 0.876)
+```
+
+py2ver writes such a function out as scalar Python, checks it against the
+original in float on the examples, and builds that:
+
+- calls of the object's methods (`self.forward(x)`) and of your functions are
+  inlined; a function of one value that uses `np.exp` & co. or divides by a
+  variable (`sigmoid`) is built as a table of the whole function
+- the object's attributes: read and never written are constants (trained
+  weights), read and then written (`self.W1 -= ...`) are state starting from
+  the object's values, written before read (`self.h = ...`) are variables
+- arrays take the shapes of the example inputs, so every operation is written
+  out element by element: `@`, `+ - * /` and `**` with broadcasting,
+  indexing and slices with constants, `.T`, `.sum(axis, keepdims)`,
+  `np.mean`, `np.sum`, `len`, `np.atleast_2d`, `np.zeros` / `np.ones`,
+  `np.maximum` / `np.minimum`, `abs`, and elementwise `np.tanh` / `np.exp` /
+  `np.log` / ... (tables)
+- a method that is a loop with `print` / `break` on a condition (a training
+  loop) is built as one step of the loop: the variables its condition uses
+  (the loss) are the step's results, and the loop itself stays in Python
+
+Calls take the arguments the original does (numpy arrays); results come out
+flat, in row-major order. `samples=` is needed (for the shapes), and the
+examples should cover the inputs' real range: formats and tables are chosen
+from them.
+
 ### Area and timing (`SYN()`)
 
 `SYN()` compiles the generated module alone with Quartus (no board needed,
@@ -649,7 +691,8 @@ signals, complex arithmetic, lists, an AES S-box ROM, a randomized regression,
 a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
-table, a 32-tap FIR folded onto 4 multipliers, a decimate-by-4 filter fed one
+table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained and run
+in hardware, a decimate-by-4 filter fed one
 sample per handshake, a receiver chain built from plain Python functions, a
 histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:

@@ -186,6 +186,11 @@ def _math_function(f: ast.expr, ns: Dict[str, Any]) -> Optional[Callable]:
     if getattr(fn, "__module__", None) == "math" and callable(fn) \
             and getattr(fn, "__name__", "") not in _NO_TABLE:
         return fn
+    from .numpy_fe import TABLE_UFUNCS, TABLES_KEY
+    if getattr(fn, "__module__", None) == "numpy" and getattr(fn, "__name__", "") in TABLE_UFUNCS:
+        return fn                                   # np.tanh, np.exp, ...
+    if isinstance(f, ast.Name) and f.id in ns.get(TABLES_KEY, ()):
+        return fn                                   # your function, built as a table
     return None
 
 

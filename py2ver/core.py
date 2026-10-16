@@ -195,6 +195,18 @@ class Py2ver:
         {'fold', 'unroll', 'pipeline'}} to override the automatic folding.
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
+        # numpy / methods: translated into a scalar function first (see numpy_fe.py)
+        self._adapt: Callable[[Any], tuple] | None = None
+        self._numpy = None
+        from . import numpy_fe
+        if numpy_fe.needs_frontend(func):
+            tr = numpy_fe.translate(func, list(samples) if samples is not None else [])
+            self._numpy, self._adapt = tr, tr.adapt
+            user = {k.replace("self.", "self_", 1): v for k, v in normalize_attr(attr).items()}
+            attr = {k: dict(tr.attr.get(k, {}), **user.get(k, {}))
+                    for k in dict.fromkeys([*tr.attr, *user])}
+            samples = [tr.adapt(x) for x in samples]
+            func = tr.func
         if samples is not None:
             attr = auto_fixed(func, samples, attr, width=width or 16, max_error=max_error,
                               round=round, saturate=saturate, const_bits=const_bits)
@@ -844,7 +856,7 @@ class Py2ver:
         self._hw_ok = self.createHWproject()
         if not self._hw_ok:
             self._hw_unavailable(getattr(self, "_hw_error", "board project could not be built (see log)"))
-        return self._fx_rows(self.hw_fun)
+        return self._fx_rows(self.hw_fun, single=True)
 
     def _hw_unavailable(self, reason: str, *in_arg: Any) -> Tuple[int, ...]:
         """Raise, or fall back to simulation if FALLBACK_TO_SIM is set."""
@@ -1431,7 +1443,7 @@ class Py2ver:
     # ------------------------------------------------------------------------
 
     def TB(self) -> Callable[..., Tuple[int, ...]]:
-        return self._fx_rows(self.tb_fun)
+        return self._fx_rows(self.tb_fun, single=True)
 
     def TB_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
         return self._fx_rows(self.tb_batch_fun)
@@ -1457,6 +1469,21 @@ class Py2ver:
                                self.output_args_width_list)
         )
 
+    def state_values(self, row: Tuple[Any, ...]) -> Dict[str, Any]:
+        """
+        numpy designs with state: the object's attributes in one result row
+        of PY_stream() / TB_stream(), as arrays of their shapes (e.g. the
+        weights after a hardware training step): {'W1': array, ...}.
+        """
+        import numpy as np
+        if self._numpy is None or not self._numpy.state:
+            raise ValueError("Only for a numpy design with state")
+        out, i = {}, len(self.output_args_list) - sum(v.size for v in self._numpy.state.values())
+        for a, init in self._numpy.state.items():
+            out[a] = np.array(row[i:i + init.size], dtype=float).reshape(init.shape)
+            i += init.size
+        return out
+
     def PY_float(self) -> Callable[[List[Any]], List[Tuple[Any, ...]]]:
         """
         The original function as written (floats), on the same inputs as the
@@ -1468,6 +1495,8 @@ class Py2ver:
 
     def py_float_fun(self, vectors: List[Any]) -> List[Tuple[Any, ...]]:
         from .auto import float_reference
+        if self._adapt is not None:
+            vectors = [self._adapt(v) for v in vectors]
         return float_reference(self.func, self._py_attr, vectors)
 
     def quantization_error(self, vectors: List[Any]) -> Dict[str, Tuple[float, float]]:
@@ -1537,9 +1566,11 @@ class Py2ver:
         params = [p for p, _ in self.arg_groups]
         return tuple(self._py_value(p, v) for p, v in zip(params, vec)) + tuple(vec[len(params):])
 
-    def _fx_rows(self, fn: Callable) -> Callable:
-        """fn with its results' fixed-point outputs as numbers (raw / 2**frac)."""
-        if not self._fx_out:
+    def _fx_rows(self, fn: Callable, single: bool = False) -> Callable:
+        """fn with its results' fixed-point outputs as numbers (raw / 2**frac),
+        and (numpy designs) taking arguments as the original does: one call's
+        if `single`, else a list of them first."""
+        if not self._fx_out and self._adapt is None:
             return fn
         fracs = [self._fx_out.get(n) for n in self.output_args_list]
 
@@ -1548,6 +1579,9 @@ class Py2ver:
 
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
+            if self._adapt is not None:
+                args = (self._adapt(args) if single
+                        else ([self._adapt(v) for v in args[0]],) + tuple(args[1:]))
             out = fn(*args, **kwargs)
             return [row(r) for r in out] if isinstance(out, list) else row(out)
 

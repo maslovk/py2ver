@@ -626,7 +626,8 @@ class _Lower:
                 self._err(n, f"'.{f.attr}()' is not supported on fixed-point values")
             return n, (CPLX if tb == CPLX else INT)
         if any(_is_fx(t) for t in types):
-            if getattr(self._global_value(f), "__module__", None) == "math":
+            if getattr(self._global_value(f), "__module__", None) in ("math", "numpy") \
+                    or key in self.ns.get("__py2ver_tables__", ()):
                 self._err(n, f"Give {key} a table in attr, e.g. {{'{key}': {{'range': (-4, 4), "
                              f"'signed': 1, 'width': 16, 'frac': 14}}}} (or choose formats with "
                              f"samples / auto_fixed)")
