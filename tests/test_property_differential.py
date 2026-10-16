@@ -1,5 +1,6 @@
 import pytest
 import os
+import tempfile
 import shutil
 from pathlib import Path
 
@@ -23,6 +24,7 @@ def prop_add_sub(a, b):
         max_size=200,
     )
 )
+@pytest.mark.sim
 @settings(max_examples=10, deadline=None)
 def test_property_python_vs_sim_add_sub(vectors):
     """Property-based differential check: Python reference must match Icarus sim."""
@@ -38,7 +40,7 @@ def test_property_python_vs_sim_add_sub(vectors):
         "d": {"signed": 1, "width": 9, "type": "wire"},
     }
 
-    root = Path(__file__).resolve().parents[1]
+    root = Path(tempfile.mkdtemp(prefix="py2ver_prop_"))   # (its own directory)
     old_cwd = Path.cwd()
     old_sim = os.environ.get("SIM")
     try:

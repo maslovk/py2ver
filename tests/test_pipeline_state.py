@@ -77,6 +77,7 @@ def test_bubbles_and_stalls_leave_state_alone(sim_dir, func, attr, valid, ready)
 
 
 @pytest.mark.sim
+@pytest.mark.board
 def test_pipelined_state_on_the_virtual_board(sim_dir):
     p = Py2ver(fir_step, FIR_ATTR, pipeline=2)
     xs = [64, 0, 0, 1000, -1000]

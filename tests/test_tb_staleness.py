@@ -1,6 +1,5 @@
 import importlib
 import shutil
-from pathlib import Path
 
 import pytest
 
@@ -11,7 +10,7 @@ def _stale_sensitive(a, b):
 
 
 @pytest.mark.sim
-def test_tb_calls_do_not_reuse_stale_results(monkeypatch):
+def test_tb_calls_do_not_reuse_stale_results(monkeypatch, tmp_path):
     """Two consecutive TB calls with different inputs must produce different fresh outputs."""
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         pytest.skip("Icarus Verilog tools are not installed")
@@ -24,8 +23,7 @@ def test_tb_calls_do_not_reuse_stale_results(monkeypatch):
     except ModuleNotFoundError as exc:
         pytest.skip(f"py2ver runtime dependency missing: {exc}")
 
-    repo_root = Path(__file__).resolve().parents[1]
-    monkeypatch.chdir(repo_root)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SIM", "icarus")
 
     attr = {

@@ -222,11 +222,19 @@ def test_fixed_point_designs_match_the_reference_in_simulation(monkeypatch, tmp_
 
 
 @pytest.mark.sim
-def test_fixed_point_on_the_virtual_board_and_handshake(monkeypatch, tmp_path):
+@pytest.mark.board
+def test_fixed_point_on_the_virtual_board(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     p = Py2ver(mac, MAC)
     vectors = _vectors(4, 3, 6)
     assert p.HW_sim()(vectors) == p.PY_batch()(vectors)
+
+
+@pytest.mark.sim
+def test_fixed_point_through_the_handshake(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(mac, MAC)
+    vectors = _vectors(4, 3, 6)
     assert p.TB_handshake()(vectors, valid=0.6, ready=0.5, seed=1) == p.PY_batch()(vectors)
 
 

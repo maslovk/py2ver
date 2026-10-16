@@ -844,14 +844,29 @@ python examples/sha256_pipeline.py --board      # + connected DE0-Nano
 
 ### Tests
 
+Tests run in parallel (`-n auto`, pytest-xdist from the `test` extra) and are
+marked by what they need, so a quick check after a change doesn't wait for
+everything:
+
 ```
-.venv/bin/python -m pytest -q
-QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # also runs the Quartus test
+.venv/bin/python -m pytest -q -n auto -m "not sim and not board"   # no simulator: ~5 s
+.venv/bin/python -m pytest -q -n auto -m "not board"               # + simulation: ~35 s
+.venv/bin/python -m pytest -q -n auto                              # everything: ~1.5 min
+.venv/bin/python -m pytest -q -n auto tests/test_share.py          # one feature's tests
+.venv/bin/python -m pytest -q --lf                                 # what failed last time
+QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # + the Quartus tests
 ```
 
-Simulation tests compare the Python function against the cocotb + Icarus
-result and are skipped if Icarus or cocotb is missing. `tests/test_combinations.py`
-builds a set of designs (state, lists, complex values, tables, block RAM,
-helpers, keyword names) with each option (pipelining, folding, automatic
-formats, serial ports, stages, annotations) and checks every result against
-the references.
+- `sim`: compares the Python function against a simulation (the native
+  testbench on Icarus or Verilator, or cocotb); skipped if Icarus is missing.
+  A test that isn't marked `sim` (or `board`) and starts a simulator fails and
+  says so, which keeps the quick run quick.
+- `board`: the virtual DE0-Nano (`HW_sim()`): the whole project, UART
+  included, simulated; the slowest tests.
+- `quartus`: a real Quartus compile, skipped unless Quartus is found.
+
+Every test builds in its own temporary directory, so they can run in parallel.
+`tests/test_combinations.py` builds a set of designs (state, lists, complex
+values, tables, block RAM, helpers, keyword names) with each option
+(pipelining, folding, automatic formats, serial ports, stages, annotations)
+and checks every result against the references.

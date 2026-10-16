@@ -167,6 +167,7 @@ def test_ram_matches_python(sim_dir, func, attr, make):
 
 
 @pytest.mark.sim
+@pytest.mark.board
 def test_ram_on_the_virtual_board(sim_dir):
     p = Py2ver(cond_write, COND_ATTR)
     samples = [(5, 3), (7, 3), (-2, 3), (31, 0), (1, 0)]

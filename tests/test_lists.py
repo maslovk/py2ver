@@ -222,6 +222,7 @@ def test_histogram_updated_in_place(sim_dir):
 
 
 @pytest.mark.sim
+@pytest.mark.board
 def test_board_with_list_argument_and_list_state(sim_dir):
     p = Py2ver(var_index, {"xs": {"signed": 1, "width": 8, "length": 5},
                            "i": {"signed": 1, "width": 4}, "v": S8})

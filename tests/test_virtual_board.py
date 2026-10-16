@@ -6,6 +6,8 @@ from py2ver import Py2ver
 from test_state_stream import LPF_ATTR, lpf_step
 from test_syn_report import FIXTURES, FOO_ATTR, foo
 
+pytestmark = pytest.mark.board
+
 # The virtual board simulates the whole DE0-Nano project (UART RX/TX, the
 # latency handshake and the core) and talks to it over its UART pins with
 # the bytes hw_fun() would send, so these tests cover the board path end to

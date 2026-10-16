@@ -96,6 +96,7 @@ def test_ram_ports_match_python(sim_dir, func, attr, make, clocks):
 
 
 @pytest.mark.sim
+@pytest.mark.board
 def test_ram_ports_on_the_virtual_board(sim_dir):
     p = Py2ver(swap, {"i": U3, "j": U3, "mem": MEM})
     samples = [(1, 5), (5, 1), (2, 2), (0, 7)]

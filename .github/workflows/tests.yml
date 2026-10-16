@@ -41,4 +41,4 @@ jobs:
 
       # Quartus tests skip themselves (no QUARTUS_DIR on the runner)
       - name: Run tests
-        run: python -m pytest -q -rs
+        run: python -m pytest -q -rs -n auto

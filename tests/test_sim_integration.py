@@ -1,6 +1,5 @@
 import importlib
 import shutil
-from pathlib import Path
 
 import pytest
 
@@ -27,7 +26,7 @@ def _sim_mixed_latency(a, b):
 
 
 @pytest.mark.sim
-def test_icarus_cocotb_tb_end_to_end(monkeypatch):
+def test_icarus_cocotb_tb_end_to_end(monkeypatch, tmp_path):
     """Run the real cocotb+Icarus simulation path and verify decoded outputs."""
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         pytest.skip("Icarus Verilog tools are not installed")
@@ -40,8 +39,7 @@ def test_icarus_cocotb_tb_end_to_end(monkeypatch):
     except ModuleNotFoundError as exc:
         pytest.skip(f"py2ver runtime dependency missing: {exc}")
 
-    repo_root = Path(__file__).resolve().parents[1]
-    monkeypatch.chdir(repo_root)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SIM", "icarus")
 
     attr = {
@@ -59,7 +57,7 @@ def test_icarus_cocotb_tb_end_to_end(monkeypatch):
 
 
 @pytest.mark.sim
-def test_icarus_pipeline_latency_and_value(monkeypatch):
+def test_icarus_pipeline_latency_and_value(monkeypatch, tmp_path):
     """Verify reg-pipeline latency metadata and sampled value correctness."""
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         pytest.skip("Icarus Verilog tools are not installed")
@@ -72,8 +70,7 @@ def test_icarus_pipeline_latency_and_value(monkeypatch):
     except ModuleNotFoundError as exc:
         pytest.skip(f"py2ver runtime dependency missing: {exc}")
 
-    repo_root = Path(__file__).resolve().parents[1]
-    monkeypatch.chdir(repo_root)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SIM", "icarus")
 
     attr = {
@@ -95,7 +92,7 @@ def test_icarus_pipeline_latency_and_value(monkeypatch):
 
 
 @pytest.mark.sim
-def test_icarus_mixed_output_latencies(monkeypatch):
+def test_icarus_mixed_output_latencies(monkeypatch, tmp_path):
     """Verify per-output latency accounting for wire+reg mixed outputs."""
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         pytest.skip("Icarus Verilog tools are not installed")
@@ -108,8 +105,7 @@ def test_icarus_mixed_output_latencies(monkeypatch):
     except ModuleNotFoundError as exc:
         pytest.skip(f"py2ver runtime dependency missing: {exc}")
 
-    repo_root = Path(__file__).resolve().parents[1]
-    monkeypatch.chdir(repo_root)
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SIM", "icarus")
 
     attr = {

@@ -146,7 +146,16 @@ def test_folded_fixed_point_and_stateless_designs(monkeypatch, tmp_path):
     expected = p.PY_batch()(vectors)
     assert p.TB_batch()(vectors) == expected
     assert p.TB_handshake()(vectors, valid=0.6, ready=0.5, seed=2) == expected
-    assert p.HW_sim()(vectors[:3]) == expected[:3]
+
+
+@pytest.mark.sim
+@pytest.mark.board
+def test_a_folded_design_on_the_virtual_board(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(dot_max, DOT, fold="i")
+    vectors = [([_rng.randint(-300, 300) for _ in range(8)],
+                [_rng.randint(-300, 300) for _ in range(8)]) for _ in range(3)]
+    assert p.HW_sim()(vectors) == p.PY_batch()(vectors)
 
 
 def _quartus_dir():

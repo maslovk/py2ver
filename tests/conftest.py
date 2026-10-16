@@ -55,15 +55,38 @@ def _normalize_expected(py_out, p):
     return tuple(out)
 
 
+def pytest_collection_modifyitems(items):
+    """A test using the simulation fixture is a simulation test."""
+    for item in items:
+        if "assert_python_matches_sim" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.sim)
+
+
+@pytest.fixture(autouse=True)
+def _simulations_are_marked(request, monkeypatch):
+    """A test not marked sim / board may not start a simulator, so that
+    `pytest -m "not sim and not board"` stays quick (and its tests keep running
+    in parallel with -n): mark a test that simulates."""
+    if request.node.get_closest_marker("sim") or request.node.get_closest_marker("board"):
+        return
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError(f"{request.node.nodeid} runs a simulation: mark it @pytest.mark.sim")
+    import py2ver.native
+    import py2ver.tb_runner
+    monkeypatch.setattr(py2ver.native, "_run", refuse)          # iverilog / vvp / verilator
+    monkeypatch.setattr(py2ver.tb_runner, "get_runner", refuse)  # cocotb
+
+
 @pytest.fixture
-def assert_python_matches_sim(monkeypatch):
+def assert_python_matches_sim(monkeypatch, tmp_path):
     """Assert Python reference output equals cocotb+Icarus output for vectors."""
     if shutil.which("iverilog") is None or shutil.which("vvp") is None:
         pytest.skip("Icarus Verilog tools are not installed")
     pytest.importorskip("cocotb")
     pytest.importorskip("cocotb_tools")
 
-    monkeypatch.chdir(ROOT)
+    monkeypatch.chdir(tmp_path)                 # (its own directory: tests run in parallel)
     monkeypatch.setenv("SIM", "icarus")
 
     def _run(func, attr, vectors, **py2ver_kwargs):
