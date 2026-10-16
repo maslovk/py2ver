@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import ast
 import copy
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class _Expand(ast.NodeTransformer):
     def __init__(self, lengths: Dict[str, int], ns: Dict[str, Any]) -> None:
         self.lengths = dict(lengths)
         self.ns = ns
+        self.shapes: Dict[str, Tuple[int, ...]] = {}
+        self.dict_keys: Dict[str, List[Any]] = {}
         self.local: set = set()
 
     # ------------------------------------------------------------ lengths, constants
@@ -79,13 +81,36 @@ class _Expand(ast.NodeTransformer):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and len(n.args) == 1 \
                 and n.func.id in ("list", "tuple", "reversed"):
             return self.length(n.args[0])
-        if isinstance(n, ast.ListComp):
-            return None
+        if isinstance(n, ast.Subscript) and not isinstance(n.slice, ast.Slice):
+            # A row of a list of lists (an argument with a 'shape', or a nested literal)
+            depth, base = 0, n
+            while isinstance(base, ast.Subscript):
+                depth, base = depth + 1, base.value
+            if isinstance(base, ast.Name) and base.id in self.shapes \
+                    and depth < len(self.shapes[base.id]):
+                return self.shapes[base.id][depth]
+            if isinstance(base, (ast.List, ast.Tuple)) and depth == 1 \
+                    and isinstance(n.value, (ast.List, ast.Tuple)):
+                k = self.const(n.slice)
+                if k is not None and isinstance(base.elts[k], (ast.List, ast.Tuple)):
+                    return len(base.elts[k].elts)
         return None
 
     # ------------------------------------------------------------ iteration
     def items(self, it: ast.expr) -> Optional[List[ast.expr]]:
         """The items an iterable gives, as expressions, or None if unknown."""
+        # A dict (its keys), d.keys() / d.values() / d.items()
+        base, kind = it, "keys"
+        if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute) and not it.args \
+                and it.func.attr in ("keys", "values", "items"):
+            base, kind = it.func.value, it.func.attr
+        keys = self.keys_of(base) if isinstance(base, (ast.Name, ast.Dict)) else None
+        if keys is not None:
+            def value(k):
+                return ast.Subscript(value=copy.deepcopy(base), slice=ast.Constant(k),
+                                     ctx=ast.Load())
+            return [ast.Constant(k) if kind == "keys" else value(k) if kind == "values" else
+                    ast.Tuple(elts=[ast.Constant(k), value(k)], ctx=ast.Load()) for k in keys]
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) and not it.keywords:
             fn, args = it.func.id, it.args
             if fn == "range" and 1 <= len(args) <= 3:
@@ -162,6 +187,13 @@ class _Expand(ast.NodeTransformer):
     def visit_ListComp(self, node: ast.ListComp):
         return self.expand(node)
 
+    def visit_DictComp(self, node: ast.DictComp):
+        # {k: v for ...}: the pairs as a dict literal (see containers.py)
+        pair = ast.Tuple(elts=[node.key, node.value], ctx=ast.Load())
+        lst = self.expand(ast.copy_location(ast.ListComp(elt=pair, generators=node.generators), node))
+        return ast.copy_location(ast.Dict(keys=[e.elts[0] for e in lst.elts],
+                                          values=[e.elts[1] for e in lst.elts]), node)
+
     def visit_GeneratorExp(self, node: ast.GeneratorExp):
         return self.expand(node)
 
@@ -177,13 +209,64 @@ class _Expand(ast.NodeTransformer):
         for s in stmts:
             s = self.visit(s)
             out.append(s)
-            # Lengths of lists assigned on the way (statements run in order)
+            # Lengths of lists (and keys of dicts) assigned on the way
             if isinstance(s, ast.Assign) and len(s.targets) == 1 \
                     and isinstance(s.targets[0], ast.Name):
+                name = s.targets[0].id
+                self.dict_keys.pop(name, None)
                 n = self.length(s.value)
                 if n is not None:
-                    self.lengths[s.targets[0].id] = n
+                    self.lengths[name] = n
+                keys = self.keys_of(s.value)
+                if keys is not None:
+                    self.dict_keys[name] = keys
+            elif isinstance(s, ast.Assign) and len(s.targets) == 1 \
+                    and isinstance(s.targets[0], ast.Subscript) \
+                    and isinstance(s.targets[0].value, ast.Name) \
+                    and s.targets[0].value.id in self.dict_keys:
+                key = _literal(s.targets[0].slice)
+                keys = self.dict_keys[s.targets[0].value.id]
+                if key is _NONE:
+                    del self.dict_keys[s.targets[0].value.id]
+                elif key not in keys:
+                    keys.append(key)
         return out
+
+    def keys_of(self, node: ast.expr) -> Optional[List[Any]]:
+        """The keys of a dict-valued expression known now, in order (or None)."""
+        if isinstance(node, ast.Dict):
+            keys = []
+            for k, v in zip(node.keys, node.values):
+                if k is None:
+                    sub = self.keys_of(v)
+                    if sub is None:
+                        return None
+                    keys += [x for x in sub if x not in keys]
+                    continue
+                key = _literal(k)
+                if key is _NONE:
+                    return None
+                if key not in keys:
+                    keys.append(key)
+            return keys
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
+            keys = []
+            for a in node.args:
+                sub = self.keys_of(a)
+                if sub is None:
+                    return None
+                keys += [x for x in sub if x not in keys]
+            return keys + [kw.arg for kw in node.keywords if kw.arg and kw.arg not in keys]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "copy" and not node.args:
+            return self.keys_of(node.func.value)
+        if isinstance(node, ast.Name):
+            if node.id in self.dict_keys:
+                return list(self.dict_keys[node.id])
+            v = self.ns.get(node.id) if node.id not in self.local else None
+            if isinstance(v, dict):
+                return list(v)
+        return None
 
     def generic_visit(self, node):
         for field in ("body", "orelse", "finalbody"):
@@ -200,6 +283,16 @@ class _Expand(ast.NodeTransformer):
             elif isinstance(value, ast.AST):
                 setattr(node, field, self.visit(value))
         return node
+
+
+_NONE = object()
+
+
+def _literal(node: ast.expr) -> Any:
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        return _NONE
 
 
 def _subst(node: ast.expr, env: Dict[str, ast.expr]) -> ast.expr:
@@ -264,9 +357,15 @@ def _decide(cond: ast.expr, ex: _Expand) -> Optional[bool]:
 def expand_comprehensions(tree: ast.Module, attr: Dict[str, Any],
                           ns: Dict[str, Any]) -> ast.Module:
     """The module with every list comprehension / generator expression written out."""
-    if not any(isinstance(n, (ast.ListComp, ast.GeneratorExp)) for n in ast.walk(tree)):
+    if not any(isinstance(n, (ast.ListComp, ast.GeneratorExp, ast.DictComp))
+               for n in ast.walk(tree)):
         return tree
     lengths = {k: int(m["length"]) for k, m in (attr or {}).items()
                if isinstance(m, dict) and "length" in m}
-    tree = _Expand(lengths, ns).visit(copy.deepcopy(tree))
+    lengths.update({k: int(m["shape"][0]) for k, m in (attr or {}).items()
+                    if isinstance(m, dict) and "shape" in m})
+    ex = _Expand(lengths, ns)
+    ex.shapes = {k: tuple(int(x) for x in m["shape"]) for k, m in (attr or {}).items()
+                 if isinstance(m, dict) and "shape" in m}
+    tree = ex.visit(copy.deepcopy(tree))
     return ast.fix_missing_locations(tree)

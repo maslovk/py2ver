@@ -725,7 +725,8 @@ vectors).
 - A variable first assigned in only one branch of an `if` takes that
   branch's value (Python can only read it after that branch)
 
-- Lists, tables and memories (see below)
+- Lists, tables and memories (see below), lists of lists, and dicts with
+  constant keys (see "Dicts and lists of lists")
 - List comprehensions and generator expressions (`[x * g for x in xs]`,
   `sum(x * y for x, y in zip(xs, ys))`), written out as lists: over lists of
   known length, `range(...)` of constants, `enumerate` and `zip` of those,
@@ -733,8 +734,8 @@ vectors).
   list's length must be known when translating)
 - Returning an argument: it gets its own output port, `<name>_out`
 
-Not supported: recursion, keyword arguments in helper calls, dicts and sets,
-nested lists, `try` / `with`, a loop's `else`.
+Not supported: recursion, keyword arguments in helper calls, sets, `try` /
+`with`, a loop's `else`, a dict as an argument or a result.
 
 Python names that are Verilog keywords (`buf`, `time`, `table`, `type`, ...)
 get a `_` suffix in the HDL; keep using the Python names in `attr` and calls.
@@ -808,6 +809,43 @@ def histogram(bin_, counts):
 attr = {'bin_':   {'signed': 0, 'width': 8},
         'counts': {'signed': 0, 'width': 16, 'length': 256, 'memory': 'ram'}}
 ```
+
+### Dicts and lists of lists
+
+A dict whose keys are known when translating is one variable per key, and a
+list of lists (a matrix, any depth) one flat list in row-major order:
+
+```python
+GAIN = {"lo": 3, "hi": -2}
+
+def mix(x, m, v):                       # m: a 3 x 2 matrix, v: a 2-vector
+    acc = {"lo": x * GAIN["lo"], "hi": 0}
+    for i in range(3):
+        acc["hi"] += m[i][0] * v[0] + m[i][1] * v[1]
+    out = [[acc[k] * j for j in range(2)] for k in acc]
+    return out                          # 4 outputs, row-major
+
+attr = {"x": I16, "m": dict(I16, shape=(3, 2)), "v": dict(I16, length=2)}
+p = Py2ver(mix, attr)
+p.TB_batch()([(5, [[1, 2], [3, 4], [5, 6]], [7, 8])])
+```
+
+- **Dicts**: `d[k]`, `d[k] = v`, `d[k] += v` with a constant key (a literal, a
+  module constant, or the variable of a loop over the dict); `k in d`,
+  `len(d)`, `d.get(k, default)`, `d.update(...)`, loops over `d`, `d.keys()`,
+  `d.values()`, `d.items()` (unrolled), dict comprehensions, `d2 = d` (the
+  same dict) and `dict(d)` / `d.copy()` (a copy), module-level constant dicts.
+  With int keys a key computed at run time reads, or updates, the existing
+  keys. `attr['d']` gives every entry its format. A dict can't be an argument
+  or a result (return its values).
+- **Lists of lists**: literals and comprehensions, `m[i][j]` with constant or
+  variable indices, writes, `m[i]` as a row, `for row in m` (a loop over the
+  rows, which `fold` can fold), `len(m)`, `len(m[0])`. An argument declares
+  its shape, `'shape': (R, C)` in attr, and takes nested lists (automatic
+  formats find it from the examples); a returned one gives its elements in
+  row-major order. Writing through a row (`row = m[0]; row[1] = 5`) would
+  change `m` in Python, so it is refused (write `m[0][1] = 5`), and so is
+  `[[0] * C] * R`, whose rows are one list in Python.
 
 ### How results relate to Python
 

@@ -45,13 +45,18 @@ class _Range:
         self.length = 0          # for a list: its longest length seen
         self.is_list = False
         self.is_complex = False
+        self.shape: Optional[Tuple[int, ...]] = None    # a list of lists
 
     def add(self, v: Any) -> None:
         if isinstance(v, (list, tuple)):
             self.is_list = True
             self.length = max(self.length, len(v))
+            if v and all(isinstance(x, (list, tuple)) for x in v):    # a list of lists
+                shape = _shape(v)
+                if shape is not None:
+                    self.shape = shape
             for x in v:
-                self._add(x)
+                self.add(x) if isinstance(x, (list, tuple)) else self._add(x)
         else:
             self._add(v)
 
@@ -70,6 +75,7 @@ class _Range:
         self.lo, self.hi = min(self.lo, other.lo), max(self.hi, other.hi)
         self.is_float |= other.is_float
         self.length = max(self.length, other.length)
+        self.shape = self.shape or other.shape
         self.is_list |= other.is_list
         self.is_complex |= other.is_complex
 
@@ -393,9 +399,18 @@ def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]
     return ranges, order, returned
 
 
+def _shape(v: Any) -> Optional[Tuple[int, ...]]:
+    if not isinstance(v, (list, tuple)):
+        return ()
+    subs = {_shape(x) for x in v}
+    return (len(v),) + subs.pop() if len(subs) == 1 and None not in subs else None
+
+
 def _fmt(r: _Range, int_bits: int, frac: int) -> Dict[str, Any]:
     out = {"signed": 1, "width": 1 + int_bits + frac, "frac": frac}
-    if r.is_list:
+    if r.shape is not None and len(r.shape) > 1:
+        out["shape"] = r.shape
+    elif r.is_list:
         out["length"] = r.length
     return out
 
@@ -493,7 +508,9 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
                 signed = r.lo < 0
                 bits = (r.int_bits() + 1 if signed else max(1, int(r.hi).bit_length())) + margin
                 result[name] = dict(base.get(name, {}), signed=int(signed), width=bits)
-                if r.is_list:
+                if r.shape is not None and len(r.shape) > 1:
+                    result[name].setdefault("shape", r.shape)
+                elif r.is_list:
                     result[name].setdefault("length", r.length)
             continue                                 # integer locals keep exact widths
         auto[name] = (r, r.int_bits() + margin)

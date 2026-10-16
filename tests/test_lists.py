@@ -242,7 +242,7 @@ def test_board_with_list_argument_and_list_state(sim_dir):
     [
         (alias, "copy it with"),
         (append_in_branch, "one path only"),
-        (nested, "must be integers"),
+        (nested, "must be rectangular"),
         (out_of_range, "out of range"),
     ],
 )

@@ -55,6 +55,7 @@ from .share import ROM_MIN, share
 from .comprehend import expand_comprehensions
 from .control import structure, while_bound
 from .choose import choose
+from .containers import flatten, nest, scalarize, shapes_of
 from .fixed import (DEFAULT_CONST_BITS, build_model, copy_tree, is_table, lower_fixed, quantize,
                     uses_fixed)
 from .visitor import FunctionVisitor
@@ -129,6 +130,9 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
         for k, v in attr.items()
     }
     ns = _namespace(func)
+    # Dicts with constant keys and lists of lists (see containers.py)
+    fe.shapes = shapes_of(attr)
+    tree, attr = scalarize(tree, attr, ns)
     # Inputs as the caller gives them (a complex one is split in two below)
     fe.call_inputs = [fe.hw_name.get(p, p) for p in fe.py_params
                       if not {"next", "memory"} & set(attr.get(fe.hw_name.get(p, p), {}))]
@@ -262,6 +266,7 @@ class Py2ver:
         self._hw_name, self._py_name = fe.hw_name, fe.py_name
         self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
         self._fx_types, self._model = fe.fx_types, fe.model
+        self._shapes = fe.shapes             # lists of lists: (rows, ...) per argument
         self._complex_names = fe.complex_names
         # Folding: the loop's body runs once per clock (phase) instead of unrolled
         self._fold: Dict[str, Any] | None = None
@@ -1622,8 +1627,26 @@ class Py2ver:
         """
         if self.state_map or self.rams:
             raise ValueError("This design has state ('next' or 'memory' in attr); use PY_stream().")
-        func = self._model or self.func
+        func = self._model or self._original()
         return [self._py_row(func(*self._py_args(vec))) for vec in vectors]
+
+    def _original(self) -> Callable:
+        """The function as written, taking the flat lists the ports take for its
+        lists of lists (it gets them nested)."""
+        if not self._shapes:
+            return self.func
+        names = [self._py_name.get(p, p) for p in self._shapes]
+        shapes = {self._py_name.get(p, p): s for p, s in self._shapes.items()}
+        sig = inspect.signature(self.func)
+
+        @functools.wraps(self.func)
+        def call(*args, **kwargs):
+            bound = sig.bind(*args, **kwargs)
+            for name in names:
+                if name in bound.arguments:
+                    bound.arguments[name] = nest(flatten(bound.arguments[name]), shapes[name])
+            return self.func(*bound.args, **bound.kwargs)
+        return call
 
     def _py_row(self, ret: Any) -> Tuple[int, ...]:
         return tuple(
@@ -1714,6 +1737,8 @@ class Py2ver:
     def _py_value(self, param: str, value: Any) -> Any:
         """An argument for the ports / the bit-exact model: a fixed-point
         parameter's numbers as raw values, quantized like assignments to it."""
+        if param in self._shapes:            # a list of lists: flat, row-major
+            value = flatten(value)
         m = self._fx_params.get(param)
         if m is None:
             return value
@@ -1873,7 +1898,7 @@ class Py2ver:
         groups = dict(self.arg_groups)
 
         model = self._model is not None
-        func = self._model if model else self.func
+        func = self._model if model else self._original()
         py = (lambda name: name) if model else (lambda name: self._py_name.get(name, name))  # noqa: E731
         params = list(inspect.signature(func).parameters)
         if params != [py(p) for p, _ in self.arg_groups]:
