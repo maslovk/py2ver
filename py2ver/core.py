@@ -217,7 +217,7 @@ class Py2ver:
                  fold: Any = None, unroll: int = 1,
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
                  multipliers: int | None = None, rate: float | None = None,
-                 clock: float = DEFAULT_CLK_FREQ) -> None:
+                 clock: float = DEFAULT_CLK_FREQ, sequential: bool = False) -> None:
         """
         func: the function, as written. attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
@@ -235,6 +235,9 @@ class Py2ver:
         multipliers: run the design over several clocks on this many
         shared multipliers, with each function table in block RAM (see
         share.py).
+        sequential: build the loops as they are written, as a state machine
+        running a step at a time with large lists in block RAM (see
+        sequencer.py), for designs too big to write out.
         rate: samples per second the design must keep up with at `clock` Hz
         (default 50 MHz): fold / unroll / multipliers are chosen to fit, as
         small as possible, and the choice is printed (see choose.py).
@@ -245,7 +248,20 @@ class Py2ver:
         self._numpy = None
         from . import numpy_fe
         if numpy_fe.needs_frontend(func):
-            tr = numpy_fe.translate(func, list(samples) if samples is not None else [])
+            from . import numpy_loops
+            given = list(samples) if samples is not None else []
+            if sequential:
+                tr = numpy_loops.translate(func, given)
+            else:
+                try:
+                    tr = numpy_fe.translate(func, given)
+                except numpy_fe.NotTranslatable as e:
+                    # Too big (or too varied) to write out: its loops, sequenced
+                    try:
+                        tr = numpy_loops.translate(func, given)
+                    except numpy_fe.NotTranslatable:
+                        raise e from None
+                    sequential = True
             self._numpy, self._adapt = tr, tr.adapt
             user = {k.replace("self.", "self_", 1): v for k, v in normalize_attr(attr).items()}
             attr = {k: dict(tr.attr.get(k, {}), **user.get(k, {}))
@@ -288,7 +304,19 @@ class Py2ver:
             multipliers = opts.get("multipliers")
             print(f"py2ver: {rate:g} samples/s at {clock / 1e6:g} MHz leaves {budget} "
                   f"clock{'s' if budget != 1 else ''} per sample: {self.choice}")
-        if multipliers:
+        if sequential:
+            if pipeline or multipliers or (fold is not None and fold is not False):
+                raise NotImplementedError("sequential=True can't be combined with fold=, "
+                                          "multipliers= or pipeline=")
+            from .sequencer import sequence
+            seq_tree, info = sequence(tree, attr, _namespace(func))
+            if info["phases"] > 1:
+                tree, self._fold = seq_tree, info
+                attr = dict(attr, **info["attr"])
+                log.info("Sequenced: %d blocks, %d clocks per sample, %d register file(s), "
+                         "%d ROM(s), %d register bits", info["blocks"], info["phases"],
+                         len(info["rfs"]), len(info["roms"]), info["register_bits"])
+        elif multipliers:
             if pipeline or (fold is not None and fold is not False):
                 raise NotImplementedError("multipliers= can't be combined with fold= or pipeline=")
             shared, info = share(tree, attr, multipliers)

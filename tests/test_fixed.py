@@ -157,8 +157,6 @@ def test_integer_designs_are_untouched(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "src, attr, match",
     [
-        ("def f(a, b):\n    y = a / b\n    return y", {"a": fx(8, 4), "b": fx(8, 4)},
-         "needs a constant divisor"),
         ("def f(a):\n    y = a // 2\n    return y", {"a": fx(8, 4)}, "'//' is not defined"),
         ("def f(a):\n    y = a\n    for i in range(3):\n        y = y * a\n    return y",
          {"a": fx(8, 4)}, "grows on every loop iteration"),
@@ -261,3 +259,21 @@ def test_front_end_cache_keeps_formats_apart():
     fine = front_end(_fx_scale, {"x": dict(q, frac=8), "ret": dict(q, frac=12)})
     # 1.0 * 0.3 + 0.1 = 0.4, floored to 4 / 12 fraction bits
     assert (coarse.model(256), fine.model(256)) == (6, 1638)
+
+
+def _ratio(a, b):
+    q = a / b
+    return q
+
+
+@pytest.mark.sim
+def test_division_by_a_variable(monkeypatch, tmp_path):
+    """a / b keeps a's fraction bits, truncated toward zero (as int(a / b) on raws)."""
+    monkeypatch.chdir(tmp_path)
+    q = {"signed": 1, "width": 12, "frac": 6}
+    p = Py2ver(_ratio, {"a": q, "b": q, "q": dict(q, width=16)})
+    vectors = [(1.5, 0.25), (-3.0, 0.75), (7.9, -2.5), (0.1, 3.0), (-0.5, -0.125)]
+    model = p.PY_batch()(vectors)
+    assert p.TB_batch()(vectors) == model
+    for (a, b), (got,) in zip(vectors, model):
+        assert abs(got - a / b) <= 2 ** -6 * (1 + abs(a / b))

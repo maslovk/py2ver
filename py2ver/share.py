@@ -497,6 +497,8 @@ def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
             return _fmt_range(attr[n.id])
         raise NotShareable(f"Unknown value '{n.id}'")
     if isinstance(n, ast.Subscript):
+        if isinstance(n.value, ast.Name) and n.value.id in rng:     # (a list: its elements)
+            return rng[n.value.id]
         if isinstance(n.value, ast.Name) and "width" in attr.get(n.value.id, {}):
             return _fmt_range(attr[n.value.id])
         if isinstance(n.value, ast.Tuple):
@@ -520,7 +522,9 @@ def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
             return min(ps), max(ps)
         if isinstance(op, ast.Mod) and c == d and c != 0:
             return (0, c - 1) if c > 0 else (c + 1, 0)
-        if isinstance(op, (ast.Div, ast.FloorDiv)) and (c > 0 or d < 0):
+        if isinstance(op, (ast.Div, ast.FloorDiv)):
+            # By a nonzero integer: never larger than the dividend (by 0 there is
+            # no value: Python raises)
             m = max(abs(a), abs(b))
             return -m, m
         if isinstance(op, ast.BitAnd):
@@ -557,7 +561,7 @@ def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
         if fn == "abs":
             a, b = rs[0]
             return (a, b) if a >= 0 else (-b, -a) if b <= 0 else (0, max(-a, b))
-        if fn == "int":
+        if fn in ("int", "int_"):                     # (int_: renamed from the keyword)
             return rs[0]
         if fn == "bool":
             return 0, 1

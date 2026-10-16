@@ -19,7 +19,8 @@ dependencies = [
 hw = ["pyserial>=3.5"]
 # Designs written with numpy arrays
 numpy = ["numpy>=1.22"]
-test = ["pytest>=8", "pytest-xdist>=3", "hypothesis>=6", "pyserial>=3.5", "numpy>=1.22"]
+test = ["pytest>=8", "pytest-xdist>=3", "hypothesis>=6", "pyserial>=3.5", "numpy>=1.22",
+        "scikit-learn>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/maslovk/py2ver"

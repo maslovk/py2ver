@@ -436,11 +436,18 @@ class _Lower:
         return [ast.Subscript(value=ast.Name(id=base.id, ctx=ast.Load()), slice=ast.Constant(k),
                               ctx=ast.Load()) for k in idx]
 
-    def _constant(self, v: Any):
-        """A global float or table with floats as (node, type), or None."""
+    def _constant(self, v: Any, name: Optional[str] = None):
+        """A global float or table with floats as (node, type), or None. A table
+        with a format in attr (a network's weights) is quantized to it."""
         def num(x):
             return isinstance(x, (int, float)) and not isinstance(x, bool)
 
+        m = self.meta.get(name) if name is not None else None
+        if m is not None and m.get("frac") is not None and isinstance(v, (tuple, list)) and v \
+                and all(num(x) for x in v):
+            raw = tuple(quantize(x, int(m["frac"]), int(m["width"]), bool(m.get("signed")),
+                                 round=True, saturate=True) for x in v)
+            return table_node(raw), LST(FX(int(m["frac"])))
         if isinstance(v, float):
             raw, frac = const_raw(v, self.const_bits)
             return ast.Constant(raw), FX(frac)
@@ -465,7 +472,7 @@ class _Lower:
         if isinstance(n, ast.Name):
             if n.id in self.locals:
                 return n, self.env.get(n.id)
-            const = self._constant(self.ns.get(n.id)) if n.id in self.ns else None
+            const = self._constant(self.ns.get(n.id), n.id) if n.id in self.ns else None
             if const is not None:
                 return ast.copy_location(const[0], n), const[1]
             return n, INT
@@ -581,6 +588,11 @@ class _Lower:
         if isinstance(op, ast.Mult):
             return n, FX(fl + fr)
         if isinstance(op, ast.Div):
+            if divisor is None and not (isinstance(r, ast.Constant) and isinstance(r.value, (int, float))):
+                # By a variable: the dividend's fraction bits, truncated toward zero
+                # (raw (l << fr) / r), as int(a / b) would on the raw values
+                n.left = self._shl(l, fr)
+                return n, FX(fl)
             return self._divide(n, l, fl, divisor)
         if isinstance(op, (ast.LShift, ast.RShift)):
             if _is_fx(tr) or not (isinstance(r, ast.Constant) and isinstance(r.value, int)

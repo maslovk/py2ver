@@ -207,6 +207,7 @@ def _traced_code(func: Callable, source: str):
 
 _TABLE_IN = ":in"               # range key of a table function's argument
 WHILE_KEY = "__while__"         # iterations of while loops, as traced
+WEIGHT_TABLES = "__py2ver_weight_tables__"   # (in a namespace) tables that get formats
 _NO_TABLE = {"floor", "ceil"}   # math functions computed exactly
 
 
@@ -457,6 +458,16 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     base = {k: dict(ann.get(k, {}), **base.get(k, {})) for k in dict.fromkeys([*ann, *base])}
 
     ranges, order, returned = _profile(func, samples, base)
+    # The weight tables of a numpy loop program (numpy_loops.py): a format
+    # each, from their values
+    ns0 = _namespace(func)
+    for name in sorted(ns0.get(WEIGHT_TABLES, ())):
+        v = ns0[name]
+        if name not in ranges:
+            r = _Range()
+            r.add(list(v))
+            ranges[name] = r
+            order.append(name)
     if while_n is None and WHILE_KEY in ranges:
         while_n = int(ranges.pop(WHILE_KEY).hi)
     ranges.pop(WHILE_KEY, None)

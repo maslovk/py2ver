@@ -131,8 +131,10 @@ What the hardware computes:
   (one whose format would grow on every loop iteration, like `y = y * a`,
   needs a format in attr).
 - **`/` by a constant**: a power of two only moves the binary point; any
-  other constant multiplies by its reciprocal. Division by a variable isn't
-  supported.
+  other constant multiplies by its reciprocal. **By a variable**, the quotient
+  keeps the dividend's fraction bits, truncated toward zero (`a / b` is
+  `int((a_raw << fb) / b_raw)` on the raw values); a sequenced design divides a
+  bit per clock, others with a combinational divider.
 - **Float constants** (literals and module-level floats or tables of floats,
   like filter coefficients) are exact if they fit in `const_bits`
   significant bits, else rounded to that many: `Py2ver(f, attr,
@@ -412,6 +414,31 @@ The XOR network's training step (`examples/xor_hardware.py`) on the EP4CE22:
 | `multipliers=4` | 9072 (41 %) | 39 | 64823 | 57 MHz | 45 |
 | `multipliers=2` | 7378 (33 %) | 25 | 64931 | 56 MHz | 78 |
 
+### Sequenced loops (`sequential=True`)
+
+`sequential=True` builds a design's loops as they are written: a small state
+machine runs the program a step at a time, for designs far too big to unroll
+(a network's forward pass, thousands of multiply-accumulates over arrays):
+
+- the program is for-range loops over straight-line blocks; each block is a
+  state, run once per iteration of the loops around it, and afterwards the
+  loop counters choose the next one
+- loop counters and scalars are registers; lists of 32 or more elements are
+  block RAMs (each read in a step a port), shorter ones registers; constant
+  tables of 64 or more entries are ROMs in block RAM
+- a block takes a few clocks: block-RAM and ROM reads give their values a
+  clock after their address, so they are issued level by level (a read whose
+  address needs another read waits for it); then everything is computed, and
+  the registers and the RAMs written (one write per RAM per clock). A division
+  by a variable takes a clock per quotient bit
+- a list in block RAM made by `[0] * n` is filled by a loop, unless the loop
+  after it writes every element before anything reads it
+
+The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
+and register widths come from following the program with intervals, so the
+results are exactly the Python program's. The loops need constant bounds, and
+a loop can't be inside an `if`.
+
 ### Choosing the structure from a rate (`rate=`)
 
 Instead of picking `fold`, `unroll` or `multipliers` yourself, give the rate
@@ -615,6 +642,44 @@ examples should cover the inputs' real range: formats and tables are chosen
 from them. Written out, numpy code is large and has no loops: build a
 training step with `multipliers=` (see Sharing multipliers) and a forward
 pass with `pipeline=` (its tables then go to block RAM).
+
+#### Networks too big to write out: loops
+
+A network of real size can't be written out element by element: the
+64 -> 128 -> 64 -> 10 digit recogniser in `examples/digits_network.py` (a list
+of `Dense` / `ReLU` layer objects, softmax, argmax, unchanged) is 17,000
+multiply-accumulates per image. When the scalar translation can't take a
+design (here: the loop over `self.layers`), or with `sequential=True`, py2ver
+keeps its loops instead:
+
+- the method runs at translation time, the way Python would: the object, its
+  lists of layers, `isinstance()`, loops over lists and ifs on them are real,
+  and each method called is inlined with its own `self`
+- each array is a view (shape, strides, offset) of a flat list or a constant
+  table (an attribute read and never written: trained weights), so `.T`,
+  `np.atleast_2d` and constant slices cost nothing; each numpy operation is a
+  loop nest writing a new list: `@`, `+ - * / **` and comparisons with
+  broadcasting, `np.exp` / `np.log` / `np.sqrt` / `np.tanh` / ... (tables),
+  `.sum` / `.max` / `.mean` / `.argmax` with `axis` and `keepdims`,
+  `np.maximum` / `np.minimum`, `abs`
+- the weight tables get formats like the variables (from their values)
+- the loops are built by the sequencer (see "Sequenced loops")
+
+```python
+net = DigitNetwork()
+net.fit(X_train, y_train, epochs=30)                        # in Python, as written
+p = Py2ver(net.predict, samples=list(X_train[:200]), width=16)
+p.PY_batch()(list(X_test))                                  # the bit-exact model
+p.TB_batch()(list(X_test[:20]))                             # the hardware (Verilator)
+```
+
+`examples/digits_hardware.py` (needs scikit-learn for the dataset), on the
+DE0-Nano's EP4CE22:
+
+| | test accuracy | logic elements | block RAM | 9-bit multipliers | Fmax | per image |
+|---|---|---|---|---|---|---|
+| numpy (float) | 98.6 % | | | | | |
+| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3457 (15 %) | 275 kbit (45 %) | 6 | 64 MHz | 35,964 clocks: 0.72 ms at 50 MHz |
 
 ### Simulation speed (Icarus, Verilator)
 
@@ -867,7 +932,8 @@ a streaming low-pass filter, a FIR filter with its delay line in a memory, a
 fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
 table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained on 4
-shared multipliers and run pipelined in hardware, a decimate-by-4 filter fed one
+shared multipliers and run pipelined in hardware, a 64 -> 128 -> 64 -> 10 numpy
+digit recogniser built with its loops sequenced, a decimate-by-4 filter fed one
 sample per handshake, a receiver chain built from plain Python functions, a
 histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
