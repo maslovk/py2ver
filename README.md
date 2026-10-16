@@ -380,8 +380,11 @@ p = Py2ver(train_step, attr, multipliers=4)     # 4 multipliers, p.ram_phases cl
 - every function table is a ROM in block RAM, read once per clock
 - the rest (additions, shifts, comparisons, clamps) is built as it is, chained
   within a clock up to an estimated 12 ns
-- a value used in a later clock than the one making it is kept in a register;
-  values from the same multiplier or ROM share registers
+- a value a multiplier reads two or more clocks after it was made waits in
+  that multiplier input's register file, a block RAM written when the value
+  is made; one made a clock before comes from the multiplier's or table's
+  last-result register. Anything else read in a later clock is kept in a
+  register (values from the same multiplier or table share one)
 - the multipliers' inputs are registered, so a product comes a clock after
   its operands; a few wide products share one wide multiplier
 
@@ -398,15 +401,16 @@ inputs, so it clocks faster. The 16-tap FIR from the folding section:
 | | logic elements | 9-bit multipliers | Fmax | clocks per sample |
 |---|---|---|---|---|
 | `fold='k'` | 551 | 2 | 68 MHz | 16 |
-| `multipliers=1` | 791 | 2 | 115 MHz | 17 |
-| `multipliers=4` | 1063 | 8 | 88 MHz | 8 |
+| `multipliers=1` | 786 | 2 | 120 MHz | 17 |
+| `multipliers=4` | 1087 | 8 | 96 MHz | 8 |
 
 The XOR network's training step (`examples/xor_hardware.py`) on the EP4CE22:
 
 | | logic elements | 9-bit multipliers | block RAM bits | Fmax | clocks per step |
 |---|---|---|---|---|---|
 | unshared | doesn't fit: 152 multipliers | | | | 1 |
-| `multipliers=4` | 10503 (47 %) | 39 | 62592 | 56 MHz | 45 |
+| `multipliers=4` | 9072 (41 %) | 39 | 64823 | 57 MHz | 45 |
+| `multipliers=2` | 7378 (33 %) | 25 | 64931 | 56 MHz | 78 |
 
 ### Choosing the structure from a rate (`rate=`)
 

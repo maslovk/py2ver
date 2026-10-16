@@ -163,6 +163,16 @@ def test_loops_and_ifs_in_simulation(monkeypatch, tmp_path):
 
 
 @pytest.mark.sim
+def test_values_wait_in_register_files(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    samples = _samples(poly)
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(poly, samples=samples, width=18, multipliers=1)
+    assert p._fold["rfs"] and "Register file in block RAM" in (tmp_path / "hdl" / "main.v").read_text()
+    assert p.TB_batch()(samples[:12]) == p.PY_batch()(samples[:12])
+
+
+@pytest.mark.sim
 def test_shared_design_with_state(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     p = Py2ver(counter, COUNTER, multipliers=1)

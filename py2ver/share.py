@@ -1076,35 +1076,107 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
     phase = _fresh("fphase", used)
     last = P - 1
 
-    # Values read after the clock that makes them (and outputs made before the
-    # last clock) are kept in registers. Values from the same multiplier or ROM
-    # whose lives don't overlap share one (its input is the same wire, so the
-    # sharing costs no multiplexer).
+    # How an operand gets its value, by the clock r it is read in and the clock
+    # w its value is made in:
+    #   r == w      straight from the operation that makes it
+    #   r == w + 1  from that multiplier's / ROM's last-result register
+    #   r >= w + 2  for a multiplier input: from the input's register file, a
+    #               block RAM written when the value is made (one write per
+    #               clock; a value that finds the write port taken gets a register)
+    # Anything else read in a later clock (by other logic, as an output) is kept
+    # in a register; values from the same multiplier or ROM share one when their
+    # lives don't overlap (their input is the same wire, so it costs no multiplexer).
     users: Dict[str, List[str]] = {o.name: [] for o in ops}
     for o in ops:
         for d in o.deps:
             users[d].append(o.name)
     out_refs = {n for _, v in conv.outputs for ref in (v if isinstance(v, list) else [v])
                 for n in _names(ref) if n in by}
-    life: Dict[str, Tuple[int, int]] = {}
-    def read_at(u: str, v: str) -> int:
-        """The clock in which operation u reads v (a multiplier reads c a clock after a, b)."""
-        o = by[u]
-        if o.kind == "mul":
-            c = _mac_parts(o.node)[0]
-            if c is not None and v in _names(c):
-                return sched.phase[u] + 1
-        return sched.phase[u]
-
-    for o in ops:
-        if o.name in sched.invariant:
+    units: Dict[Tuple[str, int], List[str]] = {}
+    for n, u in sched.unit.items():
+        units.setdefault(u, []).append(n)
+    parts: Dict[str, Dict[str, Any]] = {}
+    for n, u in sched.unit.items():
+        if u[0] != "mul":
             continue
-        r = sched.ready[o.name]
-        reads = [read_at(u, o.name) for u in users[o.name] if read_at(u, o.name) > r]
-        if o.name in out_refs and r < last:
-            reads.append(last)
-        if reads:
-            life[o.name] = (r, max(reads))
+        c, x, y, minus = _mac_parts(by[n].node)
+        if sched.swap.get(n):
+            x, y = y, x
+        parts[n] = {"a": x, "b": y, "c": c if c is not None else ast.Constant(0), "minus": minus,
+                    "has_c": c is not None}
+
+    def root(v: str) -> str:
+        """A copy that doesn't change the value (a format it already fits): its source."""
+        while True:
+            o = by[v]
+            n = o.node
+            if not (o.kind == "free" and isinstance(n, ast.Name) and n.id in by
+                    and rng[n.id] == rng[v] and sched.ready[n.id] == sched.ready[v]):
+                return v
+            v = n.id
+
+    def value_of(ref: ast.expr) -> Optional[str]:
+        """The operation a multiplier operand reads (None for inputs and constants)."""
+        if isinstance(ref, ast.Name) and ref.id in by and ref.id not in sched.invariant:
+            return root(ref.id)
+        return None
+
+    slot_reads: Dict[str, List[int]] = {}
+    rf_reads: Dict[Tuple[int, str], Dict[str, List[int]]] = {}
+    last_needed: Set[Tuple[str, int]] = set()
+    for n, pt in parts.items():
+        for side in ("a", "b", "c"):
+            v = value_of(pt[side])
+            if v is None:
+                continue
+            r = sched.phase[n] + (side == "c")
+            w = sched.ready[v]
+            if r == w:
+                continue
+            if r == w + 1 and v in sched.unit:
+                last_needed.add(sched.unit[v])
+            elif r >= w + 2:
+                rf_reads.setdefault((sched.unit[n][1], side), {}).setdefault(v, []).append(r)
+            else:
+                slot_reads.setdefault(v, []).append(r)
+    for o in ops:                     # other logic and ROM indexes read in their clock
+        if o.kind == "mul":
+            continue
+        for d in o.deps:
+            if d not in sched.invariant and sched.phase[o.name] > sched.ready[d]:
+                slot_reads.setdefault(d, []).append(sched.phase[o.name])
+    for d in out_refs:
+        if d not in sched.invariant and sched.ready[d] < last:
+            slot_reads.setdefault(d, []).append(last)
+
+    # Register files: an entry per value, reused once its last read is done
+    rf_plan: Dict[Tuple[int, str], Dict[str, Tuple[int, int]]] = {}   # value -> (write clock, entry)
+    rf_depth: Dict[Tuple[int, str], int] = {}
+    for us, vals in sorted(rf_reads.items()):
+        port: Set[int] = set()
+        ends: List[int] = []
+        plan: Dict[str, Tuple[int, int]] = {}
+        for v in sorted(vals, key=lambda v: (sched.ready[v], min(vals[v]), v)):
+            w, first, end = sched.ready[v], min(vals[v]), max(vals[v])
+            options = [w] + ([w + 1] if v in sched.unit else [])
+            wp = next((x for x in options if x not in port and x + 2 <= first), None)
+            if wp is None:                      # the write port is taken: a register
+                slot_reads.setdefault(v, []).extend(vals[v])
+                continue
+            port.add(wp)
+            if wp == w + 1:
+                last_needed.add(sched.unit[v])
+            k = next((i for i, e in enumerate(ends) if e <= wp), None)
+            if k is None:
+                k = len(ends)
+                ends.append(end)
+            else:
+                ends[k] = end
+            plan[v] = (wp, k)
+        if plan:
+            rf_plan[us], rf_depth[us] = plan, len(ends)
+
+    life: Dict[str, Tuple[int, int]] = {v: (sched.ready[v], max(rs)) for v, rs in slot_reads.items()}
     slots: List[Dict[str, Any]] = []
     slot_of: Dict[str, int] = {}
     for n in sorted(life, key=lambda n: (life[n][0], life[n][1], n)):
@@ -1112,11 +1184,11 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
         sig = sched.unit.get(n, ("op", n))
         lo, hi = rng[n]
 
-        def cost(k: int) -> Tuple[int, int, int]:
+        def cost(k: int) -> Tuple[int, int]:
             sl = slots[k]
             grow = (_fmt_of((min(lo, sl["lo"]), max(hi, sl["hi"])))["width"]
                     - _fmt_of((sl["lo"], sl["hi"]))["width"])
-            return (0 if sig in sl["sigs"] else 1), grow, k
+            return grow, k
         free = [k for k, sl in enumerate(slots) if sl["end"] <= w and sig in sl["sigs"]]
         if free:
             k = min(free, key=cost)
@@ -1153,43 +1225,100 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
     def assign(name: str, value: ast.expr) -> None:
         stmts.append(ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=value))
 
-    # Shared multipliers: operands chosen by the phase
-    units: Dict[Tuple[str, int], List[str]] = {}
-    for n, u in sched.unit.items():
-        units.setdefault(u, []).append(n)
+    # Units: their outputs' names first (everything below reads them)
     roms: Dict[str, Dict[str, Any]] = {}
+    rfs: Dict[str, Dict[str, Any]] = {}
     source: Dict[str, str] = {}               # mul / rom op -> the unit output it reads
-    unit_regs: Dict[str, str] = {}            # a multiplier's operand register -> its input
-    mux_inputs = [0]                          # multiplier input bits (for the log)
+    unit_out: Dict[Tuple[str, int], str] = {}
+    for u in sorted(units):
+        unit_out[u] = _fresh(f"mul{u[1]}" if u[0] == "mul" else f"rom{u[1]}_q", used)
+        for n in units[u]:
+            source[n] = unit_out[u]
+    unit_regs: Dict[str, str] = {}            # registers loaded every clock -> their input
+    last_reg: Dict[Tuple[str, int], str] = {}
+    mux_inputs = [0]                          # multiplexer input bits (for the log)
+    for u in sorted(last_needed):             # a unit's previous result
+        last_reg[u] = _fresh(f"{unit_out[u]}_last", used)
+        now = unit_out[u]
+        if u[0] == "rom":                     # (a port can't be returned as it is)
+            now = _fresh(f"{unit_out[u]}_now", used)
+            assign(now, ast.Name(id=unit_out[u], ctx=ast.Load()))
+        unit_regs[last_reg[u]] = now
+        new_attr[last_reg[u]] = dict(_fmt_of(_hull(*[rng[n] for n in units[u]])), type="wire")
     params_extra: List[str] = []
     returns_extra: List[str] = []
+
+    # Register files: written when a value is made, read the clock before it's needed
+    rf_q: Dict[Tuple[int, str], str] = {}
+    for us, plan in sorted(rf_plan.items()):
+        q = _fresh(f"mul{us[0]}_{us[1]}_rf", used)
+        rf_q[us] = q
+        depth = rf_depth[us]
+        ab = max(1, (depth - 1).bit_length())
+        raddr, we, waddr = ([0] * P for _ in range(3))
+        wsrc: List[str] = []
+        wpick = [0] * P
+        for v, (wp, k) in plan.items():
+            for r in rf_reads[us][v]:
+                raddr[(r - 1) % P] = k
+            we[wp], waddr[wp] = 1, k
+            src = source.get(v, v) if wp == sched.ready[v] else last_reg[sched.unit[v]]
+            if src not in wsrc:
+                wsrc.append(src)
+            wpick[wp] = wsrc.index(src)
+        names = {key: _fresh(f"{q}_{key}", used) for key in ("raddr", "we", "waddr", "wdata")}
+        for key, table in (("raddr", raddr), ("we", we), ("waddr", waddr)):
+            assign(names[key], ast.Subscript(
+                value=ast.Tuple(elts=[ast.Constant(x) for x in table], ctx=ast.Load()),
+                slice=ast.Name(id=phase, ctx=ast.Load()), ctx=ast.Load()))
+        _select([ast.Name(id=x, ctx=ast.Load()) for x in wsrc], wpick, phase, stmts,
+                names["wdata"], used)
+        fmt = _fmt_of(_hull(*[rng[v] for v in plan]))
+        mux_inputs[0] += (len(wsrc) - 1) * fmt["width"]
+        new_attr[q] = dict(fmt, type="wire")
+        new_attr[names["wdata"]] = dict(fmt, type="wire")
+        rfs[q] = dict(fmt, depth=depth, address_bits=ab,
+                      **{key: names[key] for key in ("raddr", "we", "waddr", "wdata")})
+        params_extra.append(q)
+        returns_extra += [names[key] for key in ("raddr", "we", "waddr", "wdata")]
+
+    def operand(n: str, side: str) -> ast.expr:
+        """Multiplier operation n's operand on a side, as its read clock gets it."""
+        ref = parts[n][side]
+        v = value_of(ref)
+        if v is None:
+            return copy.deepcopy(ref)
+        r, w = sched.phase[n] + (side == "c"), sched.ready[v]
+        if r == w:                            # (a unit's result: its output, one wire)
+            return ast.Name(id=source.get(v, v), ctx=ast.Load())
+        if r == w + 1 and v in sched.unit:
+            return ast.Name(id=last_reg[sched.unit[v]], ctx=ast.Load())
+        us = (sched.unit[n][1], side)
+        if v in rf_plan.get(us, {}) and r >= rf_plan[us][v][0] + 2:
+            return ast.Name(id=rf_q[us], ctx=ast.Load())
+        return ast.Name(id=slot_reg[slot_of[v]][0], ctx=ast.Load())
+
     for u, members in sorted(units.items()):
         members.sort(key=lambda n: sched.phase[n])
+        out = unit_out[u]
         if u[0] == "mul":
             # Pipelined: a and b are chosen and registered in the clock an operation
             # issues, c is chosen and added in the next, when the product is there
-            out = _fresh(f"mul{u[1]}", used)
-            parts = {}
-            for n in members:
-                c, x, y, minus = _mac_parts(by[n].node)
-                if sched.swap.get(n):
-                    x, y = y, x
-                parts[n] = {"a": x, "b": y, "c": c if c is not None else ast.Constant(0),
-                            "minus": minus}
-            has_c = any(_mac_parts(by[n].node)[0] is not None for n in members)
+            has_c = any(parts[n]["has_c"] for n in members)
+            regs_ab = []
             for side in ("a", "b", "c") if has_c else ("a", "b"):
                 srcs: List[ast.expr] = []
                 keys: List[str] = []
                 pick = [0] * P
                 when = [sched.phase[n] + (side == "c") for n in members]
                 for n, p in zip(members, when):
-                    ref = at(parts[n][side], p)
+                    ref = operand(n, side)
                     key = ast.dump(ref)
                     if key not in keys:
                         keys.append(key)
                         srcs.append(ref)
-                    pick[p] = keys.index(key)
-                _fill(pick, when)
+                    pick[p % P] = keys.index(key)
+                _fill(pick, [p % P for p in when])
                 _select(srcs, pick, phase, stmts, f"{out}_{side}", used)
                 fmt = dict(_fmt_of(_hull(*[_interval(parts[n][side], rng, attr)
                                            for n in members])), type="wire")
@@ -1199,8 +1328,9 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
                     reg = _fresh(f"{out}_r{side}", used)
                     unit_regs[reg] = f"{out}_{side}"
                     new_attr[reg] = dict(fmt)
-            ra, rb = (ast.Name(id=r, ctx=ast.Load()) for r in list(unit_regs)[-2:])
-            prod = ast.BinOp(left=ra, op=ast.Mult(), right=rb)
+                    regs_ab.append(reg)
+            prod = ast.BinOp(left=ast.Name(id=regs_ab[0], ctx=ast.Load()), op=ast.Mult(),
+                             right=ast.Name(id=regs_ab[1], ctx=ast.Load()))
             if has_c:
                 cn = ast.Name(id=f"{out}_c", ctx=ast.Load())
                 minus = [parts[n]["minus"] for n in members]
@@ -1209,7 +1339,7 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
                                           right=prod))
                 else:                                    # add in some clocks, subtract in others
                     pick = [0] * P
-                    when = [sched.phase[n] + 1 for n in members]
+                    when = [(sched.phase[n] + 1) % P for n in members]
                     for n, p in zip(members, when):
                         pick[p] = int(parts[n]["minus"])
                     _fill(pick, when)
@@ -1220,12 +1350,9 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
                             pick, phase, stmts, out, used)
             else:
                 assign(out, prod)
-            for n in members:
-                source[n] = out
         else:
             o0 = by[members[0]]
-            q = _fresh(f"rom{u[1]}_q", used)
-            idx = _fresh(f"rom{u[1]}_i", used)
+            idx = _fresh(f"{out}_i", used)
             srcs, keys, pick = [], [], [0] * P
             for n in members:
                 ref = at(by[n].node.slice, sched.phase[n])
@@ -1238,13 +1365,11 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
             _select(srcs, pick, phase, stmts, idx, used)
             entries = list(o0.table)
             width, signed = widths[o0.name]["width"], widths[o0.name]["signed"]
-            roms[q] = {"index": idx, "entries": entries, "width": width, "signed": int(signed),
-                       "address_bits": max(1, (len(entries) - 1).bit_length())}
-            new_attr[q] = {"signed": int(signed), "width": width, "type": "wire"}
-            params_extra.append(q)
+            roms[out] = {"index": idx, "entries": entries, "width": width, "signed": int(signed),
+                         "address_bits": max(1, (len(entries) - 1).bit_length())}
+            new_attr[out] = {"signed": int(signed), "width": width, "type": "wire"}
+            params_extra.append(out)
             returns_extra.append(idx)
-            for n in members:
-                source[n] = q
 
     # Every operation in its clock
     for o in ops:
@@ -1290,6 +1415,9 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
         "phase": phase,
         "regs": regs,
         "roms": roms,
+        "rfs": rfs,
+        "extra_params": list(params_extra),
+        "extra_returns": list(returns_extra),
         "params": {phase} | set(regs) | set(params_extra),
         "attr": new_attr,
         "register_bits": sum(new_attr[r]["width"] for r in regs),
@@ -1322,16 +1450,25 @@ def simulate(info: Dict[str, Any], model, args: Tuple[Any, ...], state: Tuple[An
     """
     Run a shared design's bit-exact model clock by clock (for tests): args are
     the function's own arguments; returns its outputs after the last clock.
+    ROMs and register files are modelled as the hardware has them.
     """
     regs = {r: 0 for r in info["regs"]}
-    qs = {q: 0 for q in info["roms"]}
-    n_regs, n_roms = len(regs), len(info["roms"])
+    extra = {q: 0 for q in info["extra_params"]}
+    mems = {q: [0] * rf["depth"] for q, rf in info["rfs"].items()}
+    n_regs, n_ret = len(regs), len(info["extra_returns"])
     out = None
     for p in range(info["phases"]):
-        res = model(*args, p, *regs.values(), *qs.values())
+        res = model(*args, p, *regs.values(), *extra.values())
         res = list(res) if isinstance(res, tuple) else [res]
-        k = len(res) - n_regs - n_roms
-        out, nxt, idx = res[:k], res[k:k + n_regs], res[k + n_regs:]
+        k = len(res) - n_regs - n_ret
+        out, nxt = res[:k], res[k:k + n_regs]
+        rets = dict(zip(info["extra_returns"], res[k + n_regs:]))
         regs = dict(zip(regs, nxt))
-        qs = {q: info["roms"][q]["entries"][int(i)] for q, i in zip(qs, idx)}
+        for q, rom in info["roms"].items():
+            extra[q] = rom["entries"][int(rets[rom["index"]])]
+        for q, rf in info["rfs"].items():
+            mem = mems[q]
+            extra[q] = mem[int(rets[rf["raddr"]]) % rf["depth"]]      # (the old contents)
+            if rets[rf["we"]]:
+                mem[int(rets[rf["waddr"]])] = rets[rf["wdata"]]
     return tuple(out) if len(out) != 1 else out[0]

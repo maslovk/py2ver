@@ -563,7 +563,8 @@ class Py2ver:
                 assigns.append(Assignment(left=reg, right=f"rst ? 0 : (ce ? {nxt} : {reg})",
                                           is_reg=True))
         roms = fold.get("roms", {})
-        fold_ports = {fold["phase"], *fold["regs"], *roms}
+        rfs = fold.get("rfs", {})
+        fold_ports = {fold["phase"], *fold["regs"], *roms, *rfs}
         inputs = [p for p in ir.inputs if p.name not in self.state_map and p.name not in fold_ports]
         have = {p.name for p in inputs}
         for name, kind in (("clk", "clk"), ("rst", "rst"), ("ce", "ce")):
@@ -574,10 +575,12 @@ class Py2ver:
             name=ir.name,
             inputs=inputs,
             outputs=[p for p in ir.outputs if p.name not in
-                     set(fold["regs"].values()) | {r["index"] for r in roms.values()}],
+                     set(fold["regs"].values()) | {r["index"] for r in roms.values()}
+                     | {rf[k] for rf in rfs.values() for k in ("raddr", "we", "waddr", "wdata")}],
             assigns=assigns,
             has_clk=True,
-            items=list(ir.items) + self._phase_items() + self._ram_items() + self._rom_items(roms, attr),
+            items=list(ir.items) + self._phase_items() + self._ram_items() + self._rom_items(roms, attr)
+                  + self._rf_items(rfs, attr),
         )
 
     def _schedule_rams(self, ir: ModuleIR) -> Tuple[int, Dict[str, Any]]:
@@ -662,6 +665,31 @@ class Py2ver:
             if int(attr.get(idx, {}).get("width", aw + 1)) > aw:      # (the index is never out of range)
                 idx = f"{idx}[{aw - 1}:0]"
             items.append(f"always @(posedge clk) if (ce) {q} <= {arr}[{idx}];")
+        return items
+
+    @staticmethod
+    def _rf_items(rfs: Dict[str, Dict[str, Any]], attr: Dict[str, Dict[str, Any]]) -> List[str]:
+        """A shared multiplier input's register file: a simple dual-port block RAM,
+        written by we/waddr/wdata, q the entry raddr addressed a clock before."""
+        items: List[str] = []
+        for q, rf in rfs.items():
+            w, depth, ab = int(rf["width"]), int(rf["depth"]), int(rf["address_bits"])
+            sig = "signed " if rf["signed"] else ""
+            arr = f"{q}__mem"
+
+            def addr(name: str) -> str:
+                return f"{name}[{ab - 1}:0]" if int(attr.get(name, {}).get("width", ab)) > ab \
+                    else name
+            items += [f"// Register file in block RAM: {depth} x {w} bits",
+                      f"(* ramstyle = \"M9K\" *) reg {sig}[{w - 1}:0] {arr} [0:{depth - 1}];",
+                      f"reg {sig}[{w - 1}:0] {q};",
+                      f"integer __i_{arr};",
+                      f"initial for (__i_{arr} = 0; __i_{arr} < {depth}; __i_{arr} = __i_{arr} + 1)"
+                      f" {arr}[__i_{arr}] = {w}'d0;",
+                      "always @(posedge clk) if (ce) begin",
+                      f"  if ({rf['we']}) {arr}[{addr(rf['waddr'])}] <= {rf['wdata']};",
+                      f"  {q} <= {arr}[{addr(rf['raddr'])}];",
+                      "end"]
         return items
 
     def _ram_items(self) -> List[str]:
