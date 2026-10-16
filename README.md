@@ -657,8 +657,19 @@ vectors).
   in attr. `abs()` of a complex value uses `$sqrt`, so it only works in
   simulation. Python computes complex numbers in floating point, so results
   match exactly while they stay below 2**53. Complex fixed point: see above.
-- A single `return` of variables or expressions (an expression output is
-  named `ret`, or `ret0`, `ret1`, ... for several)
+- `return` of variables or expressions (an expression output is named `ret`,
+  or `ret0`, `ret1`, ... for several), also early inside an `if` or a loop:
+  every return must give the same number of values
+- `break` and `continue` in loops
+- `while` loops, built as their largest number of iterations, each guarded by
+  the loop's test: worked out for a counting loop (`i = 0` before it, `while
+  i < 10:` and one `i += 1` in it), else given as `attr['while'] = N` (for
+  the function's while loops), or measured on the examples with `samples=`
+  (and printed with the formats). If Python would need more iterations, the
+  hardware stops early. A while loop can be folded (`fold=True`) to run one
+  iteration per clock, e.g. a bisection or a GCD
+- A variable first assigned in only one branch of an `if` takes that
+  branch's value (Python can only read it after that branch)
 
 - Lists, tables and memories (see below)
 - List comprehensions and generator expressions (`[x * g for x in xs]`,
@@ -668,8 +679,8 @@ vectors).
   list's length must be known when translating)
 - Returning an argument: it gets its own output port, `<name>_out`
 
-Not supported: `while`, recursion, early `return`, keyword arguments in
-helper calls, dicts and sets, nested lists.
+Not supported: recursion, keyword arguments in helper calls, dicts and sets,
+nested lists, `try` / `with`, a loop's `else`.
 
 Python names that are Verilog keywords (`buf`, `time`, `table`, `type`, ...)
 get a `_` suffix in the HDL; keep using the Python names in `attr` and calls.

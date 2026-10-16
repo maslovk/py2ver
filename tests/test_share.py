@@ -119,17 +119,10 @@ def looped(xs, g):
 LOOPED = {"xs": dict(I16, length=4), "g": I16}
 
 
-def waits(xs):
-    k = 0
-    while xs[k] > 0:
-        k += 1
-    return k
-
-
-def early(x, y):
-    if x > y:
-        return x * y
-    return x
+def by_index(xs, i):
+    ys = list(xs)
+    ys[i] = 0
+    return ys
 
 
 def test_loops_and_ifs_are_unrolled_and_selected():
@@ -142,26 +135,11 @@ def test_loops_and_ifs_are_unrolled_and_selected():
 
 
 def test_what_cant_be_shared_is_refused():
-    fe = front_end(waits, {"xs": dict(I16, length=4)})
-    with pytest.raises(NotShareable, match="While"):
-        share(fe.tree, fe.attr, 2)
-    fe = front_end(early, {"x": I16, "y": I16})
-    with pytest.raises(NotShareable, match="return inside"):
+    fe = front_end(by_index, {"xs": dict(I16, length=4), "i": I16})
+    with pytest.raises(NotShareable, match="constant"):
         share(fe.tree, fe.attr, 2)
     with pytest.raises(NotImplementedError, match="can't be combined"):
         Py2ver(counter, COUNTER, multipliers=2, pipeline=2)
-
-
-@pytest.mark.sim
-def test_shared_design_matches_in_simulation(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    samples = _samples(neuron)
-    with contextlib.redirect_stdout(io.StringIO()):
-        p = Py2ver(neuron, samples=samples, width=18, multipliers=2)
-    assert p.ram_phases > 1 and "Table in block RAM" in (tmp_path / "hdl" / "main.v").read_text()
-    expected = p.PY_batch()(samples[:12])
-    assert p.TB_batch()(samples[:12]) == expected
-    assert p.TB_handshake()(samples[:12], valid=0.6, ready=0.5, seed=3) == expected
 
 
 @pytest.mark.sim

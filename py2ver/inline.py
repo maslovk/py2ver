@@ -69,7 +69,8 @@ class _Inliner:
         fd = ast.parse(src).body[0]
         if not isinstance(fd, ast.FunctionDef):
             raise NotImplementedError(f"Helper '{name}' is not a plain function")
-        return strip_helper_annotations(fd)
+        from .control import structure_function
+        return structure_function(strip_helper_annotations(fd))  # (early returns, while, ...)
 
     def _constants(self, locals_: Set[str]):
         """Transformer replacing names of module-level int constants with values."""

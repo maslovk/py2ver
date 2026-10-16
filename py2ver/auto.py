@@ -140,6 +140,17 @@ def _traced(func: Callable, record: Callable[[str, Any], None]):
             node.body = trace(targets(node.target)) + node.body
             return node
 
+        def visit_While(self, node):
+            # Counts its iterations (the largest count becomes attr['while'])
+            self.generic_visit(node)
+            k = ast.Name(id=f"__py2ver_w{id(node)}", ctx=ast.Load())
+            store = ast.Name(id=k.id, ctx=ast.Store())
+            node.body = [ast.AugAssign(target=store, op=ast.Add(), value=ast.Constant(1)),
+                         ast.Expr(ast.Call(func=ast.Name(id="__py2ver_trace", ctx=ast.Load()),
+                                           keywords=[], args=[ast.Constant(WHILE_KEY), k]))
+                         ] + node.body
+            return [ast.Assign(targets=[copy.deepcopy(store)], value=ast.Constant(0)), node]
+
         def visit_Call(self, node):
             self.generic_visit(node)
             key = ast.unparse(node.func)
@@ -170,6 +181,7 @@ def _traced(func: Callable, record: Callable[[str, Any], None]):
 
 
 _TABLE_IN = ":in"               # range key of a table function's argument
+WHILE_KEY = "__while__"         # iterations of while loops, as traced
 _NO_TABLE = {"floor", "ceil"}   # math functions computed exactly
 
 
@@ -401,6 +413,8 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     """
     if width is None and max_error is None:
         raise ValueError("Give width=<bits> or max_error=<error> (or both)")
+    attr = dict(attr or {})
+    while_n = attr.pop("while", None)          # iterations of the while loops (else measured)
     base = {k: dict(v) for k, v in normalize_attr(attr).items()}
     samples = list(samples)
     if not samples:
@@ -409,6 +423,9 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
     base = {k: dict(ann.get(k, {}), **base.get(k, {})) for k in dict.fromkeys([*ann, *base])}
 
     ranges, order, returned = _profile(func, samples, base)
+    if while_n is None and WHILE_KEY in ranges:
+        while_n = int(ranges.pop(WHILE_KEY).hi)
+    ranges.pop(WHILE_KEY, None)
     params = list(inspect.signature(func).parameters)
     state = [p for p in params if "next" in base.get(p, {}) or "memory" in base.get(p, {})]
     nexts = {base[p]["next"] for p in state
@@ -485,6 +502,8 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
                 out[name]["width"] = 1
         for k, m in base.items():
             out.setdefault(k, m)
+        if while_n is not None:
+            out["while"] = while_n
         # Parameters first, in order, then the rest as they were first assigned
         return {k: out[k] for k in sorted(out, key=lambda k: (k not in params,
                                                                 params.index(k) if k in params else 0))}

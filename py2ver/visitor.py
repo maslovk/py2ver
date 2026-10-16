@@ -1251,12 +1251,12 @@ class FunctionVisitor(ast.NodeVisitor):
             def value_in(env: Dict[str, str]) -> str:
                 if lhs in env:
                     return env[lhs]
-                # Not assigned in this branch: keeps its value from before the if
+                # Not assigned in this branch: keeps its value from before the if.
+                # With none, Python can only read it after a branch that assigns
+                # it (else NameError), so that branch's value serves (no latch)
                 if not self._is_defined(lhs):
-                    raise NotImplementedError(
-                        f"'{lhs}' is assigned in only some branches of an if and has no "
-                        "earlier value (that would infer a latch)."
-                    )
+                    return next(m[lhs] for m in [e for _, e in branches] + [else_env]
+                                if lhs in m)
                 return self._resolve_name(lhs)
 
             # Build nested ternary from bottom (else) up

@@ -201,14 +201,18 @@ def test_helper_locals_are_prefixed_and_constants_folded(monkeypatch, tmp_path):
     assert not any("GAIN" in a.right or "MASK" in a.right for a in p.ir.assigns)
 
 
-@pytest.mark.parametrize(
-    "func, match",
-    [
-        (recursive, "Recursive call"),
-        (early_return, "may only return at its end"),
-        (only_some_branches, "only some branches"),
-    ],
-)
+@pytest.mark.sim
+def test_early_return_in_a_helper_and_one_branch_values(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    attr = {"a": S8, "b": S8}
+    p = Py2ver(early_return, {"a": S8})
+    assert p.TB_batch()([(5,), (-7,), (0,)]) == [(5,), (7,), (0,)]
+    # y exists only after the branch that sets it: Python reads it only then
+    p = Py2ver(only_some_branches, attr)
+    assert p.TB_batch()([(9, 2), (40, -3)]) == [(9,), (40,)]
+
+
+@pytest.mark.parametrize("func, match", [(recursive, "Recursive call")])
 def test_unsupported_forms_raise_clearly(monkeypatch, tmp_path, func, match):
     monkeypatch.chdir(tmp_path)
     attr = {"a": S8, "b": S8, "n": S8}
