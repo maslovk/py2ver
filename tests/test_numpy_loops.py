@@ -214,3 +214,183 @@ def test_square_roots_and_division_take_a_bit_a_clock(monkeypatch, tmp_path):
     model = [v for v, in p.PY_batch()(xs)]
     assert np.allclose(model, [_norm(x) for x in xs], rtol=1e-3)
     assert p.TB_batch()(xs[:3]) == p.PY_batch()(xs[:3])
+
+
+# ----------------------------- convolutions, pooling, dropout, an optimiser's dict -----------------------------
+
+from numpy.lib.stride_tricks import sliding_window_view   # noqa: E402
+
+crng = np.random.default_rng(8)                 # (the module's generator: dropout draws from it)
+
+
+class Conv:
+    def __init__(self, cin, cout, k=3):
+        self.k = k
+        self.W = crng.normal(0, 0.5, (cout, cin, k, k))
+        self.b = np.zeros(cout)
+
+    def forward(self, x, training=True):
+        N, C, H, W = x.shape
+        self.x_shape = x.shape
+        p = self.k // 2
+        xp = np.pad(x, ((0, 0), (0, 0), (p, p), (p, p)))
+        win = sliding_window_view(xp, (self.k, self.k), axis=(2, 3))
+        self.cols = win.transpose(0, 2, 3, 1, 4, 5).reshape(N * H * W, -1)
+        out = self.cols @ self.W.reshape(len(self.W), -1).T + self.b
+        return out.reshape(N, H, W, -1).transpose(0, 3, 1, 2)
+
+    def backward(self, grad):
+        F = len(self.W)
+        g = grad.transpose(0, 2, 3, 1).reshape(-1, F)
+        self.dW = (g.T @ self.cols).reshape(self.W.shape)
+        self.db = g.sum(axis=0)
+        return None
+
+    def params(self):
+        return [(self.W, self.dW), (self.b, self.db)]
+
+
+class Pool:
+    def forward(self, x, training=True):
+        N, C, H, W = x.shape
+        blocks = x.reshape(N, C, H // 2, 2, W // 2, 2)
+        out = blocks.max(axis=(3, 5))
+        self.mask = blocks == out[:, :, :, None, :, None]
+        self.x_shape = x.shape
+        return out
+
+    def backward(self, grad):
+        return (self.mask * grad[:, :, :, None, :, None]).reshape(self.x_shape)
+
+
+class Drop:
+    def forward(self, x, training=True):
+        if not training:
+            return x
+        self.mask = (crng.random(x.shape) > 0.25) / 0.75
+        return x * self.mask
+
+    def backward(self, grad):
+        return grad * self.mask
+
+
+class Flat:
+    def forward(self, x, training=True):
+        self.shape = x.shape
+        return x.reshape(len(x), -1)
+
+    def backward(self, grad):
+        return grad.reshape(self.shape)
+
+
+class Lin:
+    def __init__(self, n_in, n_out):
+        self.W = crng.normal(0, 0.5, (n_in, n_out))
+        self.b = np.zeros(n_out)
+
+    def forward(self, x, training=True):
+        self.x = x
+        return x @ self.W + self.b
+
+    def backward(self, grad):
+        self.dW = self.x.T @ grad
+        self.db = grad.sum(axis=0)
+        return grad @ self.W.T
+
+    def params(self):
+        return [(self.W, self.dW), (self.b, self.db)]
+
+
+class DictAdam:
+    def __init__(self, lr=0.01):
+        self.lr, self.state, self.t = lr, {}, 0
+
+    def step(self, layers):
+        self.t += 1
+        for layer in layers:
+            if not hasattr(layer, "params"):
+                continue
+            for p, g in layer.params():
+                m, v = self.state.setdefault(id(p), (np.zeros_like(p), np.zeros_like(p)))
+                m[:] = 0.9 * m + 0.1 * g
+                v[:] = 0.999 * v + 0.001 * g * g
+                p -= self.lr * (m / (1 - 0.9 ** self.t)) / (np.sqrt(v / (1 - 0.999 ** self.t)) + 1e-8)
+
+
+class SmallCNN:
+    def __init__(self):
+        self.layers = [Conv(1, 2), Pool(), Flat(), Drop(), Lin(8, 3)]
+        self.opt = DictAdam()
+
+    def forward(self, x, training=False):
+        for layer in self.layers:
+            x = layer.forward(x, training)
+        return softmax(x)
+
+    def train_batch(self, x, labels):
+        probs = self.forward(x, training=True)
+        loss = -np.mean(np.log(probs[np.arange(len(x)), labels] + 1e-9))
+        grad = probs.copy()
+        grad[np.arange(len(x)), labels] -= 1
+        grad /= len(x)
+        for layer in reversed(self.layers):
+            grad = layer.backward(grad)
+        self.opt.step(self.layers)
+        return loss
+
+    def predict(self, x, batch=2):
+        return np.concatenate([self.forward(x[i:i + batch]).argmax(1)
+                               for i in range(0, len(x), batch)])
+
+
+def _images(n, seed=9):
+    r = np.random.default_rng(seed)
+    x = r.uniform(0, 1, (n, 1, 4, 4))
+    return x, (x[:, 0, :2].sum(axis=(1, 2)) > x[:, 0, 2:].sum(axis=(1, 2))).astype(int) \
+        + (x[:, 0, :, :2].sum(axis=(1, 2)) > 4).astype(int)
+
+
+def test_convolutions_and_pooling_agree_with_numpy():
+    net = SmallCNN()
+    x, _ = _images(12)
+    tr = numpy_loops.translate(net.predict, [x[i:i + 3] for i in range(4)])   # (2 batches of it)
+    for i in range(4):
+        assert list(tr.func(*tr.adapt(x[i:i + 3]))) == list(net.predict(x[i:i + 3]))
+
+
+def test_a_training_step_with_dropout_labels_and_a_dict_of_moments():
+    net = SmallCNN()
+    x, y = _images(16)
+    steps = [(x[i:i + 4], y[i:i + 4]) for i in range(0, 16, 4)]
+    drawn = crng.bit_generator.state
+    tr = numpy_loops.translate(net.train_batch, steps)        # (checked against numpy)
+    # The object and the module's generator are left as they are
+    assert net.opt.state == {} and net.opt.t == 0 and crng.bit_generator.state == drawn
+    labels = sorted(label for label, _, _ in tr.memories.values())
+    # Adam's moments, made on its first step by dict.setdefault, are state from zeros
+    moments = [lb for lb in labels if lb.startswith("SmallCNN.opt.state[id(.layers[")]
+    assert len(moments) == 8 and "DictAdam.t" in labels and "Generator.random_state" in labels
+    assert all(set(tr.attr[m]["init"]) == {0.0} for m, (lb, _, _) in tr.memories.items()
+               if lb in moments)
+    # dropout: numbers from a generator in hardware, the same stream as the check's
+    gen = next(m for m, (lb, _, _) in tr.memories.items() if lb == "Generator.random_state")
+    assert tr.attr[gen]["width"] == 32 and tr.attr[gen]["signed"] == 0
+
+
+@pytest.mark.sim
+def test_a_cnn_trains_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    net = SmallCNN()
+    x, y = _images(48)
+    steps = [(x[i:i + 4], y[i:i + 4]) for i in range(0, 48, 4)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(net.train_batch, samples=steps, width=24, saturate=True, margin=2)
+    model = [r[0] for r in p.PY_stream()(steps)]
+    twin = copy.deepcopy(net)
+    with numpy_loops._drawing(p._numpy.generators):          # (the hardware's dropout numbers)
+        numpy_losses = [twin.train_batch(*s) for s in steps]
+    # (the first step's untrained probabilities are tiny, where the log table is steep)
+    assert np.allclose(model[1:], numpy_losses[1:], atol=0.05)
+    state = p.state_values()
+    assert np.allclose(state[(net.layers[4], "W")], twin.layers[4].W, atol=0.01)
+    assert p.TB_stream()(steps[:2]) == p.PY_stream()(steps[:2])

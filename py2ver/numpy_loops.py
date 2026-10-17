@@ -9,24 +9,36 @@ sequencer (sequencer.py) to run them a step at a time. This translator runs
 the method at translation time, the way Python would, keeping the arrays
 symbolic:
 
-  - Python values are real: the object, its lists of layers, isinstance(),
-    loops over lists, ifs on them, the methods called (inlined, each with its
-    own self)
+  - Python values are real: the object (a copy of it), its lists of layers,
+    isinstance(), hasattr(), loops over lists (break, continue), ifs on them,
+    comprehensions, dicts, the methods called (inlined, each with its own self)
   - an array is a view (shape, strides, offset) of a flat list in the program
     or of a constant table: an attribute read and never written (trained
-    weights) is a table, an input a list argument; .T, np.atleast_2d and
-    constant slices are views, so they cost nothing
+    weights) is a table, an input a list argument; .T, .transpose(),
+    np.atleast_2d, sliding_window_view, constant slices and indices with None
+    and ... are views, so they cost nothing; .reshape of a view in another
+    order copies it
   - each numpy operation becomes a loop nest writing a new list: @ (sums of
     products), + - * / ** and comparisons with broadcasting, np.exp / np.log /
     np.tanh / ... (tables), np.sqrt (exact), .sum / .max / .mean / .argmax
-    with axis and keepdims, np.maximum / np.minimum, abs; dividing an array
-    by a computed scalar multiplies by its reciprocal, and c ** n with a
-    computed integer n multiplies the constants c ** 2 ** k for n's bits
+    with axis (or axes) and keepdims, np.maximum / np.minimum, abs, np.pad
+    (zeros), np.concatenate; dividing an array by a computed scalar multiplies
+    by its reciprocal, and c ** n with a computed integer n multiplies the
+    constants c ** 2 ** k for n's bits
+  - indexing with arrays of integers (np.arange, labels given as an input)
+    reads the elements they pick, and assigning to it (a[rows, labels] -= 1)
+    writes them, one after another
   - an attribute the method reads and then changes (the weights and the
     optimiser's moments in a training step, in place or reassigned; a step
     counter) is state: a list argument of the program that it updates in
     place ('memory' in attr, its 'init' the object's values), kept between
-    calls by the hardware
+    calls by the hardware. So is an array the object holds in a dict or a
+    list that the method changes, and one it makes with np.zeros / np.ones
+    and Python code it calls keeps in the object (Adam's moments by
+    dict.setdefault on the first step: state from zeros)
+  - a numpy Generator's .random(size) draws from a generator in hardware
+    (xorshift32, its state kept between calls), not numpy's stream: the check
+    runs the original with the same numbers in its place (_drawing)
   - work whose result nothing uses is left out
 
 The program is plain Python on flat lists, checked against the original in
@@ -50,6 +62,8 @@ from .fixed import EXACT_SQRT
 from .numpy_fe import TABLE_UFUNCS, NotTranslatable, Translation, _np
 
 POW_BITS = 32                            # bits of an integer exponent (c ** n)
+RANDOM_STATE = "random_state"            # a Generator's state in hardware (its attribute name)
+RANDOM_BITS = 24                         # bits of a uniform number from Generator.random
 
 
 # ==================================================================== values
@@ -91,8 +105,9 @@ class Lazy(Arr):
     list it reads (it holds the values from before)."""
 
     def __init__(self, it: "_Interp", shape: Tuple[int, ...], fn: Callable[..., ast.expr],
-                 vals: Tuple[Any, ...]) -> None:
+                 vals: Tuple[Any, ...], extra: Tuple[Arr, ...] = ()) -> None:
         self.it, self.shape, self.fn, self.vals = it, tuple(shape), fn, vals
+        self.extra = extra                     # (lists fn reads besides vals: a gather's)
         self.const = False
         self.real: Optional[Arr] = None
 
@@ -122,7 +137,7 @@ class Lazy(Arr):
         if self.real is not None:
             return {self.real.name}
         out = set()
-        for v in self.vals:
+        for v in tuple(self.vals) + tuple(self.extra):
             if isinstance(v, Lazy):
                 out |= v.reads()
             elif isinstance(v, Arr):
@@ -150,6 +165,14 @@ class Sym:
 class _Return(Exception):
     def __init__(self, value: Any) -> None:
         self.value = value
+
+
+class _Break(Exception):
+    pass
+
+
+class _Continue(Exception):
+    pass
 
 
 def _bcast(*shapes: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -195,6 +218,11 @@ class _Interp:
         self.tables: Dict[str, Any] = {}                # constant table name -> its values
         self.table_of: Dict[Tuple[int, str], Arr] = {}
         self.lists: Dict[str, int] = {}                 # list in the program -> its length
+        self.generators: Dict[int, Any] = {}            # numpy Generators drawn from
+        self.real_of: Dict[str, Any] = {}               # table / state list -> its ndarray
+        self.fills: Dict[str, float] = {}               # list -> the value it was made with
+        self.dirty: set = set()                         # lists written since they were made
+        self.handed: Dict[int, Optional[float]] = {}    # Arr given to Python code -> its fill
 
     # ------------------------------------------------------------ program text
     def fresh(self, base: str) -> str:
@@ -207,6 +235,7 @@ class _Interp:
         name = self.fresh(base)
         n = math.prod(shape)
         self.lists[name] = n
+        self.fills[name] = 0.0
         self.emit(ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())],
                              value=ast.BinOp(left=ast.List(elts=[ast.Constant(0)], ctx=ast.Load()),
                                              op=ast.Mult(), right=ast.Constant(n))))
@@ -265,6 +294,7 @@ class _Interp:
             self.table_of[key] = Arr(name, tuple(arr.shape), _contiguous(tuple(arr.shape)),
                                      const=True)
             self.key_of[name] = key
+            self.real_of[name] = value
         return self.table_of[key]
 
     def state_value(self, obj: Any, attr: str, value: Any) -> Any:
@@ -272,6 +302,7 @@ class _Interp:
         key = (id(obj), attr)
         if key not in self.state:
             name = self.fresh(f"S_{type(obj).__name__}_{attr}_")
+            self.real_of[name] = value
             if isinstance(value, self.np.ndarray):
                 value = self.np.array(value, dtype=float)
                 self.lists[name] = max(1, value.size)
@@ -290,6 +321,16 @@ class _Interp:
             return Arr(name, shape, _contiguous(shape))
         return self.scalar(ast.Subscript(value=_load(name), slice=ast.Constant(0), ctx=ast.Load()),
                            "st")
+
+    def adopt(self, v: Any) -> Any:
+        """A float array reached in Python values (a dict's or a list's item, not an
+        attribute): a table, or state if the method changes it (by its identity)."""
+        if isinstance(v, self.np.ndarray) and v.dtype.kind == "f":
+            key = (id(v), "")
+            if self.state_keys is not None and key in self.state_keys:
+                return self.state_value(v, "", v)
+            return self.const_array(v, "", v)
+        return v
 
     def written(self, target: Arr) -> None:
         """target (a constant table) is written: an attribute changed in place."""
@@ -485,8 +526,19 @@ class _Interp:
                 raise NotTranslatable(f"A loop over an array value (line {s.lineno})")
             for item in list(items):
                 self.store(s.target, item, frame, g)
-                self.block(s.body, frame, g)
+                try:
+                    self.block(s.body, frame, g)
+                except _Continue:
+                    continue
+                except _Break:
+                    break
+            else:
+                self.block(s.orelse, frame, g)
             return
+        if isinstance(s, ast.Continue):
+            raise _Continue()
+        if isinstance(s, ast.Break):
+            raise _Break()
         if isinstance(s, ast.If):
             test = self.expr(s.test, frame, g)
             if isinstance(test, (Arr, Sym)):
@@ -517,15 +569,44 @@ class _Interp:
                 self.store(tt, v, frame, g)
             return
         if isinstance(t, ast.Subscript):
-            target = self.expr(t, frame, g)
+            target = self.target(t, frame, g)
+            if isinstance(target, _Scatter):
+                self.scatter(target, lambda old, new: new, value)
+                return
             if isinstance(target, Arr):
                 self.copy_into(target, value)
                 return
         raise NotTranslatable(f"Unsupported assignment to {ast.unparse(t)}")
 
+    def target(self, t: ast.Subscript, frame, g) -> Any:
+        """The array a subscript assigns to (a view, or a _Scatter)."""
+        base = self.expr(t.value, frame, g)
+        if isinstance(base, Arr):
+            return self.index(base, t.slice, frame, g, store=True)
+        return self.expr(t, frame, g)
+
+    def scatter(self, sc: "_Scatter", combine: Callable[[ast.expr, ast.expr], ast.expr],
+                value: Any) -> None:
+        """target[i0, i1, ...] = combine(its element, value), element by element, in order."""
+        if sc.base.const:
+            self.written(sc.base)
+        self.dirty.add(sc.base.name)
+        value = value if isinstance(value, Lazy) else self.to_arr(value)
+        for lz in self.held():
+            if lz.real is None and sc.base.name in lz.reads():
+                lz.materialize()
+
+        def body(idx):
+            where = [_int_index(self.elem(o, sc.shape, idx)) for o in sc.ops]
+            old = sc.base.at(where)
+            self.emit(ast.Assign(targets=[_store(sc.base.at(copy.deepcopy(where)))],
+                                 value=combine(old, self.elem(value, sc.shape, idx))))
+        self.loops(sc.shape, body)
+
     def copy_into(self, target: Arr, value: Any) -> None:
         if target.const:
             self.written(target)
+        self.dirty.add(target.name)
         if isinstance(target, Lazy):
             target = target.materialize()
         value = value if isinstance(value, Lazy) else self.to_arr(value)
@@ -576,11 +657,15 @@ class _Interp:
                    and n.value.id == target.name)
 
     def augassign(self, s: ast.AugAssign, frame, g) -> None:
-        cur = self.expr(s.target, frame, g)
+        cur = (self.target(s.target, frame, g) if isinstance(s.target, ast.Subscript)
+               else self.expr(s.target, frame, g))
         rhs = self.expr(s.value, frame, g)
         op = _BINOPS.get(type(s.op))
         if op is None:
             raise NotTranslatable(f"Unsupported operator in {ast.unparse(s)}")
+        if isinstance(cur, _Scatter):
+            self.scatter(cur, lambda old, new: ast.BinOp(left=old, op=type(s.op)(), right=new), rhs)
+            return
         if isinstance(cur, Arr):                  # in place, as numpy does
             if cur.const:
                 self.written(cur)
@@ -596,9 +681,9 @@ class _Interp:
             return n.value
         if isinstance(n, ast.Name):
             if n.id in frame:
-                return frame[n.id]
+                return self.adopt(frame[n.id])
             if n.id in g:
-                return g[n.id]
+                return self.adopt(g[n.id])
             if hasattr(builtins, n.id):
                 return getattr(builtins, n.id)
             raise NotTranslatable(f"Unknown name '{n.id}'")
@@ -656,7 +741,7 @@ class _Interp:
             if isinstance(base, Arr):
                 return self.index(base, n.slice, frame, g)
             key = self.expr(n.slice, frame, g)
-            return base[key]
+            return self.adopt(base[key])
         if isinstance(n, ast.Slice):
             return slice(*(self.expr(x, frame, g) if x is not None else None
                            for x in (n.lower, n.upper, n.step)))
@@ -664,7 +749,32 @@ class _Interp:
             return self.call_expr(n, frame, g)
         if isinstance(n, ast.JoinedStr):
             return ""
+        if isinstance(n, (ast.ListComp, ast.GeneratorExp)):
+            return self.comprehension(n, frame, g)
         raise NotTranslatable(f"Unsupported expression: {ast.unparse(n)}")
+
+    def comprehension(self, n, frame, g) -> List[Any]:
+        """[elt for ... in ... if ...] over Python values, as Python runs it."""
+        out: List[Any] = []
+
+        def run(k: int, fr) -> None:
+            if k == len(n.generators):
+                out.append(self.expr(n.elt, fr, g))
+                return
+            c = n.generators[k]
+            items = self.expr(c.iter, fr, g)
+            if isinstance(items, (Arr, Sym)):
+                raise NotTranslatable(f"A loop over an array value: {ast.unparse(n)}")
+            for item in list(items):
+                inner = dict(fr)
+                self.store(c.target, item, inner, g)
+                tests = [self.expr(t, inner, g) for t in c.ifs]
+                if any(isinstance(t, (Arr, Sym)) for t in tests):
+                    raise NotTranslatable(f"An if on a computed value: {ast.unparse(n)}")
+                if all(tests):
+                    run(k + 1, inner)
+        run(0, frame)
+        return out
 
     def arr_attr(self, a: Arr, attr: str) -> Any:
         if attr == "T":
@@ -677,20 +787,29 @@ class _Interp:
             return len(a.shape)
         return _Method(a, attr)
 
-    def index(self, a: Arr, sl: ast.expr, frame, g) -> Any:
+    def index(self, a: Arr, sl: ast.expr, frame, g, store: bool = False) -> Any:
         parts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+        vals = [self.expr(p, frame, g) for p in parts]
+        if any(self.is_index_array(v) for v in vals):
+            return self.fancy(a, vals, store)
+        if any(v is Ellipsis for v in vals):          # (... : the dimensions not named)
+            k = vals.index(Ellipsis)
+            named = sum(1 for v in vals if v is not None and v is not Ellipsis)
+            vals = vals[:k] + [slice(None)] * (len(a.shape) - named) + vals[k + 1:]
         shape, strides, offset = [], [], a.offset
         d = 0
-        idx_exprs: List[ast.expr] = []
-        for p in parts:
-            v = self.expr(p, frame, g)
+        for v in vals:
+            if v is None:                             # (a new axis of 1)
+                shape.append(1)
+                strides.append(0)
+                continue
             if isinstance(v, slice):
                 start, stop, step = v.indices(a.shape[d])
                 shape.append(len(range(start, stop, step)))
                 strides.append(a.strides[d] * step)
                 offset += start * a.strides[d]
-            elif isinstance(v, int):
-                offset += (v % a.shape[d]) * a.strides[d]
+            elif isinstance(v, (int, self.np.integer)) and not isinstance(v, bool):
+                offset += (int(v) % a.shape[d]) * a.strides[d]
             else:
                 raise NotTranslatable(f"Index with a value computed in hardware: {ast.unparse(sl)}")
             d += 1
@@ -698,7 +817,27 @@ class _Interp:
         strides += list(a.strides[d:])
         if not shape:
             return Sym(Arr(a.name, (1,), (1,), offset, a.const).at([ast.Constant(0)]))
-        return Arr(a.name, tuple(shape), tuple(strides), offset, a.const)
+        return a.view(tuple(shape), tuple(strides), offset)
+
+    def is_index_array(self, v: Any) -> bool:
+        return (isinstance(v, self.np.ndarray) and v.dtype.kind in "iu") or (
+            isinstance(v, Arr) and not isinstance(v, slice))
+
+    def fancy(self, a: Arr, vals: List[Any], store: bool) -> Any:
+        """a[i0, i1, ...] with arrays of indices (one per dimension, numpy's integer
+        arrays or arrays computed in hardware, broadcast together): the elements
+        they pick, read where used (a gather) or, as a target, a _Scatter."""
+        if len(vals) != len(a.shape) or any(isinstance(v, slice) or v is None or v is Ellipsis
+                                            for v in vals):
+            raise NotTranslatable("Indexing with arrays is supported with an array (or an "
+                                  "integer) for every dimension")
+        if isinstance(a, Lazy):
+            a = a.materialize()
+        ops = tuple(self.to_arr(v) if isinstance(v, self.np.ndarray) else v for v in vals)
+        shape = _bcast(*[o.shape for o in ops if isinstance(o, Arr)])
+        if store:
+            return _Scatter(a, ops, shape)
+        return Lazy(self, shape, lambda *ix: a.at([_int_index(x) for x in ix]), ops, extra=(a,))
 
     def binop(self, op: ast.operator, a: Any, b: Any) -> Any:
         if isinstance(op, ast.MatMult):
@@ -766,15 +905,28 @@ class _Interp:
         kwargs = {k.arg: self.expr(k.value, frame, g) for k in n.keywords}
         if isinstance(fn, _Method):
             return self.method(fn.arr, fn.name, args, kwargs)
+        if isinstance(getattr(fn, "__self__", None), np.random.Generator):
+            if getattr(fn, "__name__", "") != "random":
+                raise NotTranslatable(f"Generator.{getattr(fn, '__name__', fn)} is not supported "
+                                      "(only .random)")
+            return self.random(fn.__self__, args, kwargs)
         sym = any(isinstance(v, (Arr, Sym)) for v in list(args) + list(kwargs.values()))
-        if getattr(fn, "__module__", None) == "numpy" or (
+        if getattr(fn, "__module__", None) in ("numpy", "numpy.lib.stride_tricks") or (
                 isinstance(fn, np.ufunc)):
             name = getattr(fn, "__name__", "")
-            if not sym and name not in ("zeros", "ones", "zeros_like", "ones_like"):
+            arrays = any(isinstance(v, Arr) for v in list(args) + list(kwargs.values())
+                         + [x for v in args if isinstance(v, (list, tuple)) for x in v])
+            if not sym and not arrays and name not in ("zeros", "ones", "zeros_like", "ones_like"):
                 return fn(*args, **kwargs)
             return self.numpy(name, args, kwargs)
         if fn is isinstance:
             return isinstance(*args)
+        if fn is id and len(args) == 1 and isinstance(args[0], Arr):
+            a = args[0]
+            real = self.real_of.get(a.name) if not isinstance(a, Lazy) else None
+            if real is None or tuple(real.shape if hasattr(real, "shape") else ()) != a.shape:
+                raise NotTranslatable("id() of an array computed in hardware")
+            return id(real)
         if fn in (len,):
             a = args[0]
             return a.shape[0] if isinstance(a, Arr) else len(a)
@@ -790,7 +942,46 @@ class _Interp:
         if sym:
             raise NotTranslatable(f"Unsupported call on values computed in hardware: "
                                   f"{ast.unparse(n)}")
+        for a in _arrays_in(list(args) + list(kwargs.values())):    # (kept by Python code?)
+            if not isinstance(a, Lazy):
+                self.handed[id(a)] = (self.fills.get(a.name) if a.name not in self.dirty
+                                      else None)
         return fn(*args, **kwargs)                   # plain Python (range, reversed, ...)
+
+    def random(self, gen: Any, args, kwargs) -> Any:
+        """gen.random(size): uniform numbers in [0, 1) from a generator in hardware, its
+        state kept between calls (a memory): xorshift32, each number its top
+        RANDOM_BITS bits (not numpy's stream: see _Draws)."""
+        size = kwargs.get("size", args[0] if args else None)
+        shape = () if size is None else (
+            tuple(int(x) for x in size) if isinstance(size, (tuple, list)) else (int(size),))
+        key = (id(gen), RANDOM_STATE)
+        self.generators[id(gen)] = gen
+        if self.state_keys is None:
+            self.mutated.add(key)
+        if key not in self.state:
+            self.state_value(gen, RANDOM_STATE, _seed(gen))
+        state = self.state[key][0]
+        out = self.new_list(shape or (1,), "rnd")
+
+        def body(idx):
+            x = self.fresh("x")
+            self.emit(_assign(x, ast.Subscript(value=_load(state), slice=ast.Constant(0),
+                                               ctx=ast.Load())))
+            for op, k in _XORSHIFT:
+                shifted = ast.BinOp(left=_load(x), op=op(), right=ast.Constant(k))
+                if isinstance(shifted.op, ast.LShift):
+                    shifted = ast.BinOp(left=shifted, op=ast.BitAnd(), right=ast.Constant(_MASK32))
+                self.emit(_assign(x, ast.BinOp(left=_load(x), op=ast.BitXor(), right=shifted)))
+            self.emit(ast.Assign(targets=[ast.Subscript(value=_load(state), slice=ast.Constant(0),
+                                                        ctx=ast.Store())], value=_load(x)))
+            self.emit(ast.Assign(targets=[_store(out.at(idx if shape else [ast.Constant(0)]))],
+                                 value=ast.BinOp(left=ast.BinOp(
+                                     left=_load(x), op=ast.RShift(),
+                                     right=ast.Constant(32 - RANDOM_BITS)),
+                                     op=ast.Mult(), right=ast.Constant(2.0 ** -RANDOM_BITS))))
+        self.loops(shape, body)
+        return out if shape else Sym(out.at([ast.Constant(0)]))
 
     def method(self, a: Arr, name: str, args, kwargs) -> Any:
         if name in ("sum", "max", "mean", "argmax", "min"):
@@ -802,11 +993,20 @@ class _Interp:
                                         self.reduce(neg, axis, keep, "max"))
             return self.reduce(a, axis, keep, name)
         if name == "reshape":
-            shape = args[0] if len(args) == 1 and isinstance(args[0], tuple) else tuple(args)
-            if a.strides != _contiguous(a.shape):
-                raise NotTranslatable("reshape of a view that isn't contiguous")
-            shape = tuple(a.size // -math.prod(shape) * -1 if s == -1 else s for s in shape)
+            shape = args[0] if len(args) == 1 and isinstance(args[0], (tuple, list)) else tuple(args)
+            shape = tuple(int(x) for x in shape)
+            if -1 in shape:
+                rest = math.prod(x for x in shape if x != -1)
+                shape = tuple(a.size // rest if x == -1 else x for x in shape)
+            if math.prod(shape) != a.size:
+                raise NotTranslatable(f"Can't reshape {a.shape} to {shape}")
+            if not _is_contiguous(a):
+                a = self.method(a, "copy", [], {})      # (a view of another order: a copy)
             return a.view(shape, _contiguous(shape))
+        if name == "transpose":
+            axes = args[0] if len(args) == 1 and isinstance(args[0], (tuple, list)) else tuple(args)
+            axes = tuple(axes) if axes else tuple(range(len(a.shape)))[::-1]
+            return a.view(tuple(a.shape[x] for x in axes), tuple(a.strides[x] for x in axes))
         if name == "copy":
             out = self.new_list(a.shape)
             self.copy_into(out, a)
@@ -834,12 +1034,59 @@ class _Interp:
         if name == "abs":
             return self.elementwise(lambda x: ast.Call(func=ast.Name(id="abs", ctx=ast.Load()),
                                                        args=[x], keywords=[]), args[0])
+        if name == "transpose":
+            return self.method(self.to_arr(args[0]), "transpose", list(args[1:2]), {})
+        if name == "reshape":
+            return self.method(self.to_arr(args[0]), "reshape", [args[1]], {})
+        if name == "pad":
+            a = self.to_arr(args[0])
+            mode = kwargs.get("mode", args[2] if len(args) > 2 else "constant")
+            if mode != "constant" or kwargs.get("constant_values", 0) != 0:
+                raise NotTranslatable("np.pad: only zeros around (mode='constant') are supported")
+            pads = np.broadcast_to(np.asarray(kwargs.get("pad_width", args[1] if len(args) > 1
+                                                         else None)), (len(a.shape), 2))
+            out = self.new_list(tuple(int(s + lo + hi) for s, (lo, hi) in zip(a.shape, pads)))
+            inner = out.view(a.shape, out.strides, sum(int(lo) * st for (lo, _), st
+                                                       in zip(pads, out.strides)))
+            self.copy_into(inner, a)
+            return out
+        if name == "concatenate":
+            parts = [self.to_arr(v) for v in args[0]]
+            axis = kwargs.get("axis", args[1] if len(args) > 1 else 0)
+            if len(parts) == 1:
+                return parts[0]
+            nd = len(parts[0].shape)
+            axis %= nd
+            shape = list(parts[0].shape)
+            shape[axis] = sum(p.shape[axis] for p in parts)
+            out = self.new_list(tuple(shape))
+            at = 0
+            for p in parts:
+                self.copy_into(out.view(p.shape, out.strides, at * out.strides[axis]), p)
+                at += p.shape[axis]
+            return out
+        if name == "sliding_window_view":
+            a = self.to_arr(args[0])
+            window = args[1] if len(args) > 1 else kwargs["window_shape"]
+            window = tuple(window) if isinstance(window, (tuple, list)) else (window,)
+            axis = kwargs.get("axis", args[2] if len(args) > 2 else None)
+            axes = tuple(range(len(a.shape)))[-len(window):] if axis is None else (
+                tuple(axis) if isinstance(axis, (tuple, list)) else (axis,))
+            shape, strides = list(a.shape), list(a.strides)
+            for x, w in zip(axes, window):
+                shape[x % len(shape)] -= w - 1
+            for x, w in zip(axes, window):
+                shape.append(w)
+                strides.append(a.strides[x % len(a.shape)])
+            return a.view(tuple(shape), tuple(strides))
         if name in ("zeros", "ones", "zeros_like", "ones_like"):
             shape = args[0].shape if name.endswith("like") else (
                 tuple(args[0]) if isinstance(args[0], (tuple, list)) else (args[0],))
             out = self.new_list(tuple(shape))
             if name.startswith("ones"):
                 self.copy_into(out, 1.0)
+                self.fills[out.name] = 1.0
+                self.dirty.discard(out.name)
             return out
         raise NotTranslatable(f"np.{name} is not supported")
 
@@ -847,6 +1094,129 @@ class _Interp:
 class _Method:
     def __init__(self, arr: Arr, name: str) -> None:
         self.arr, self.name = arr, name
+
+
+def _arrays_in(v: Any, depth: int = 0) -> List[Arr]:
+    if isinstance(v, Arr):
+        return [v]
+    if isinstance(v, (list, tuple)) and depth < 4:
+        return [a for x in v for a in _arrays_in(x, depth + 1)]
+    if isinstance(v, dict) and depth < 4:
+        return [a for x in v.values() for a in _arrays_in(x, depth + 1)]
+    return []
+
+
+_ATOMS = (int, float, complex, str, bytes, bool, type(None))
+
+
+def _children(x: Any) -> List[Tuple[Tuple[str, Any], Any]]:
+    """(step, value) for an object's attributes, a dict's or a list's items."""
+    np = _np()
+    if isinstance(x, dict):
+        return [(("item", k), v) for k, v in x.items()]
+    if isinstance(x, (list, tuple)):
+        return [(("item", i), v) for i, v in enumerate(x)]
+    if isinstance(x, (np.ndarray, type)) or inspect.ismodule(x) or callable(x) \
+            or isinstance(x, (Arr, Sym)):
+        return []
+    d = getattr(x, "__dict__", None)
+    return [(("attr", k), v) for k, v in d.items()] if isinstance(d, dict) else []
+
+
+def _paths(root: Any, depth: int = 8) -> Dict[int, Tuple]:
+    """id(x) -> the path from root to x (attributes, items), for what root holds. A
+    dict key that is id() of an array root holds is written as that array's path."""
+    out: Dict[int, Tuple] = {id(root): ()}
+    queue = [(root, ())]
+    while queue:
+        x, path = queue.pop(0)
+        if len(path) >= depth:
+            continue
+        for step, v in _children(x):
+            if isinstance(v, _ATOMS) or id(v) in out:
+                continue
+            out[id(v)] = path + (step,)
+            queue.append((v, path + (step,)))
+    for k, path in out.items():
+        out[k] = tuple(("id", out[s[1]]) if s[0] == "item" and type(s[1]) is int and s[1] in out
+                       and s[1] != id(None) and len(out[s[1]]) else s for s in path)
+    return out
+
+
+def _resolve(root: Any, path: Tuple) -> Any:
+    x = root
+    for kind, k in path:
+        if kind == "attr":
+            x = getattr(x, k)
+        elif kind == "item":
+            x = x[k]
+        else:
+            x = x[id(_resolve(root, k))]
+    return x
+
+
+def _path_text(path: Tuple) -> str:
+    out = ""
+    for kind, k in path:
+        out += (f".{k}" if kind == "attr" else f"[{k!r}]" if kind == "item"
+                else f"[id({_path_text(k)})]")
+    return out
+
+
+_MASK32 = (1 << 32) - 1
+_XORSHIFT = ((ast.LShift, 13), (ast.RShift, 17), (ast.LShift, 5))
+
+
+def _seed(gen: Any) -> int:
+    """A generator's starting state in hardware, from its numpy state (not drawing)."""
+    import zlib
+    return zlib.crc32(repr(gen.bit_generator.state).encode()) or 1
+
+
+def _xorshift(x: int) -> int:
+    for op, k in _XORSHIFT:
+        x ^= ((x << k) & _MASK32) if op is ast.LShift else x >> k
+    return x
+
+
+class _Draws:
+    """Stands in for a numpy Generator while the original is checked against the
+    program: .random() gives the hardware's numbers."""
+
+    def __init__(self, seed: int) -> None:
+        self.x = seed
+
+    def random(self, size=None, dtype=None, out=None):
+        np = _np()
+        shape = () if size is None else (tuple(size) if isinstance(size, (tuple, list))
+                                         else (int(size),))
+        vals = []
+        for _ in range(math.prod(shape)):
+            self.x = _xorshift(self.x)
+            vals.append((self.x >> (32 - RANDOM_BITS)) * 2.0 ** -RANDOM_BITS)
+        return np.array(vals).reshape(shape) if shape else vals[0]
+
+
+@dataclass
+class _Scatter:
+    """The elements of base that arrays of indices pick, as an assignment's target."""
+    base: Arr
+    ops: Tuple[Any, ...]
+    shape: Tuple[int, ...]
+
+
+def _is_contiguous(a: Arr) -> bool:
+    """Is the view its list's elements in order, from its offset (dimensions of 1 aside)?"""
+    want = _contiguous(a.shape)
+    return isinstance(a, Lazy) or all(s == w for n, s, w in zip(a.shape, a.strides, want) if n != 1)
+
+
+def _int_index(e: ast.expr) -> ast.expr:
+    """An index read from a list: an integer (its list holds integers as floats in the
+    float program)."""
+    if isinstance(e, ast.Constant):
+        return ast.Constant(int(e.value))
+    return ast.Call(func=_load("int"), args=[e], keywords=[])
 
 
 def _load(n: str) -> ast.Name:
@@ -870,8 +1240,12 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     np = _np()
     if not samples:
         raise NotTranslatable("A numpy design needs example inputs (samples=...) for its shapes")
-    obj = func.__self__ if inspect.ismethod(func) else None
-    fn = func.__func__ if obj is not None else func
+    original = func.__self__ if inspect.ismethod(func) else None
+    fn = func.__func__ if original is not None else func
+    # (run on a copy: Python code the method calls, dict.setdefault, may change the object)
+    memo: Dict[int, Any] = {}
+    obj = copy.deepcopy(original, memo) if original is not None else None
+    back = {id(memo[id(o)]): o for o in memo.get(id(memo), []) if id(o) in memo}
     sig = inspect.signature(func)
     first = samples[0] if isinstance(samples[0], tuple) else (samples[0],)
     names = list(sig.parameters)[:len(first)]
@@ -891,10 +1265,8 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
 
     # First to find the state (attributes read, then changed), then to build it
     it, _ = run(None)
-    if it.mutated:
-        it, result = run(set(it.mutated))
-    else:
-        it, result = run(set())
+    mutated = set(it.mutated) | _kept(it, obj)
+    it, result = run(mutated)
     ns = it.ns
     # The state's new values, where they were reassigned (not changed in place)
     for key, (name, value, _, _) in it.state.items():
@@ -943,11 +1315,24 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     gen = ns[gen_name]
     attr = {p: {"length": math.prod(shapes[p])} for p in names if shapes[p] != ()}
     memories: Dict[str, Tuple[str, Any, Any]] = {}
+    paths = _paths(obj) if obj is not None else {}
+    tr_paths: Dict[str, Tuple] = {}
+    for key, (name, value, label, owner) in list(it.state.items()):
+        if key[1] == "":                       # (an array the object holds in a container)
+            if key[0] not in paths:
+                raise NotTranslatable("An array the method changes isn't held by the object")
+            tr_paths[name] = paths[key[0]]
+            label, owner = type(original).__name__ + _path_text(paths[key[0]]), original
+        else:
+            owner = back.get(id(owner), owner)
+        it.state[key] = (name, value, label, owner)
     for name, value, label, owner in it.state.values():
         flat = (np.ravel(value).tolist() if isinstance(value, np.ndarray) else [value])
         attr[name] = {"length": len(flat), "memory": "ram", "init": flat}
         if not isinstance(value, np.ndarray) and isinstance(value, int):
             attr[name].update(signed=1, width=32)      # (a counter: an integer)
+        if label.endswith("." + RANDOM_STATE):
+            attr[name].update(signed=0, width=32)      # (a generator's: 32 bits)
         memories[name] = (label, value, owner)
     tr = Translation(func=gen, source=source, attr=attr, params=names, shapes=shapes,
                      outputs=outs)
@@ -955,8 +1340,52 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     tr.tables = set()
     tr.const_tables = dict(it.tables)
     tr.memories = memories
+    tr.generators = {id(gen): _seed(gen) for gen in it.generators.values()}
+    tr.paths = tr_paths
     _check(tr, func, samples)
     return tr
+
+
+def _kept(it: _Interp, obj: Any) -> set:
+    """Arrays the method made (np.zeros_like ...) that Python code it called kept in
+    the object (Adam's moments by dict.setdefault on its first step): put in as
+    arrays of the values they were made with, their keys (state, by identity)."""
+    np = _np()
+    keys: set = set()
+    if obj is None:
+        return keys
+
+    def real(v):
+        if isinstance(v, (Lazy, Sym)):
+            raise NotTranslatable("A value computed in hardware is kept in a Python container")
+        if isinstance(v, Arr):
+            fill = it.handed.get(id(v))
+            if fill is None:
+                raise NotTranslatable("An array kept in a Python container isn't made with "
+                                      "np.zeros / np.ones (its starting value)")
+            out = np.full(v.shape, float(fill))
+            keys.add((id(out), ""))
+            return out
+        if isinstance(v, tuple):
+            return tuple(real(x) for x in v)
+        return v
+
+    seen, queue = {id(obj)}, [obj]
+    while queue:
+        x = queue.pop()
+        if isinstance(x, dict):
+            for k, v in list(x.items()):
+                if _arrays_in(v):
+                    x[k] = real(v)
+        elif isinstance(x, list):
+            for i, v in enumerate(x):
+                if _arrays_in(v):
+                    x[i] = real(v)
+        for _, v in _children(x):
+            if not isinstance(v, _ATOMS) and id(v) not in seen:
+                seen.add(id(v))
+                queue.append(v)
+    return keys
 
 
 def _stored(s: ast.stmt) -> set:
@@ -981,6 +1410,32 @@ def _live(stmts: List[ast.stmt], roots: set) -> List[ast.stmt]:
     return keep[::-1]
 
 
+class _drawing:
+    """The modules' numpy Generators (by id) replaced by _Draws while the original runs."""
+
+    def __init__(self, generators: Dict[int, int]) -> None:
+        self.generators, self.saved = generators, []
+
+    def __enter__(self):
+        import sys
+        for mod in list(sys.modules.values()):
+            d = getattr(mod, "__dict__", None)
+            if not isinstance(d, dict):
+                continue
+            for k, v in list(d.items()):
+                if id(v) in self.generators:
+                    self.saved.append((d, k, v))
+        draws = {g: _Draws(seed) for g, seed in self.generators.items()}
+        for d, k, v in self.saved:
+            d[k] = draws[id(v)]
+        return self
+
+    def __exit__(self, *exc):
+        for d, k, v in self.saved:
+            d[k] = v
+        return False
+
+
 def _check(tr: Translation, func: Callable, samples: List[Any]) -> None:
     """The program in float against the original on a few examples (with state:
     on a copy of the object, one example after another)."""
@@ -990,6 +1445,12 @@ def _check(tr: Translation, func: Callable, samples: List[Any]) -> None:
     if obj is not None:
         func = getattr(copy.deepcopy(obj, memo), func.__name__)
     state = {name: list(tr.attr[name]["init"]) for name in tr.memories}
+    with _drawing(getattr(tr, "generators", {})):
+        _check_runs(tr, func, samples, memo, state)
+
+
+def _check_runs(tr, func, samples, memo, state) -> None:
+    np = _np()
     for s in samples[:2 if tr.memories else 3]:
         args = s if isinstance(s, tuple) else (s,)
         want = np.ravel(np.asarray(func(*args), dtype=float))
@@ -1000,7 +1461,12 @@ def _check(tr: Translation, func: Callable, samples: List[Any]) -> None:
             raise NotTranslatable(f"The loop translation of {getattr(func, '__name__', func)} "
                                   f"disagrees with it on an example: {got[:6]} vs {want[:6]}")
         for name, (label, _, owner) in tr.memories.items():
-            value = getattr(memo.get(id(owner), owner), label.split(".")[1])
+            if label.endswith("." + RANDOM_STATE):
+                continue
+            mine = memo.get(id(owner), owner)
+            path = getattr(tr, "paths", {}).get(name)
+            value = (_resolve(mine, path) if path is not None
+                     else getattr(mine, label.split(".", 1)[1]))
             if not np.allclose(np.ravel(np.asarray(value, dtype=float)), state[name],
                                rtol=1e-6, atol=1e-9):
                 raise NotTranslatable(f"The loop translation of {func.__name__} changes "

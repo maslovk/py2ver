@@ -696,16 +696,23 @@ multiply-accumulates per image. When the scalar translation can't take a
 design (here: the loop over `self.layers`), or with `sequential=True`, py2ver
 keeps its loops instead:
 
-- the method runs at translation time, the way Python would: the object, its
-  lists of layers, `isinstance()`, loops over lists and ifs on them are real,
-  and each method called is inlined with its own `self`
+- the method runs at translation time, the way Python would, on a copy of
+  the object: the object, its lists of layers, `isinstance()`, `hasattr()`,
+  loops over lists (with `break` / `continue`), ifs on them, comprehensions
+  and dicts are real, and each method called is inlined with its own `self`
 - each array is a view (shape, strides, offset) of a flat list or a constant
   table (an attribute read and never written: trained weights), so `.T`,
-  `np.atleast_2d` and constant slices cost nothing; each numpy operation is a
-  loop nest writing a new list: `@`, `+ - * / **` and comparisons with
-  broadcasting, `np.exp` / `np.log` / `np.tanh` / ... (tables), `np.sqrt`
-  (exact: an integer square root of the raw value), `.sum` / `.max` / `.mean`
-  / `.argmax` with `axis` and `keepdims`, `np.maximum` / `np.minimum`, `abs`
+  `.transpose(...)`, `np.atleast_2d`, `sliding_window_view`, constant slices
+  and indices with `None` and `...` cost nothing (`.reshape` of a view in
+  another order is a copy); each numpy operation is a loop nest writing a new
+  list: `@`, `+ - * / **` and comparisons with broadcasting, `np.exp` /
+  `np.log` / `np.tanh` / ... (tables), `np.sqrt` (exact: an integer square
+  root of the raw value), `.sum` / `.max` / `.mean` / `.argmax` with `axis`
+  (or a tuple of axes) and `keepdims`, `np.maximum` / `np.minimum`, `abs`,
+  `np.pad` (zeros), `np.concatenate`
+- indexing with arrays of integers (`probs[np.arange(n), labels]`, the labels
+  an input) reads the elements they pick, and assigning to it
+  (`grad[np.arange(n), labels] -= 1`) writes them, one after another
 - elementwise operations are computed where they are used: a chain of them
   (`m[:] = beta1 * m + (1 - beta1) * g`) is one loop, each operation's
   result still a variable with a format of its own, as each numpy result
@@ -754,9 +761,21 @@ it is. What the method reads and then changes is state:
 - attributes written before they are read (`self.x`, `self.mask`,
   `self.dW`) are variables, and the gradient computed for the layer before
   the first is never used, so it isn't computed
-- the object itself is left as it is (the check runs on a copy);
+- an array the object holds in a dict or a list (not as an attribute) is
+  state too if the method changes it, and so is one the method makes with
+  `np.zeros` / `np.ones` that Python code it calls keeps in the object: an
+  optimiser's moments made on its first step by `dict.setdefault(id(p),
+  ...)` start at zero and are kept
+- `rng.random(size)` of a numpy `Generator` draws from a random number
+  generator in hardware (xorshift32, its state kept between steps): dropout
+  works, with numbers of its own rather than numpy's stream (the translation
+  is checked against the original with these numbers in place of `rng`'s)
+- attributes read and never written are constants, built in: changing one
+  between steps (`net.opt.lr /= 4`) needs another build
+- the object itself is left as it is (the translation runs on a copy);
   `p.state_values()` gives the state after the last `PY_stream()` as
-  `{(object, attribute): array}`, to put back on a network
+  `{(object, attribute): array}`, to put back on a network (an array held in
+  a dict: `(network, 'opt.state[id(.layers[0].W)][0]')`, its path)
 
 ```python
 steps = batches(epochs=3)                                    # [(x, y_onehot, lr)], 32 images each
@@ -788,6 +807,48 @@ The state is 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so this
 one is for simulation. The batch's 2,048 inputs are ports: a list argument
 that long read by index is an array of its ports, and the testbench reads
 a vector that wide in parts.
+
+#### A convolutional network
+
+`examples/cnn_network.py` is a CNN in numpy, conv -> pool -> conv -> pool ->
+dense -> dense (13,706 parameters), with dropout, shifted training images
+and an Adam that keeps its moments in a dict. Its forward pass and its
+training step are built as they are:
+
+- `Conv2D.forward`'s im2col (`np.pad`, `sliding_window_view`, a transpose
+  and a reshape) is a copy of the padded image into the patches' order, and
+  the convolution a matrix product of the patches and the filters
+- `MaxPool2x2` is a reduction over the 2x2 blocks of a 6-dimensional view,
+  and its mask a comparison with the maxima broadcast back (`None` indices)
+- the backward pass adds each patch's gradient back with `+=` on 3x3 shifted
+  views (col2im), and the gradient of the softmax picks each image's label
+  (`grad[np.arange(n), labels] -= 1`)
+
+`examples/cnn_hardware.py` (inference), on the DE0-Nano's EP4CE22:
+
+| | test accuracy | logic elements | block RAM | 9-bit multipliers | Fmax | per image |
+|---|---|---|---|---|---|---|
+| numpy (float) | 98.3 % | | | | | |
+| hardware, 16 bits | 98.3 % (same digit as numpy for 100 %) | 4521 (20 %) | 351 kbit (58 %) | 8 | 73 MHz | 108,774 clocks: 2.2 ms at 50 MHz |
+| 2 lanes (`multipliers=2`) | the same | 4896 (22 %) | 380 kbit (63 %) | 14 | 68 MHz | 67,494 clocks: 1.35 ms at 50 MHz |
+
+On 4 lanes the activations read by the lanes (the patches) are copied per
+lane, which takes more block RAMs (74) than the EP4CE22 has (66).
+
+`examples/cnn_training.py` builds `net.train_batch(x, labels)` (24 bits,
+formats from the first 8 steps, `margin=2`) and trains 2 epochs of the
+script's shifted images in fixed point. Its dropout draws other numbers than
+numpy's, so the losses agree on average rather than step by step:
+
+| | loss, epochs 1 / 2 | test accuracy | per step (32 images) |
+|---|---|---|---|
+| numpy (float) | 2.398 / 1.845 | 78.1 % | |
+| fixed point, 24 bits | 2.362 / 1.805 | 78.6 % | 10,163,735 clocks: 203 ms at 50 MHz |
+
+A step is 8.5 million multiply-accumulates (the convolutions' products
+forward, for the filters' gradients and back), most of its clocks. Verilator
+simulates a step in 3 minutes, the same as the model's; the state (weights,
+moments: 41,120 numbers, 1 Mbit at 24 bits) is for simulation.
 
 ### Simulation speed (Icarus, Verilator)
 
@@ -1042,11 +1103,12 @@ chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
 table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained on 4
 shared multipliers and run pipelined in hardware, a 64 -> 128 -> 64 -> 10 numpy
 digit recogniser built with its loops sequenced, on up to 8 lanes, and its
-training step with Adam (simulated), a decimate-by-4 filter fed one sample per
-handshake, a receiver chain built from plain Python functions, a histogram in
-block RAM, and pipelined SHA-256 rounds). Each checks the hardware against
-Python in simulation, and optionally on the virtual board, in Quartus, or on
-the real board:
+training step with Adam (simulated), a convolutional network with pooling and
+dropout, its forward pass and its training step, a decimate-by-4 filter fed
+one sample per handshake, a receiver chain built from plain Python functions,
+a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the
+hardware against Python in simulation, and optionally on the virtual board, in
+Quartus, or on the real board:
 
 ```
 python examples/sha256_pipeline.py              # simulation

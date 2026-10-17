@@ -1763,7 +1763,7 @@ class Py2ver:
                 frac = self._fx_frac(mem)
                 raw = self._last_memories[mem]
                 vals = [v / (1 << frac) if frac is not None else v for v in raw]
-                out[(owner, label.split(".")[1])] = (np.array(vals, dtype=float).reshape(np.shape(init))
+                out[(owner, label.split(".", 1)[1])] = (np.array(vals, dtype=float).reshape(np.shape(init))
                                                      if isinstance(init, np.ndarray) else vals[0])
             return out
         if self._numpy is None or not self._numpy.state:
