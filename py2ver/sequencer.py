@@ -17,6 +17,8 @@ a time:
     ('memory' in attr) keeps its values from one sample to the next (state:
     a network's weights while it trains), starting from its 'init'
   - a division by a variable and an integer square root take a bit a clock
+  - an innermost loop of one block is pipelined: an iteration a clock, its
+    values carried to later stages by delay registers (pipeline_block)
   - a block takes a few clocks: a read from a RAM / ROM gives its value a
     clock after its address, so reads are issued level by level (a read whose
     address needs another read's value waits for it), then everything is
@@ -348,12 +350,13 @@ class _Seq:
         return name
 
 
-def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, Any]
-             ) -> Tuple[ast.Module, Dict[str, Any]]:
+def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, Any],
+             pipelined: bool = True) -> Tuple[ast.Module, Dict[str, Any]]:
     """
     Build the module's first function (lowered integer code with for-range
     loops) as a state machine; returns (tree, info) in share.py's form, or
-    info['phases'] == 1 if it has no loops to sequence.
+    info['phases'] == 1 if it has no loops to sequence. pipelined: innermost
+    loops start an iteration every clock where they can (see pipeline_block).
     """
     from .visitor import _Desugar
     fd = _Desugar().visit(copy.deepcopy(tree.body[0]))
@@ -362,10 +365,10 @@ def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, An
     program = st.seq(fd.body)
     if not any(isinstance(it, Loop) for it in program):
         return tree, {"phases": 1}
-    return _build(sq, program, attr, ns)
+    return _build(sq, program, attr, ns, pipelined)
 
 
-def _build(sq: _Seq, program, attr, ns):
+def _build(sq: _Seq, program, attr, ns, pipelined: bool = True):
     params = sq.params
     inputs = set(params)
     # Number the blocks and loops in program order
@@ -438,6 +441,24 @@ def _build(sq: _Seq, program, attr, ns):
                                             rng, ns)
     walk(program, {})
 
+    # ----- innermost loops of one block: an iteration a clock (see pipeline_block)
+    from .sequencer_blocks import pipeline_block
+    known: Dict[str, Tuple[int, int]] = {f"r_{v}": r for v, r in rng.items()}
+    for lp in loops:
+        known[f"{counters[lp.index]}_now"] = (min(lp.values, default=0), max(lp.values, default=0))
+    for a in reg_lists:
+        for e in range(sq.lists[a]):
+            if a in rng:
+                known[f"r_{a}_{e}"] = rng[a]
+    for code in codes.values():
+        for site in code.sites:
+            known[site.data] = ((min(site.array), max(site.array)) if site.rom
+                                else rng.get(site.array, (0, 0)))
+    for lp in loops:
+        if len(lp.body) == 1 and isinstance(lp.body[0], Block) and pipelined:
+            pipeline_block(codes[lp.body[0].index], counters[lp.index], len(lp.values), known,
+                           attr)
+
     # ----- the control: successor of each block, how often each runs
     n = len(blocks)
     DONE = n
@@ -494,17 +515,21 @@ def _build(sq: _Seq, program, attr, ns):
     start_state, start_sets = enter(program[0])
 
     # How many times each block runs, and the clocks of a sample
-    runs: Dict[int, int] = {}
+    # (a pipelined loop: N + its stages - 1 clocks each time it runs)
+    total = 0
 
     def count(items, times: int):
+        nonlocal total
         for it in items:
             if isinstance(it, Block):
-                runs[it.index] = runs.get(it.index, 0) + times
+                total += times * codes[it.index].clocks
+            elif len(it.body) == 1 and isinstance(it.body[0], Block) \
+                    and codes[it.body[0].index].pipe is not None:
+                total += times * (len(it.values) + codes[it.body[0].index].clocks - 1)
             else:
                 count(it.body, times * len(it.values))
     count(program, 1)
-    clocks = {k: codes[k].clocks for k in codes}
-    phases = sum(runs[k] * clocks[k] for k in clocks) + 1
+    phases = total + 1
 
     from .sequencer_blocks import emit_machine
     return emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,

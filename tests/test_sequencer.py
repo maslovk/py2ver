@@ -108,3 +108,80 @@ def test_what_cant_be_sequenced_says_so():
     fe = front_end(loop_in_if, X16)
     with pytest.raises(NotSequenceable, match="loop inside an if"):
         sequence(fe.tree, fe.attr, _namespace(loop_in_if))
+
+
+# ----------------------------- pipelined loops: an iteration a clock -----------------------------
+
+def in_place(x):
+    m = [0] * 40
+    for i in range(40):
+        m[i] = x[i % 16] * 3
+    for i in range(40):
+        m[i] = m[i] * 7 - x[i % 16]         # read and written at the same element: pipelined
+    s = 0
+    for i in range(40):
+        if m[i] > 0:
+            s = s + m[i]                    # carried, under a condition
+    t = m[7]
+    return s, t
+
+
+def running(x):
+    a = [0] * 40
+    a[0] = x[0]
+    for i in range(1, 40):
+        a[i] = a[i - 1] + x[i % 16]         # reads what the iteration before wrote: not pipelined
+    j = 0
+    for k in range(10):
+        j = a[(j + k) % 40] % 40            # carried through a read: not pipelined
+    return a[39], j
+
+
+@pytest.mark.parametrize("f", [mlp, in_place, running])
+def test_pipelined_loops_compute_what_python_does(f):
+    fe = front_end(f, X16)
+    tree, info = sequence(fe.tree, fe.attr, _namespace(f))
+    _, plain = sequence(fe.tree, fe.attr, _namespace(f), pipelined=False)
+    model = build_model(tree, dict(fe.attr, **info["attr"]), _namespace(f))
+    for _ in range(20):
+        x = _vec()
+        got = simulate(info, model, (x,))
+        assert got == f(x)
+    expected = {mlp: 1, in_place: 3, running: 0}[f]
+    assert info["pipelined"] == expected
+    if expected:
+        assert info["phases"] < 0.7 * plain["phases"]
+    else:
+        assert info["phases"] == plain["phases"]
+
+
+@pytest.mark.sim
+def test_pipelined_hardware_matches(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(in_place, X16, sequential=True)
+    vectors = [(_vec(),) for _ in range(6)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+def deep(x):
+    h = [0] * 40
+    for j in range(40):
+        h[j] = abs(x[j % 16]) * 5
+    s = 0
+    for i in range(40):
+        a = h[i] * 3 + i                    # several stages: delays of delays
+        b = h[h[i] % 40] - a                 # (a read at an address read first)
+        s = s + (b if b > a else a) * i
+    return s
+
+
+@pytest.mark.sim
+def test_a_deep_pipeline_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    fe = front_end(deep, X16)
+    _, info = sequence(fe.tree, fe.attr, _namespace(deep))
+    assert info["pipelined"] == 2
+    p = Py2ver(deep, X16, sequential=True)
+    vectors = [(_vec(),) for _ in range(6)]
+    assert p.PY_batch()(vectors) == [(deep(*v),) for v in vectors]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)

@@ -442,6 +442,18 @@ machine runs the program a step at a time, for designs far too big to unroll
   below) a clock per two bits of its argument
 - a list in block RAM made by `[0] * n` is filled by a loop, unless the loop
   after it writes every element before anything reads it
+- an innermost loop whose body is one block is pipelined: an iteration
+  starts every clock, each value computed at its stage of the iteration and
+  carried to later stages by delay registers, and a value carried from one
+  iteration to the next (`acc = acc + x[i] * w[i]`) kept at one stage, so the
+  next iteration finds it a clock later. A loop of `N` iterations then takes
+  `N + stages - 1` clocks instead of `N * stages` (a matrix product's
+  multiply-accumulates: one a clock instead of one every two). A loop isn't
+  pipelined if it divides or takes a square root (several clocks each), writes
+  a list held in registers, writes one RAM twice, reads a RAM it writes
+  anywhere but at the element it writes (a different one each iteration: `m[i]
+  = 0.9 * m[i] + g[i]` is fine, `a[i] = a[i - 1] + x[i]` isn't), or carries a
+  value through a RAM read
 - a memory argument (`'memory'` in attr) is state: its block RAM (or its
   registers, if it is short) keeps its values from one sample to the next,
   starting from its `'init'`, and isn't a port
@@ -698,7 +710,7 @@ DE0-Nano's EP4CE22:
 | | test accuracy | logic elements | block RAM | 9-bit multipliers | Fmax | per image |
 |---|---|---|---|---|---|---|
 | numpy (float) | 98.6 % | | | | | |
-| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3064 (14 %) | 270 kbit (44 %) | 6 | 73 MHz | 35,185 clocks: 0.70 ms at 50 MHz |
+| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3084 (14 %) | 270 kbit (44 %) | 6 | 76 MHz | 18,173 clocks: 0.36 ms at 50 MHz |
 
 #### Training: the object's arrays as state
 
@@ -735,10 +747,12 @@ should cover training, or `margin=` leave room for it. `examples/digits_training
 | | loss, epochs 1 / 2 / 3 | test accuracy | per step (32 images) |
 |---|---|---|---|
 | numpy (float) | 1.863 / 0.838 / 0.419 | 93.3 % | |
-| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 4,291,843 clocks: 86 ms at 50 MHz |
+| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 2,878,738 clocks: 58 ms at 50 MHz |
 
-The bit-exact model trains the three epochs in under 3 minutes; the hardware,
-simulated in Verilator, gives the model's losses bit for bit (2 steps, 72 s).
+The bit-exact model trains the three epochs in about 3 minutes; the hardware,
+simulated in Verilator, gives the model's losses bit for bit (2 steps). Most
+of a step's clocks are now Adam's division and square root, a bit a clock for
+each of the 17,226 parameters; the matrix products are pipelined.
 
 The state is 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so this
 one is for simulation. The batch's 2,048 inputs are ports: a list argument

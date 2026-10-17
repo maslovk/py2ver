@@ -92,6 +92,7 @@ class BlockCode:
         self.rng = rng
         self.extra_regs: Dict[str, Tuple[str, Dict[str, Any]]] = {}   # register -> (next, format)
         self.reads: Dict[Any, ast.expr] = {}   # (array, address) -> its value (read once)
+        self.pipe: Optional[Dict[str, Any]] = None    # set by pipeline_block
         for s in block.stmts:
             self.stmt(s, None)
         self.schedule()
@@ -444,7 +445,10 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     # ----- control registers: state, clock within the block, loop counters
     st, cyc = "r_st", "r_cyc"
     reg(st, bits(DONE + 1))
-    max_c = max(codes[k].clocks for k in codes)
+    # A block's clocks each time it runs (a pipelined loop's block: the whole loop)
+    run = {k: (codes[k].pipe["n"] + codes[k].clocks - 1 if codes[k].pipe else codes[k].clocks)
+           for k in codes}
+    max_c = max(run.values())
     reg(cyc, bits(max_c + 1))
     at_start("st_now", st, start_state)
     at_start("cyc_now", cyc, ast.Constant(0))
@@ -465,6 +469,30 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             regs[r] = nxt
             new_attr[r] = dict(meta, type="wire")
 
+    # ----- pipelined loops: which stages hold an iteration (valid), the delays
+    valid: Dict[Tuple[int, int], str] = {}
+    for k in range(n):
+        pipe = codes[k].pipe
+        if pipe is None:
+            continue
+        v0 = sq.fresh(f"b{k}_valid0")
+        stmts.append(_assign(v0, _and(_eq(_name("st_now"), k), ast.Compare(
+            left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant(pipe["n"])]))))
+        new_attr[v0] = {"signed": 0, "width": 1, "type": "wire"}
+        valid[(k, 0)] = v0
+        # (each loaded from a wire: a register's next value can't be another register)
+        for c in range(1, codes[k].clocks):
+            r = sq.fresh(f"r_b{k}_valid{c}")
+            regs[r] = sq.fresh(f"{r}_n")
+            stmts.append(_assign(regs[r], _name(valid[(k, c - 1)])))
+            new_attr[r] = new_attr[regs[r]] = {"signed": 0, "width": 1, "type": "wire"}
+            valid[(k, c)] = r
+        for r, prev in pipe["regs"].items():
+            regs[r] = sq.fresh(f"{r}_n")
+            stmts.append(_assign(regs[r], _name(prev)))
+            new_attr[r] = dict(pipe["formats"][r])
+            new_attr[regs[r]] = dict(pipe["formats"][r])
+
     # ----- registers: scalars, register lists
     # Registers for the scalars read in a block before it sets them (in another
     # block, or a loop's previous iteration) or returned; the rest are wires
@@ -474,7 +502,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     end = _name("blk_end")
     stmts.append(_assign("blk_end", ast.Compare(
         left=_name("cyc_now"), ops=[ast.Eq()],
-        comparators=[_sel([ast.Constant(codes[k].clocks - 1) for k in range(n)]
+        comparators=[_sel([ast.Constant(run[k] - 1) for k in range(n)]
                           + [ast.Constant(0)], _name("st_now"))])))
 
     def next_value(per_block: List[ast.expr], keep: ast.expr) -> ast.expr:
@@ -485,8 +513,14 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         if v not in rng:
             raise _err(f"'{v}' is read before it is set")
         reg(f"r_{v}", fmt(v))
-        per = [_name(codes[k].env.get(v, f"r_{v}")) for k in range(n)]
-        stmts.append(_assign(f"rn_{v}", next_value(per, _name(f"r_{v}"))))
+        per = [_name(codes[k].env.get(v, f"r_{v}") if codes[k].pipe is None else f"r_{v}")
+               for k in range(n)]
+        value = next_value(per, _name(f"r_{v}"))
+        for k in range(n):                 # (a pipelined block: at its stage, each iteration)
+            if codes[k].pipe is not None and v in codes[k].env:
+                value = ast.IfExp(test=_name(valid[(k, codes[k].pipe["stage"][v])]),
+                                  body=_name(codes[k].env[v]), orelse=value)
+        stmts.append(_assign(f"rn_{v}", value))
         regs[f"r_{v}"] = f"rn_{v}"
     # Memories: their 'init' (raw), wrapped to the format they are kept in
     reg_init: Dict[str, int] = {}
@@ -522,7 +556,17 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     regs[st] = "rn_st"
     for cnt in loop_of:
         per = [succ[k][1].get(cnt, _name(f"{cnt}_now")) for k in range(n)]
-        stmts.append(_assign(f"rn_{cnt}", next_value(per, _name(f"{cnt}_now"))))
+        value = next_value(per, _name(f"{cnt}_now"))
+        for k in range(n):                 # (its pipelined loop: a step a clock, to the last)
+            pipe = codes[k].pipe
+            if pipe is not None and pipe["counter"] == cnt:
+                lp = loop_of[cnt]
+                step = lp.values[1] - lp.values[0]
+                value = ast.IfExp(test=_and(_eq(_name("st_now"), k), ast.Compare(
+                    left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant(pipe["n"] - 1)])),
+                    body=ast.BinOp(left=_name(f"{cnt}_now"), op=ast.Add(), right=ast.Constant(step)),
+                    orelse=value)
+        stmts.append(_assign(f"rn_{cnt}", value))
         regs[f"r_{cnt}"] = f"rn_{cnt}"
 
     # ----- RAM ports (a register file per read port, all taking the writes)
@@ -531,12 +575,18 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     extra_params: List[str] = []
     extra_returns: List[str] = []
 
-    def issue_chain(items: List[Tuple[int, int, ast.expr]], hold: ast.expr) -> ast.expr:
-        """(block, clock, value) -> the value in that block's clock, else hold."""
+    def issue_chain(items: List[Tuple[int, int, ast.expr]], hold: ast.expr,
+                    write: bool = False) -> ast.expr:
+        """(block, clock, value) -> the value in that block's clock, else hold. In a
+        pipelined block: a write at its stage while an iteration is there, a read
+        every clock."""
         out = hold
         for k, c, v in reversed(items):
-            out = ast.IfExp(test=_and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), c)),
-                            body=v, orelse=out)
+            if codes[k].pipe is None:
+                test = _and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), c))
+            else:
+                test = _name(valid[(k, c)]) if write else _eq(_name("st_now"), k)
+            out = ast.IfExp(test=test, body=v, orelse=out)
         return out
 
     for a in sorted(rams):
@@ -548,11 +598,11 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         wnames = {key: sq.fresh(f"{a}_{key}") for key in ("we", "waddr", "wdata")}
         stmts.append(_assign(wnames["we"], issue_chain(
             [(k, c, _name(w.cond) if w.cond else ast.Constant(1)) for k, c, w in writes],
-            ast.Constant(0))))
+            ast.Constant(0), write=True)))
         stmts.append(_assign(wnames["waddr"], issue_chain(
-            [(k, c, _name(w.addr)) for k, c, w in writes], ast.Constant(0))))
+            [(k, c, _name(w.addr)) for k, c, w in writes], ast.Constant(0), write=True)))
         stmts.append(_assign(wnames["wdata"], issue_chain(
-            [(k, c, _name(w.data)) for k, c, w in writes], ast.Constant(0))))
+            [(k, c, _name(w.data)) for k, c, w in writes], ast.Constant(0), write=True)))
         new_attr[wnames["wdata"]] = dict(meta, type="wire")
         for p in range(nports):
             q = sq.fresh(f"{a}_q{p}")
@@ -648,7 +698,8 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             "roms": roms, "rfs": rfs, "extra_params": extra_params,
             "extra_returns": extra_returns, "params": {phase} | set(reg_names) | set(extra_params),
             "attr": new_attr, "register_bits": sum(int(new_attr[r]["width"]) for r in reg_names),
-            "blocks": n, "mul_widths": [], "memories": mem_info, "reg_init": reg_init}
+            "blocks": n, "mul_widths": [], "memories": mem_info, "reg_init": reg_init,
+            "pipelined": sum(1 for k in codes if codes[k].pipe is not None)}
     return tree, info
 
 
@@ -660,3 +711,158 @@ def _wrap(n: int, w: int, signed: bool) -> int:
 def _err(msg: str):
     from .sequencer import NotSequenceable
     return NotSequenceable(msg)
+
+
+# ==================================================================== pipelined loops
+
+def _expand(expr: ast.expr, defs: Dict[str, ast.expr], depth: int = 0) -> ast.expr:
+    """expr with the block's own temporaries replaced by their definitions."""
+    if depth > 20:
+        return expr
+
+    class _X(ast.NodeTransformer):
+        def visit_Name(self, n: ast.Name):
+            if n.id in defs:
+                return _expand(copy.deepcopy(defs[n.id]), defs, depth + 1)
+            return n
+    return _X().visit(copy.deepcopy(expr))
+
+
+def _coefficient(e: ast.expr, now: str, varying: Set[str]) -> Optional[int]:
+    """e's coefficient of the loop counter `now` if e is that times a constant plus
+    values that don't change in the loop; else None."""
+    if isinstance(e, ast.Name):
+        return 1 if e.id == now else (None if e.id in varying else 0)
+    if isinstance(e, ast.Constant) and type(e.value) is int:
+        return 0
+    if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Sub)):
+        a, b = _coefficient(e.left, now, varying), _coefficient(e.right, now, varying)
+        if a is None or b is None:
+            return None
+        return a + b if isinstance(e.op, ast.Add) else a - b
+    if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mult):
+        for c, x in ((e.left, e.right), (e.right, e.left)):
+            if isinstance(c, ast.Constant) and type(c.value) is int:
+                k = _coefficient(x, now, varying)
+                return None if k is None else c.value * k
+    if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub):
+        k = _coefficient(e.operand, now, varying)
+        return None if k is None else -k
+    names = {n.id for n in ast.walk(e) if isinstance(n, ast.Name)}
+    return 0 if not names & (varying | {now}) else None
+
+
+def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tuple[int, int]],
+                   attr) -> bool:
+    """
+    Retime an innermost loop's one block to start an iteration every clock: each
+    value is computed at its stage (the clock of the iteration it belongs to at
+    which its inputs are there), and one used at a later stage reaches it through
+    delay registers. A value carried from one iteration to the next (acc = acc +
+    ...) is computed and stored at one stage, so the next iteration, a clock
+    later, finds it there. A loop of N iterations then takes N + stages - 1
+    clocks instead of N * stages. Returns False (and leaves the block as it is)
+    if the block can't: a divider or a square root (several clocks each), a
+    list in registers written, two writes to one RAM, a RAM read elsewhere than
+    where it is written (a later iteration could read before an earlier one
+    writes), or a value carried through a RAM read.
+    known: ranges of the registers and counters (for the delay registers' widths).
+    """
+    from .share import NotShareable, _fmt_of, _fmt_range, _interval
+    if code.extra_regs or code.elems or n_iter < 2:
+        return False
+    now = f"{cnt}_now"
+    defs = {s.targets[0].id: s.value for s in code.out}
+    carried = {v for v in code.read_regs if v in code.env}
+    varying = set(defs) | {s.data for s in code.sites} | {now} | {f"r_{v}" for v in carried}
+    # One write per RAM; a RAM written here is read only where it is written, an
+    # element a different one each iteration
+    written: Dict[str, _Write] = {}
+    for w in code.writes:
+        if w.array in written:
+            return False
+        written[w.array] = w
+    for s in code.sites:
+        if not s.rom and s.array in written:
+            ra, wa = _expand(defs[s.addr], defs), _expand(defs[written[s.array].addr], defs)
+            if ast.dump(ra) != ast.dump(wa) or not _coefficient(ra, now, varying - {now}):
+                return False
+
+    # Stages: a statement's is the latest of its inputs'; a carried value's register
+    # is there at the stage its new value is
+    ready: Dict[str, int] = {}
+    data_of = {s.addr: s.data for s in code.sites}
+
+    def stage(e: ast.expr) -> int:
+        return max([0] + [ready.get(n.id, 0) for n in ast.walk(e)
+                          if isinstance(n, ast.Name) and n.id in varying])
+    for _ in range(len(code.out) + 3):
+        before = dict(ready)
+        for v in carried:
+            ready[f"r_{v}"] = ready.get(code.env[v], 0)
+        for s in code.out:
+            t = s.targets[0].id
+            ready[t] = stage(s.value)
+            if t in data_of:
+                ready[data_of[t]] = ready[t] + 1
+        if ready == before:
+            break
+    else:
+        return False                                  # (carried through a read: no fixed stage)
+
+    # Ranges of the block's values (for the delay registers' widths)
+    rng = dict(known)
+    try:
+        for s in code.out:
+            t = s.targets[0].id
+            r = _interval(s.value, rng, attr)
+            if t in code.formats:
+                f = _fmt_range(code.formats[t])
+                if not (f[0] <= r[0] and r[1] <= f[1]):
+                    r = f
+            rng[t] = r
+    except NotShareable:
+        return False
+
+    delays: Dict[Tuple[str, int], str] = {}
+    regs: Dict[str, str] = {}
+    formats: Dict[str, Dict[str, Any]] = {}
+
+    def delayed(x: str, d: int) -> str:
+        prev = x
+        for j in range(1, d + 1):
+            if (x, j) not in delays:
+                delays[(x, j)] = code.sq.fresh(f"{x}_p{j}")
+                regs[delays[(x, j)]] = prev
+                formats[delays[(x, j)]] = dict(_fmt_of(rng[x]), type="wire")
+            prev = delays[(x, j)]
+        return prev
+
+    def at(e: ast.expr, s: int) -> ast.expr:
+        class _T(ast.NodeTransformer):
+            def visit_Name(self, n: ast.Name):
+                if n.id in varying and ready.get(n.id, 0) < s:
+                    return _name(delayed(n.id, s - ready.get(n.id, 0)))
+                return n
+        return _T().visit(copy.deepcopy(e))
+    for x in varying:
+        rng.setdefault(x, known.get(x, (0, 0)))
+    out = []
+    for s in code.out:
+        t = s.targets[0].id
+        out.append(_assign(t, at(s.value, ready[t])))
+    last = max([0] + list(ready.values()))
+    for w in code.writes:
+        w.clock = max(ready.get(w.addr, 0), ready.get(w.data, 0), ready.get(w.cond, 0) if w.cond else 0)
+        w.addr, w.data = (delayed(w.addr, w.clock - ready.get(w.addr, 0)),
+                          delayed(w.data, w.clock - ready.get(w.data, 0)))
+        if w.cond:
+            w.cond = delayed(w.cond, w.clock - ready.get(w.cond, 0))
+        last = max(last, w.clock)
+    for s in code.sites:
+        s.clock = ready[s.addr]
+    code.out = out
+    code.clocks = last + 1
+    code.pipe = {"counter": cnt, "n": n_iter, "regs": regs, "formats": formats,
+                 "stage": {v: ready.get(code.env[v], 0) for v in code.env}}
+    return True

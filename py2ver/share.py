@@ -1458,9 +1458,9 @@ def simulate(info: Dict[str, Any], model, args: Tuple[Any, ...], state: Tuple[An
     the function's own arguments; returns its outputs after the last clock.
     ROMs and register files are modelled as the hardware has them.
     """
-    regs = {r: 0 for r in info["regs"]}
+    regs = {r: info.get("reg_init", {}).get(r, 0) for r in info["regs"]}
     extra = {q: 0 for q in info["extra_params"]}
-    mems = {q: [0] * rf["depth"] for q, rf in info["rfs"].items()}
+    mems = {q: list(rf.get("init") or [0] * rf["depth"]) for q, rf in info["rfs"].items()}
     n_regs, n_ret = len(regs), len(info["extra_returns"])
     out = None
     for p in range(info["phases"]):

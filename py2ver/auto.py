@@ -420,7 +420,17 @@ def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]
     ranges: Dict[str, _Range] = {}
 
     def record(name: str, value: Any) -> None:
-        ranges.setdefault(name, _Range()).add(value)
+        r = ranges.get(name)
+        if r is None:
+            r = ranges[name] = _Range()
+        if type(value) is float:                  # (the common case, fast)
+            r.is_float = True
+            if value < r.lo:
+                r.lo = value
+            if value > r.hi:
+                r.hi = value
+        else:
+            r.add(value)
 
     _, order, returned = run_float(func, samples, attr, record)
     params = list(inspect.signature(func).parameters)
