@@ -232,6 +232,66 @@ def _writes_all(loop: Loop, name: str, n: int, limit: int = 1 << 20) -> bool:
     return seen >= set(range(n))
 
 
+# ==================================================================== lanes
+
+def _products(stmts: List[ast.stmt]) -> bool:
+    """Does the code multiply two computed values (not a value by a constant)?"""
+    return any(isinstance(n, ast.BinOp) and isinstance(n.op, ast.Mult)
+               and not isinstance(n.left, ast.Constant) and not isinstance(n.right, ast.Constant)
+               for s in stmts for n in ast.walk(s))
+
+
+def _writes_lists(stmts: List[ast.stmt]) -> bool:
+    return any(isinstance(t, ast.Subscript) for s in stmts for n in ast.walk(s)
+               if isinstance(n, (ast.Assign, ast.AugAssign))
+               for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))
+
+
+def _unrolled(items, lanes: int) -> List[Union[Block, Loop]]:
+    """
+    Innermost loops of one block that multiply computed values and write no
+    list (a matrix product's multiply-accumulates) run `lanes` iterations at a
+    time: the body is written once per lane, lane u with the loop variable +
+    u steps, and the loop steps over lanes iterations. The copies run in order,
+    so a value carried through them (acc = acc + x[i] * w[i]) is computed as
+    Python computes it; each lane reads through ports of its own. The lanes
+    divide the loop's length (a loop of 10 asked for 4 runs on 2).
+    """
+    out: List[Union[Block, Loop]] = []
+    for it in items:
+        if isinstance(it, Loop):
+            body = it.body
+            if len(body) == 1 and isinstance(body[0], Block) and _products(body[0].stmts) \
+                    and not _writes_lists(body[0].stmts) and len(it.values) > 1:
+                n = len(it.values)
+                k = max(d for d in range(1, lanes + 1) if n % d == 0)
+                step = it.values[1] - it.values[0]
+                if k > 1:
+                    stmts = []
+                    for u in range(k):
+                        for st in body[0].stmts:
+                            stmts.append(_shifted(st, it.var, u * step))
+                    out.append(Loop(it.var, it.values[::k], [Block(stmts)]))
+                    continue
+            it.body = _unrolled(body, lanes)
+        out.append(it)
+    return out
+
+
+def _shifted(stmt: ast.stmt, var: str, d: int) -> ast.stmt:
+    """stmt with the loop variable var read as var + d."""
+    stmt = copy.deepcopy(stmt)
+    if d == 0:
+        return stmt
+
+    class _S(ast.NodeTransformer):
+        def visit_Name(self, n: ast.Name):
+            if n.id == var and isinstance(n.ctx, ast.Load):
+                return ast.BinOp(left=n, op=ast.Add(), right=ast.Constant(d))
+            return n
+    return _S().visit(stmt)
+
+
 # ==================================================================== intervals
 
 class _Ranges:
@@ -354,12 +414,14 @@ class _Seq:
 
 
 def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, Any],
-             pipelined: bool = True) -> Tuple[ast.Module, Dict[str, Any]]:
+             pipelined: bool = True, lanes: int = 1) -> Tuple[ast.Module, Dict[str, Any]]:
     """
     Build the module's first function (lowered integer code with for-range
     loops) as a state machine; returns (tree, info) in share.py's form, or
     info['phases'] == 1 if it has no loops to sequence. pipelined: innermost
     loops start an iteration every clock where they can (see pipeline_block).
+    lanes: multiply-accumulate loops run that many iterations at a time (see
+    _unrolled).
     """
     from .visitor import _Desugar
     fd = _Desugar().visit(copy.deepcopy(tree.body[0]))
@@ -368,10 +430,10 @@ def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, An
     program = st.seq(fd.body)
     if not any(isinstance(it, Loop) for it in program):
         return tree, {"phases": 1}
-    return _build(sq, program, attr, ns, pipelined)
+    return _build(sq, program, attr, ns, pipelined, lanes)
 
 
-def _build(sq: _Seq, program, attr, ns, pipelined: bool = True):
+def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
     params = sq.params
     inputs = set(params)
     # Number the blocks and loops in program order
@@ -405,6 +467,8 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True):
     # A list in block RAM made by [c] * n: filled by a loop, unless the loop after
     # it writes every element before anything reads it
     program = _allocations(program, rams, sq)
+    if lanes > 1:
+        program = _unrolled(program, lanes)
     blocks, loops = [], []
     for it in _walk_items(program):
         if isinstance(it, Block):

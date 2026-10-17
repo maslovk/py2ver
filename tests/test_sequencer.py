@@ -224,3 +224,43 @@ def test_step_by_step_units_in_hardware(monkeypatch, tmp_path):
     p = Py2ver(roots, X16, sequential=True)
     vectors = [(_vec(),) for _ in range(5)]
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+# ----------------------------- lanes: several multiply-accumulates a clock -----------------------------
+
+def test_lanes_run_iterations_side_by_side():
+    fe = front_end(mlp, X16)
+    ns = _namespace(mlp)
+    clocks = {}
+    for lanes in (1, 2, 3, 4):
+        tree, info = sequence(fe.tree, fe.attr, ns, lanes=lanes)
+        clocks[lanes] = info["phases"]
+        model = build_model(tree, dict(fe.attr, **info["attr"]), ns)
+        for _ in range(10):
+            x = _vec()
+            assert simulate(info, model, (x,)) == mlp(x)
+    # 16 products a sum: 2 lanes halve it, 3 run as 2 (16 doesn't split in 3)
+    assert clocks[1] > clocks[2] == clocks[3] > clocks[4]
+
+
+@pytest.mark.sim
+def test_lanes_in_hardware_with_stalls(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(mlp, X16, sequential=True, multipliers=2)
+    assert "read by" in (tmp_path / "hdl" / "main.v").read_text()   # (one dual-port ROM)
+    vectors = [(_vec(),) for _ in range(6)]
+    expected = p.PY_batch()(vectors)
+    assert p.TB_batch()(vectors) == expected
+    assert p.TB_handshake()(vectors, valid=0.6, ready=0.5, seed=3) == expected
+
+
+def test_a_rate_chooses_the_lanes(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    import contextlib
+    import io
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        p = Py2ver(mlp, X16, sequential=True, rate=50e6 / 120)
+    assert p.choice.multipliers == 2 and p.ram_phases <= 120
+    assert "multipliers=2" in out.getvalue()
+    with pytest.raises(ValueError, match="at least"):
+        Py2ver(mlp, X16, sequential=True, rate=50e6 / 10)

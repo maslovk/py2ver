@@ -8,8 +8,13 @@
 # in block RAM, softmax's division a bit a clock. Formats are chosen from
 # example images (16 bits).
 #
-#   python examples/digits_hardware.py          # fixed point on the test set, hardware simulated
-#   python examples/digits_hardware.py --syn    # + Quartus area and timing (DE0-Nano's EP4CE22)
+# With --lanes N, the multiply-accumulate loops run N iterations a clock on N
+# multipliers (multipliers=N); 2 lanes still fit the DE0-Nano (two lanes read
+# each weight table through the two ports of one block RAM).
+#
+#   python examples/digits_hardware.py            # fixed point on the test set, hardware simulated
+#   python examples/digits_hardware.py --lanes 2  # two multiply-accumulates a clock
+#   python examples/digits_hardware.py --syn      # + Quartus area and timing (DE0-Nano's EP4CE22)
 import contextlib
 import io
 import os
@@ -30,7 +35,8 @@ if __name__ == "__main__":
 
     t = time.time()
     with contextlib.redirect_stdout(io.StringIO()):
-        p = Py2ver(net.predict, samples=list(D.X_train[:200]), width=16)
+        lanes = int(sys.argv[sys.argv.index("--lanes") + 1]) if "--lanes" in sys.argv else 1
+        p = Py2ver(net.predict, samples=list(D.X_train[:200]), width=16, multipliers=lanes)
     print(f"hardware:    built in {time.time() - t:.0f} s, {p.ram_phases} clocks per image "
           f"({p.ram_phases / 50e6 * 1e3:.2f} ms at 50 MHz)")
 

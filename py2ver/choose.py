@@ -12,6 +12,8 @@ C = clock / R clocks. The smallest structure that finishes in C clocks wins:
   - else: the fewest shared multipliers (multipliers=N) whose schedule fits
   - if no schedule fits (a chain of dependent steps longer than C clocks):
     unrolled, which takes one clock
+  - a sequenced design (sequential=True, or numpy too big to write out): the
+    fewest lanes for its multiply-accumulate loops (choose_lanes)
 
 The choice is printed, like automatically chosen formats.
 """
@@ -146,3 +148,26 @@ def choose(tree: ast.Module, attr: Dict[str, Any], budget: int) -> Choice:
         return Choice("unrolled", 1, budget, why="nothing to share")
     return Choice("multipliers", best[1], budget, multipliers=best[0],
                   why=f"{products} products on {best[0]} multiplier{'s' if best[0] > 1 else ''}")
+
+
+MAX_LANES = 32
+
+
+def choose_lanes(tree: ast.Module, attr: Dict[str, Any], ns: Dict[str, Any],
+                 budget: int) -> Choice:
+    """A sequenced design (sequential=True) for `budget` clocks per sample: the
+    fewest lanes for its multiply-accumulate loops (multipliers=N) that finish in
+    time (see sequencer._unrolled)."""
+    from .sequencer import sequence
+    best = None
+    for lanes in range(1, MAX_LANES + 1):
+        clocks = sequence(tree, attr, ns, lanes=lanes)[1]["phases"]
+        if best is not None and clocks >= best[1]:
+            continue                              # (no loop splits into this many)
+        best = (lanes, clocks)
+        if clocks <= budget:
+            return Choice("multipliers", clocks, budget, multipliers=lanes,
+                          why=f"multiply-accumulate loops on {lanes} lane"
+                              f"{'s' if lanes != 1 else ''}")
+    raise ValueError(f"A sequenced design takes at least {best[1]} clocks per sample "
+                     f"({best[0]} lanes); the rate allows {budget}")

@@ -54,7 +54,7 @@ from .fold import fold_loop
 from .share import ROM_MIN, share
 from .comprehend import expand_comprehensions
 from .control import structure, while_bound
-from .choose import choose
+from .choose import choose, choose_lanes
 from .containers import flatten, nest, scalarize, shapes_of
 from .fixed import (DEFAULT_CONST_BITS, build_model, copy_tree, is_table, lower_fixed, quantize,
                     uses_fixed)
@@ -234,7 +234,8 @@ class Py2ver:
         {'fold', 'unroll', 'pipeline'}} to override the automatic folding.
         multipliers: run the design over several clocks on this many
         shared multipliers, with each function table in block RAM (see
-        share.py).
+        share.py); for a sequenced design, run its multiply-accumulate loops
+        that many iterations at a time.
         sequential: build the loops as they are written, as a state machine
         running a step at a time with large lists in block RAM (see
         sequencer.py), for designs too big to write out.
@@ -305,7 +306,8 @@ class Py2ver:
             if budget < 1:
                 raise ValueError(f"{rate:g} samples/s is more than one sample per clock at "
                                  f"{clock / 1e6:g} MHz")
-            self.choice = choose(tree, attr, budget)
+            self.choice = (choose_lanes(tree, attr, _namespace(func), budget) if sequential
+                           else choose(tree, attr, budget))
             if pipeline and self.choice.kind != "unrolled":
                 raise ValueError(f"pipeline= keeps one sample per clock; {rate:g} samples/s "
                                  f"allows {budget} clocks per sample (drop pipeline=)")
@@ -315,11 +317,12 @@ class Py2ver:
             print(f"py2ver: {rate:g} samples/s at {clock / 1e6:g} MHz leaves {budget} "
                   f"clock{'s' if budget != 1 else ''} per sample: {self.choice}")
         if sequential:
-            if pipeline or multipliers or (fold is not None and fold is not False):
-                raise NotImplementedError("sequential=True can't be combined with fold=, "
-                                          "multipliers= or pipeline=")
+            if pipeline or (fold is not None and fold is not False):
+                raise NotImplementedError("sequential=True can't be combined with fold= or "
+                                          "pipeline=")
             from .sequencer import sequence
-            seq_tree, info = sequence(tree, attr, _namespace(func))
+            # (multipliers=: lanes for the multiply-accumulate loops)
+            seq_tree, info = sequence(tree, attr, _namespace(func), lanes=int(multipliers or 1))
             if info["phases"] > 1:
                 tree, self._fold = seq_tree, info
                 attr = dict(attr, **info["attr"])
@@ -767,23 +770,47 @@ class Py2ver:
 
     @staticmethod
     def _rom_items(roms: Dict[str, Dict[str, Any]], attr: Dict[str, Dict[str, Any]]) -> List[str]:
-        """Function tables in block RAM: q is the entry the index addressed a clock before."""
+        """Function tables in block RAM: q is the entry the index addressed a clock
+        before. Two ports reading the same table share one array (a dual-port ROM:
+        the same block RAM)."""
         items: List[str] = []
+        groups: Dict[Any, List[str]] = {}
         for q, rom in roms.items():
-            entries, w, aw = rom["entries"], int(rom["width"]), int(rom["address_bits"])
-            sig = "signed " if rom["signed"] else ""
-            mask = (1 << w) - 1
-            arr = f"{q}__rom"
-            items.append(f"// Table in block RAM: {len(entries)} x {w} bits")
-            items.append(f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];")
-            items.append(f"reg {sig}[{w - 1}:0] {q};")
-            items.append("initial begin")
-            items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
-            items.append("end")
-            idx = rom["index"]
-            if int(attr.get(idx, {}).get("width", aw + 1)) > aw:      # (the index is never out of range)
-                idx = f"{idx}[{aw - 1}:0]"
-            items.append(f"always @(posedge clk) if (ce) {q} <= {arr}[{idx}];")
+            key = (tuple(rom["entries"]), int(rom["width"]), bool(rom["signed"]))
+            groups.setdefault(key, []).append(q)
+        for qs in groups.values():
+            for pair in (qs[i:i + 2] for i in range(0, len(qs), 2)):
+                rom = roms[pair[0]]
+                entries, w, aw = rom["entries"], int(rom["width"]), int(rom["address_bits"])
+                sig = "signed " if rom["signed"] else ""
+                mask = (1 << w) - 1
+                arr = f"{pair[0]}__rom"
+                ports = " and ".join(pair)
+                items.append(f"// Table in block RAM: {len(entries)} x {w} bits"
+                             + (f", read by {ports}" if len(pair) > 1 else ""))
+                items.append(f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];")
+                items += [f"reg {sig}[{w - 1}:0] {q};" for q in pair]
+                items.append("initial begin")
+                items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+                items.append("end")
+                idxs = []
+                for q in pair:
+                    idx = roms[q]["index"]
+                    if int(attr.get(idx, {}).get("width", aw + 1)) > aw:   # (never out of range)
+                        idx = f"{idx}[{aw - 1}:0]"
+                    idxs.append(idx)
+                if len(pair) == 1:
+                    items.append(f"always @(posedge clk) if (ce) {pair[0]} <= {arr}[{idxs[0]}];")
+                    continue
+                # Two ports: read every clock (with an enable Quartus won't make it one
+                # dual-port ROM), at the address of the last enabled clock while ce is
+                # low, so q holds as with an enable
+                for q, idx in zip(pair, idxs):
+                    items += [f"reg [{aw - 1}:0] {q}__a;",
+                              f"always @(posedge clk) if (ce) {q}__a <= {idx};"]
+                items.append("always @(posedge clk) begin "
+                             + " ".join(f"{q} <= {arr}[ce ? {idx} : {q}__a];"
+                                        for q, idx in zip(pair, idxs)) + " end")
         return items
 
     @staticmethod
