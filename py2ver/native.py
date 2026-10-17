@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Icarus takes about a microsecond per clock and line of the design's Verilog;
 # above this many clock-lines (some seconds) Verilator is worth its compile
 LONG_RUN = 5_000_000
+CHUNK = 4096              # an input vector wider than this is read in parts of this many bits
 
 log = logging.getLogger(__name__)
 
@@ -99,14 +100,25 @@ def testbench(p, mode: Dict[str, Any]) -> str:
     conns += [f".{c}({c})" for c in ("clk", "rst", "ce", "vin") if c in ports]
     if "vout" in {q.name for q in p.ir.outputs}:
         conns.append(".vout(vout)")
-    lines.append(f"  {p.t_name} dut({', '.join(conns)});")
+    # (a port a line: Verilator reads at most 20000 tokens a line)
+    lines.append(f"  {p.t_name} dut(\n    " + ",\n    ".join(conns) + ");")
     fmt = " ".join(["%h"] * len(outs))
     write = f'$fwrite(fout, "{fmt}\\n", {", ".join(f"o_{n}" for n, _ in outs)});'
-    # The next vector, into nxt (applied with <= after the edge that reads the last)
+    # The next vector, into nxt (applied with <= after the edge that reads the last);
+    # a wide one in parts (Verilator reads at most 8192 bits an argument)
+    if iw <= CHUNK:
+        read = ["      if (n > 0) begin got = $fscanf(fin, \"%h\\n\", nxt); n = n - 1; end"]
+    else:
+        lines.append(f"  reg [{CHUNK - 1}:0] part;")
+        read = ["      if (n > 0) begin"]
+        for hi, lo in _chunks(iw):
+            read.append(f"        got = $fscanf(fin, \"%h\", part); nxt[{hi}:{lo}] = part[{hi - lo}:0];")
+        read.append("        n = n - 1;")
+        read.append("      end")
     lines += [
         "  task next_vector;",
         "    begin",
-        "      if (n > 0) begin got = $fscanf(fin, \"%h\\n\", nxt); n = n - 1; end",
+        *read,
         "      else nxt = 0;",
         "    end",
         "  endtask",
@@ -165,6 +177,16 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         lines.append("    end")
     lines += ["  end", "endmodule", ""]
     return "\n".join(x for x in lines if x != "")
+
+
+def _chunks(width: int) -> List[Tuple[int, int]]:
+    """(high, low) bits of a wide input vector's parts, the highest first."""
+    out, hi = [], width - 1
+    while hi >= 0:
+        lo = hi // CHUNK * CHUNK
+        out.append((hi, lo))
+        hi = lo - 1
+    return out
 
 
 def _key(*texts: str) -> str:
@@ -238,7 +260,12 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
             word = 0
             for v, w in zip(vec, widths):
                 word = (word << w) | (int(v) & ((1 << w) - 1))
-            f.write(f"{word:x}\n")
+            iw = max(1, sum(widths))
+            if iw <= CHUNK:
+                f.write(f"{word:x}\n")
+            else:
+                f.write(" ".join(f"{(word >> lo) & ((1 << (hi - lo + 1)) - 1):x}"
+                                 for hi, lo in _chunks(iw)) + "\n")
     out = d / "outputs.hex"
     if out.exists():
         out.unlink()

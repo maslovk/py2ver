@@ -103,8 +103,11 @@ def _returned_names(fd: ast.FunctionDef) -> List[str]:
 _TRACED: Dict[Any, Any] = {}
 
 
-def _traced(func: Callable, record: Callable[[str, Any], None]):
-    """The function, recording every value assigned to a name (and its parameters)."""
+def _traced(func: Callable, record: Callable[[str, Any], None],
+            record_elem: Optional[Callable[[str, Any, Any], None]] = None):
+    """The function, recording every value assigned to a name (and its parameters);
+    an element stored in a list, record_elem(list, the list, the element) (default:
+    record(list, element))."""
     source = inspect.getsource(func)
     key = (func, source)
     if key not in _TRACED:                     # (instrumented once, run many times)
@@ -121,6 +124,7 @@ def _traced(func: Callable, record: Callable[[str, Any], None]):
         return y
 
     ns["__py2ver_trace"] = record
+    ns["__py2ver_trace_elem"] = record_elem or (lambda name, xs, x: record(name, x))
     ns["__py2ver_call"] = call
     exec(code, ns)
     return ns[name], list(names), list(returned), copy.deepcopy(ann)
@@ -155,14 +159,34 @@ def _traced_code(func: Callable, source: str):
             return [t.value.id]
         return []
 
+    def stored(ts: List[ast.expr]) -> List[ast.stmt]:
+        """Traces of assignment targets: an element stored in a list as that element
+        (not the whole list again: a loop filling a long list stays linear)."""
+        out, names = [], []
+        for t in ts:
+            if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) \
+                    and not isinstance(t.slice, ast.Slice):
+                names.append(t.value.id)
+                load = copy.deepcopy(t)
+                for x in ast.walk(load):
+                    if hasattr(x, "ctx"):
+                        x.ctx = ast.Load()
+                out.append(ast.Expr(ast.Call(
+                    func=ast.Name(id="__py2ver_trace_elem", ctx=ast.Load()), keywords=[],
+                    args=[ast.Constant(t.value.id), ast.Name(id=t.value.id, ctx=ast.Load()), load])))
+            else:
+                out += trace(targets(t))
+        trace(names)                               # (in the order of names)
+        return out
+
     class _Trace(ast.NodeTransformer):
         def visit_Assign(self, node):
             self.generic_visit(node)
-            return [node] + trace([n for t in node.targets for n in targets(t)])
+            return [node] + stored(node.targets)
 
         def visit_AugAssign(self, node):
             self.generic_visit(node)
-            return [node] + trace(targets(node.target))
+            return [node] + stored([node.target])
 
         def visit_AnnAssign(self, node):
             self.generic_visit(node)
@@ -221,6 +245,9 @@ def _math_function(f: ast.expr, ns: Dict[str, Any]) -> Optional[Callable]:
         fn = eval(compile(ast.Expression(copy.deepcopy(f)), "<f>", "eval"), dict(ns))
     except Exception:
         return None
+    from .fixed import EXACT_SQRT, is_sqrt
+    if ns.get(EXACT_SQRT) and is_sqrt(fn):
+        return None                                 # (computed exactly)
     if getattr(fn, "__module__", None) == "math" and callable(fn) \
             and getattr(fn, "__name__", "") not in _NO_TABLE:
         return fn
@@ -248,7 +275,12 @@ def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]
         if record is not None:
             record(name, value)
 
-    traced, order, returned, _ = _traced(func, rec)
+    def rec_elem(name: str, xs: Any, x: Any) -> None:
+        last[name] = xs                        # (the list itself: its values at the end)
+        if record is not None:
+            record(name, x)
+
+    traced, order, returned, _ = _traced(func, rec, rec_elem)
     params = list(inspect.signature(func).parameters)
     state = [p for p in params if "next" in attr.get(p, {}) or "memory" in attr.get(p, {})]
     inputs = [p for p in params if p not in state]
@@ -276,7 +308,8 @@ def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]
             # The last value given to the next state (a state reassigned under its
             # own name too; a list updated in place keeps its object otherwise)
             if nxt is not None:
-                values[p] = last.get(nxt, values[p])
+                v = last.get(nxt, values[p])
+                values[p] = list(v) if isinstance(v, list) else v
     return outputs, order, returned
 
 
@@ -416,9 +449,12 @@ def _fmt(r: _Range, int_bits: int, frac: int) -> Dict[str, Any]:
     return out
 
 
-def _table_range(r: _Range) -> Tuple[float, float]:
-    """A table's input range: the arguments seen, rounded outward to 1/16 of the span."""
+def _table_range(r: _Range, margin: int = 0) -> Tuple[float, float]:
+    """A table's input range: the arguments seen, each end's magnitude 2 ** margin
+    times as large (as a value's margin integer bits), rounded outward to 1/16 of
+    the span."""
     lo, hi = r.lo, r.hi
+    lo, hi = (lo * 2 ** margin if lo < 0 else lo), (hi * 2 ** margin if hi > 0 else hi)
     if not lo < hi:
         lo, hi = lo - 0.5, hi + 0.5
     q = 2.0 ** (math.floor(math.log2(hi - lo)) - 4)
@@ -541,7 +577,8 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             f = max(0, fracs[name])
             fmt = _fmt(r, ib, f)
             if name in tables:                       # 'math.sin': {'range', 'bits', format}
-                fmt = dict(range=_table_range(ranges[f"{name}{_TABLE_IN}"]), bits=bits[name], **fmt)
+                fmt = dict(range=_table_range(ranges[f"{name}{_TABLE_IN}"], margin),
+                           bits=bits[name], **fmt)
             elif name in params and r.is_complex:
                 fmt["complex"] = True
             out[name] = dict(base.get(name, {}), **fmt, **extra)

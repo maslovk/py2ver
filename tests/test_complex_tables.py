@@ -155,7 +155,7 @@ def test_auto_formats_for_complex_and_tables(monkeypatch, tmp_path):
     assert attr["x"]["complex"] and attr["lo"]["complex"] and "complex" not in attr["y"]
     vs = [(_rng.uniform(-2, 2),) for _ in range(200)]
     attr = auto_fixed(soft, vs, width=16, max_error=5e-3)
-    assert attr["math.tanh"]["range"] == (-4.0, 4.0)
+    assert attr["math.tanh"]["range"] == (-8.0, 8.0)          # (seen: -4..4; margin 1)
     assert Py2ver(soft, attr).quantization_error(vs)["y"][0] <= 5e-3
 
 

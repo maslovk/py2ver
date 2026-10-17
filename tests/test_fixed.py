@@ -277,3 +277,22 @@ def test_division_by_a_variable(monkeypatch, tmp_path):
     assert p.TB_batch()(vectors) == model
     for (a, b), (got,) in zip(vectors, model):
         assert abs(got - a / b) <= 2 ** -6 * (1 + abs(a / b))
+
+
+def test_model_division_by_zero_and_integer_square_root():
+    from py2ver.fixed import _tdiv, isqrt
+    assert (_tdiv(7, 2), _tdiv(-7, 2), _tdiv(5, 0)) == (3, -3, 0)       # (by 0: 0, as the divider)
+    assert [isqrt(n) for n in (-4, 0, 1, 15, 16, 10 ** 20)] == [0, 0, 1, 3, 4, 10 ** 10]
+
+
+def _reciprocal(b):
+    r = 1.0 / b
+    return r
+
+
+def test_a_constant_divided_by_a_variable_keeps_its_fraction(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    q = {"signed": 1, "width": 16, "frac": 12}
+    p = Py2ver(_reciprocal, {"b": q, "r": dict(q, frac=10)})
+    for b, (got,) in zip((0.19, 1.9, 3.0), p.PY_batch()([(0.19,), (1.9,), (3.0,)])):
+        assert abs(got - 1 / b) < 2 ** -9 * (1 + 1 / b)            # (not truncated to an integer)

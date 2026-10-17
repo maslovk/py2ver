@@ -213,7 +213,7 @@ class Py2ver:
                  template_dir: Path = DEFAULT_TEMPLATE_DIR, pipeline: int = 0,
                  const_bits: int = DEFAULT_CONST_BITS, samples: List[Any] | None = None,
                  width: int | None = None, max_error: Any = None,
-                 round: bool = False, saturate: bool = False,
+                 round: bool = False, saturate: bool = False, margin: int = 1,
                  fold: Any = None, unroll: int = 1,
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
                  multipliers: int | None = None, rate: float | None = None,
@@ -224,8 +224,8 @@ class Py2ver:
         attr (or all of them, without attr) are chosen by auto_fixed() from
         the ranges seen: `width` bits per value (default 16), or the fewest
         bits that keep the outputs within `max_error` of the float function,
-        with `round` / `saturate` added to every chosen format. The chosen attr
-        is printed.
+        with `round` / `saturate` added to every chosen format, and `margin`
+        integer bits above the ranges seen. The chosen attr is printed.
         fold: a loop to run over several clocks instead of unrolling it (its
         variable's name, or True for the longest top-level range loop), with
         `unroll` iterations per clock (see fold.py).
@@ -270,8 +270,14 @@ class Py2ver:
             func = tr.func
         if samples is not None:
             attr = auto_fixed(func, samples, attr, width=width or 16, max_error=max_error,
-                              round=round, saturate=saturate, const_bits=const_bits)
-            lines = "".join(f"    {k!r}: {pprint.pformat(v, sort_dicts=False, width=200)},\n"
+                              round=round, saturate=saturate, margin=margin,
+                              const_bits=const_bits)
+            def shown(v):                    # (a memory's long 'init': its length)
+                if isinstance(v, dict) and isinstance(v.get("init"), list) and len(v["init"]) > 8:
+                    return {k: (_Abbrev(f"<{len(x)} values>") if k == "init" else x)
+                            for k, x in v.items()}
+                return v
+            lines = "".join(f"    {k!r}: {pprint.pformat(shown(v), sort_dicts=False, width=200)},\n"
                             for k, v in attr.items())
             print(f"py2ver: formats chosen for {getattr(func, '__name__', 'the function')}"
                   f" (pass this as attr to keep them):\nattr = {{\n{lines}}}")
@@ -286,6 +292,10 @@ class Py2ver:
         self._complex_names = fe.complex_names
         # Folding: the loop's body runs once per clock (phase) instead of unrolled
         self._fold: Dict[str, Any] | None = None
+        # Memories a sequenced design keeps between samples: name -> {length, width,
+        # signed, init (raw)}; and their contents after the last PY_stream()
+        self._seq_mems: Dict[str, Dict[str, Any]] = {}
+        self._last_memories: Dict[str, List[int]] = {}
         # rate=: the smallest structure that keeps up (fold, multipliers= or unrolled)
         self.choice = None
         if rate is not None:
@@ -313,6 +323,7 @@ class Py2ver:
             if info["phases"] > 1:
                 tree, self._fold = seq_tree, info
                 attr = dict(attr, **info["attr"])
+                self._seq_mems = info["memories"]
                 log.info("Sequenced: %d blocks, %d clocks per sample, %d register file(s), "
                          "%d ROM(s), %d register bits", info["blocks"], info["phases"],
                          len(info["rfs"]), len(info["roms"]), info["register_bits"])
@@ -385,7 +396,8 @@ class Py2ver:
                 )
             self._pipe = pipeline_ir(ir, f_visitor.attr, self.pipeline_stages,
                                      state=self.state_map or None,
-                                     roms=f_visitor.rom_reads if stateless else None)
+                                     roms={k: r for k, r in f_visitor.rom_reads.items() if "entries" in r}
+                                     if stateless else None)
             ir = self._pipe.ir
             f_visitor.attr.clear()
             f_visitor.attr.update(self._pipe.attr)
@@ -619,7 +631,12 @@ class Py2ver:
         if self._fold:
             assigns.append(Assignment(left=fold["phase"], right="__phase"))
             for reg, nxt in fold["regs"].items():
-                assigns.append(Assignment(left=reg, right=f"rst ? 0 : (ce ? {nxt} : {reg})",
+                init = fold.get("reg_init", {}).get(reg, 0)
+                if init:                          # (a memory kept in registers: its 'init')
+                    m = attr.get(reg, {})
+                    w, sgn = int(m.get("width", 1)), int(m.get("signed", 0)) == 1
+                    init = f"{w}'{'s' if sgn else ''}d{init & ((1 << w) - 1)}"
+                assigns.append(Assignment(left=reg, right=f"rst ? {init} : (ce ? {nxt} : {reg})",
                                           is_reg=True))
         roms = fold.get("roms", {})
         rfs = fold.get("rfs", {})
@@ -724,13 +741,21 @@ class Py2ver:
                 raise RuntimeError(f"Can't find the index of table read {name}: {a.right}")
             idx = names.pop()
             w, ab = int(rom["width"]), int(rom["address_bits"])
-            entries = list(rom["entries"])
-            entries += [entries[-1]] * ((1 << ab) - len(entries))
             sig = "signed " if rom.get("signed") else ""
             mask = (1 << w) - 1
             arr = f"{name}__table"
             iw = int(attr.get(idx, attr.get(rom["index"], {})).get("width", ab + 1))
             addr = f"{idx}[{ab - 1}:0]" if iw > ab else idx
+            if "signals" in rom:                  # (a long list argument's ports)
+                sigs = list(rom["signals"])
+                items += [f"// A list argument read by index: {len(sigs)} x {w} bits",
+                          f"wire {sig}[{w - 1}:0] {arr} [0:{(1 << ab) - 1}];"]
+                items += [f"assign {arr}[{k}] = {v};" for k, v in enumerate(sigs)]
+                items += [f"assign {arr}[{k}] = {w}'d0;" for k in range(len(sigs), 1 << ab)]
+                items.append(f"wire {sig}[{w - 1}:0] {name} = {arr}[{addr}];")
+                continue
+            entries = list(rom["entries"])
+            entries += [entries[-1]] * ((1 << ab) - len(entries))
             items += [f"// Table: {len(rom['entries'])} x {w} bits",
                       f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];",
                       "initial begin"]
@@ -776,11 +801,16 @@ class Py2ver:
                     else name
             items += [f"// Register file in block RAM: {depth} x {w} bits",
                       f"(* ramstyle = \"M9K\" *) reg {sig}[{w - 1}:0] {arr} [0:{depth - 1}];",
-                      f"reg {sig}[{w - 1}:0] {q};",
-                      f"integer __i_{arr};",
-                      f"initial for (__i_{arr} = 0; __i_{arr} < {depth}; __i_{arr} = __i_{arr} + 1)"
-                      f" {arr}[__i_{arr}] = {w}'d0;",
-                      "always @(posedge clk) if (ce) begin",
+                      f"reg {sig}[{w - 1}:0] {q};"]
+            if any(rf.get("init", ())):          # (a memory: its starting values)
+                mask = (1 << w) - 1
+                items += ["initial begin"] + [f"  {arr}[{k}] = {w}'d{int(v) & mask};"
+                                              for k, v in enumerate(rf["init"])] + ["end"]
+            else:
+                items += [f"integer __i_{arr};",
+                          f"initial for (__i_{arr} = 0; __i_{arr} < {depth}; __i_{arr} = __i_{arr} + 1)"
+                          f" {arr}[__i_{arr}] = {w}'d0;"]
+            items += ["always @(posedge clk) if (ce) begin",
                       f"  if ({rf['we']}) {arr}[{addr(rf['waddr'])}] <= {rf['wdata']};",
                       f"  {q} <= {arr}[{addr(rf['raddr'])}];",
                       "end"]
@@ -934,6 +964,10 @@ class Py2ver:
             # Stream mode: outputs are combinational in (inputs, state) and are
             # sampled every clock before the state registers update.
             return 0, {n: 0 for n in self.output_args_list}
+        if self._fold:
+            # Several clocks per sample (pre_step), its registers in loops: the
+            # results are there a clock after the last
+            return 1, {n: 1 for n in self.output_args_list}
         per_sig = self._compute_latencies()
         per_out = {n: int(per_sig.get(n, 0)) for n in self.output_args_list}
         cycles = max(per_out.values(), default=0)
@@ -1653,7 +1687,7 @@ class Py2ver:
         fixed-point design, its bit-exact model's), wrapped to each output's
         declared width and sign (int() truncates /).
         """
-        if self.state_map or self.rams:
+        if self.state_map or self.rams or self._seq_mems:
             raise ValueError("This design has state ('next' or 'memory' in attr); use PY_stream().")
         func = self._model or self._original()
         return [self._py_row(func(*self._py_args(vec))) for vec in vectors]
@@ -1683,13 +1717,27 @@ class Py2ver:
                                self.output_args_width_list)
         )
 
-    def state_values(self, row: Tuple[Any, ...]) -> Dict[str, Any]:
+    def state_values(self, row: Tuple[Any, ...] | None = None) -> Dict[str, Any]:
         """
         numpy designs with state: the object's attributes in one result row
         of PY_stream() / TB_stream(), as arrays of their shapes (e.g. the
-        weights after a hardware training step): {'W1': array, ...}.
+        weights after a hardware training step): {'W1': array, ...}. A
+        sequenced design keeps its state in memories, not in its results:
+        without a row, the state after the last PY_stream(), as
+        {(object, attribute): array or number} (the object the original's).
         """
         import numpy as np
+        if row is None and self._numpy is not None and getattr(self._numpy, "memories", None):
+            if not self._last_memories:
+                raise ValueError("Run PY_stream() first")
+            out = {}
+            for mem, (label, init, owner) in self._numpy.memories.items():
+                frac = self._fx_frac(mem)
+                raw = self._last_memories[mem]
+                vals = [v / (1 << frac) if frac is not None else v for v in raw]
+                out[(owner, label.split(".")[1])] = (np.array(vals, dtype=float).reshape(np.shape(init))
+                                                     if isinstance(init, np.ndarray) else vals[0])
+            return out
         if self._numpy is None or not self._numpy.state:
             raise ValueError("Only for a numpy design with state")
         out, i = {}, len(self.output_args_list) - sum(v.size for v in self._numpy.state.values())
@@ -1718,7 +1766,7 @@ class Py2ver:
         Per output: (max abs error, RMS error) of the bit-exact results
         (PY_batch / PY_stream, which the hardware matches) against PY_float().
         """
-        stream = bool(self.state_map or self.rams)
+        stream = bool(self.state_map or self.rams or self._seq_mems)
         exact = (self.PY_stream() if stream else self.PY_batch())(vectors)
         ideal = self.py_float_fun(vectors)
         out: Dict[str, Tuple[float, float]] = {}
@@ -1872,7 +1920,7 @@ class Py2ver:
 
     def tb_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
         """Simulate all input vectors in a single cocotb run, one result per vector."""
-        if self.state_map or self.rams:
+        if self.state_map or self.rams or self._seq_mems:
             raise ValueError(
                 "This design has state ('next' or 'memory' in attr); use TB_stream()."
             )
@@ -1928,7 +1976,8 @@ class Py2ver:
         model = self._model is not None
         func = self._model if model else self._original()
         py = (lambda name: name) if model else (lambda name: self._py_name.get(name, name))  # noqa: E731
-        params = list(inspect.signature(func).parameters)
+        params = [p for p in inspect.signature(func).parameters
+                  if p not in {py(m) for m in self._seq_mems}]
         if params != [py(p) for p, _ in self.arg_groups]:
             raise ValueError(f"PY_stream() needs arguments {list(groups)}; function has {params}")
         inputs = [p for p, _ in self.arg_groups
@@ -1955,6 +2004,8 @@ class Py2ver:
             vals = list(init) if isinstance(init, (list, tuple)) else [init] * ram["length"]
             w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
             rams[mem] = [self._wrap(int(v), w, sgn) for v in vals]
+        # (a sequenced design's memories: their raw 'init', wrapped as kept)
+        mems = {mem: list(m["init"]) for mem, m in self._seq_mems.items()}
         outs: List[Tuple[Any, ...]] = []
         for sample in samples:
             args = self._expand(sample if isinstance(sample, tuple) else (sample,))
@@ -1962,15 +2013,19 @@ class Py2ver:
             for p in inputs[len(args):]:                     # missing trailing args: 0
                 kwargs[p] = 0 if groups[p] is None else [0] * len(groups[p])
             kwargs = {p: self._py_value(p, v) for p, v in kwargs.items()}
-            call = {py(k): v for k, v in {**kwargs, **state, **rams}.items()}
+            call = {py(k): v for k, v in {**kwargs, **state, **rams, **mems}.items()}
             ret = _flatten_outputs(func(**call))
             for mem, ram in self.rams.items():
                 w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
                 rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
+            for mem, m in self._seq_mems.items():
+                mems[mem][:] = [self._wrap(int(v), m["width"], bool(m["signed"]))
+                                for v in mems[mem]]
             row = {name: keep(name, v) for name, v in zip(self.output_args_list, ret)}
             outs.append(tuple(row[n] for n in self.output_args_list))
             state = {p: _state_value(p, lambda port: row[self.state_map[port]])
                      for p in self.state_params}
+        self._last_memories = {mem: list(v) for mem, v in mems.items()}
         return outs
 
     def _simulate(self, n_vectors: int, write_tb: Callable[[], None]) -> List[Tuple[int, ...]]:
@@ -2244,6 +2299,12 @@ class Py2ver:
             log.error("quartus_pgm failed: %s", result.stderr)
         else:
             log.info("FPGA programmed successfully ✅")
+
+
+class _Abbrev(str):
+    """Shown as it is by pprint (no quotes)."""
+    def __repr__(self) -> str:
+        return str(self)
 
 
 def _flatten_outputs(ret: Any) -> Tuple[Any, ...]:

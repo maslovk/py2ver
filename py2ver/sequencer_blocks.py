@@ -91,6 +91,7 @@ class BlockCode:
         self.formats: Dict[str, Dict[str, Any]] = {}   # names that wrap to a declared format
         self.rng = rng
         self.extra_regs: Dict[str, Tuple[str, Dict[str, Any]]] = {}   # register -> (next, format)
+        self.reads: Dict[Any, ast.expr] = {}   # (array, address) -> its value (read once)
         for s in block.stmts:
             self.stmt(s, None)
         self.schedule()
@@ -141,6 +142,9 @@ class BlockCode:
         if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Div) \
                 and not isinstance(n.right, ast.Constant):
             return self.divide(n)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) \
+                and n.func.id == "__py2ver_isqrt" and len(n.args) == 1:      # (fixed.ISQRT)
+            return self.sqrt(n.args[0])
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "len" \
                 and len(n.args) == 1 and isinstance(n.args[0], ast.Name) \
                 and n.args[0].id in self.lengths:
@@ -159,6 +163,9 @@ class BlockCode:
         if a in self.inputs:
             return ast.Subscript(value=_name(a), slice=idx, ctx=ast.Load())
         if a in self.rams:
+            key = (a, ast.dump(idx))
+            if key in self.reads:
+                return copy.deepcopy(self.reads[key])
             addr = self.emit(f"{a}_ra", idx)
             data = self.tmp(f"{a}_rd")
             clock = self.ready[addr]
@@ -172,7 +179,9 @@ class BlockCode:
                     if w.cond:
                         test = _and(_name(w.cond), test)
                     value = ast.IfExp(test=test, body=_name(w.data), orelse=value)
-            return _name(self.emit(f"{a}_v", value)) if not isinstance(value, ast.Name) else value
+            value = _name(self.emit(f"{a}_v", value)) if not isinstance(value, ast.Name) else value
+            self.reads[key] = value
+            return value
         elems = self.elements(a)
         try:
             k = ast.literal_eval(idx)
@@ -181,8 +190,9 @@ class BlockCode:
             return _sel([_name(e) for e in elems], idx)
 
     def divide(self, n: ast.BinOp) -> ast.expr:
-        """a / b (truncating) by a variable: a restoring divider, a quotient bit a
-        clock (a combinational divider would set the clock rate on its own)."""
+        """a / b (truncating; 0 for b == 0) by a variable: a restoring divider, a
+        quotient bit a clock (a combinational divider would set the clock rate on
+        its own)."""
         from .share import _interval
         (lo_a, hi_a), (lo_b, hi_b) = (_interval(n.left, self.rng, self.attr),
                                       _interval(n.right, self.rng, self.attr))
@@ -234,18 +244,75 @@ class BlockCode:
         self.formats[qn] = dict(uq, type="wire")
         self.formats[rn] = dict(ur, type="wire")
         self.ready[q] = start + bits + 1
-        out = self.emit("dvq", ast.IfExp(test=_name(neg), body=ast.UnaryOp(op=ast.USub(),
-                                                                          operand=_name(q)),
-                                         orelse=_name(q)))
+        out = self.emit("dvq", ast.IfExp(          # (by 0: 0, as the model)
+            test=_eq(_name(b), 0), body=ast.Constant(0), orelse=ast.IfExp(
+                test=_name(neg), body=ast.UnaryOp(op=ast.USub(), operand=_name(q)),
+                orelse=_name(q))))
         self.ready[out] = start + bits + 1
         return _name(out)
 
+    def sqrt(self, arg: ast.expr) -> ast.expr:
+        """The integer square root (0 below 0), two radicand bits a clock: each
+        step brings the next two bits into the remainder and takes the next
+        bit of the root (the restoring method, like the divider)."""
+        from .share import _interval
+        hi = _interval(arg, self.rng, self.attr)[1]
+        bits = max(2, hi.bit_length())
+        bits += bits % 2
+        steps = bits // 2
+        x = self.emit("sqx", self.expr(arg))
+        start = self.ready[x]
+        xr, rr, qr = (self.sq.fresh(f"r_b{self.k}_{n}") for n in ("sqx", "sqr", "sqq"))
+        here = _eq(_name("st_now"), self.k)
+        load = self.emit("sqload", _and(copy.deepcopy(here), _eq(_name("cyc_now"), start)))
+        step = self.emit("sqstep", _and(copy.deepcopy(here), ast.BoolOp(op=ast.And(), values=[
+            ast.Compare(left=_name("cyc_now"), ops=[ast.Gt()], comparators=[ast.Constant(start)]),
+            ast.Compare(left=_name("cyc_now"), ops=[ast.LtE()],
+                        comparators=[ast.Constant(start + steps)])])))
+        rem_in = self.emit("sqrem", ast.BinOp(
+            left=ast.BinOp(left=_name(rr), op=ast.LShift(), right=ast.Constant(2)), op=ast.BitOr(),
+            right=ast.BinOp(left=ast.BinOp(left=_name(xr), op=ast.RShift(),
+                                           right=ast.Constant(bits - 2)),
+                            op=ast.BitAnd(), right=ast.Constant(3))))
+        trial = self.emit("sqtry", ast.BinOp(
+            left=ast.BinOp(left=_name(qr), op=ast.LShift(), right=ast.Constant(2)), op=ast.BitOr(),
+            right=ast.Constant(1)))
+        ge = self.emit("sqge", ast.Compare(left=_name(rem_in), ops=[ast.GtE()],
+                                          comparators=[_name(trial)]))
+        xn = self.emit("sqxn", ast.IfExp(test=_name(load), body=ast.IfExp(
+            test=ast.Compare(left=_name(x), ops=[ast.Lt()], comparators=[ast.Constant(0)]),
+            body=ast.Constant(0), orelse=_name(x)), orelse=ast.IfExp(
+            test=_name(step), body=ast.BinOp(
+                left=ast.BinOp(left=_name(xr), op=ast.LShift(), right=ast.Constant(2)),
+                op=ast.BitAnd(), right=ast.Constant((1 << bits) - 1)), orelse=_name(xr))))
+        rn = self.emit("sqrn", ast.IfExp(test=_name(load), body=ast.Constant(0), orelse=ast.IfExp(
+            test=_name(step), body=ast.IfExp(test=_name(ge), body=ast.BinOp(
+                left=_name(rem_in), op=ast.Sub(), right=_name(trial)), orelse=_name(rem_in)),
+            orelse=_name(rr))))
+        qn = self.emit("sqqn", ast.IfExp(test=_name(load), body=ast.Constant(0), orelse=ast.IfExp(
+            test=_name(step), body=ast.BinOp(
+                left=ast.BinOp(left=ast.BinOp(left=_name(qr), op=ast.LShift(), right=ast.Constant(1)),
+                               op=ast.BitAnd(), right=ast.Constant((1 << steps) - 1)),
+                op=ast.BitOr(), right=_name(ge)), orelse=_name(qr))))
+        for r, nxt, w in ((xr, xn, bits), (rr, rn, steps + 2), (qr, qn, steps)):
+            meta = {"signed": 0, "width": w}
+            self.extra_regs[r] = (nxt, meta)
+            self.formats[nxt] = dict(meta, type="wire")
+        self.ready[qr] = start + steps + 1
+        out = self.emit("sqq", _name(qr))
+        self.ready[out] = start + steps + 1
+        return _name(out)
+
     def rom(self, entries: Tuple[int, ...], idx: ast.expr) -> ast.expr:
+        key = (entries, ast.dump(idx))
+        if key in self.reads:
+            return copy.deepcopy(self.reads[key])
         addr = self.emit("rom_a", idx)
         data = self.tmp("rom_d")
         clock = self.ready[addr]
         self.sites.append(_Site(entries, addr, data, clock, rom=True))
         self.ready[data] = clock + 1
+        self.reads[key] = _name(data)
         return _name(data)
 
     # ------------------------------------------------------------ statements
@@ -305,6 +372,7 @@ class BlockCode:
         if a in self.inputs:
             raise self.NotSequenceable(f"The argument '{a}' is written")
         if a in self.rams:
+            self.reads = {k: v for k, v in self.reads.items() if k[0] != a}
             addr = self.emit(f"{a}_wa", idx)
             data = self.emit(f"{a}_wd", value)
             self.declare(data, a)
@@ -350,7 +418,7 @@ class BlockCode:
 
 
 def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
-                 DONE, phases, ret, rams, reg_lists, rng, fmt, attr):
+                 DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories=()):
     """The per-clock function (share.py's form) and its info."""
     from .sequencer import Loop, _walk_items
     fd = sq.fd
@@ -420,11 +488,25 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         per = [_name(codes[k].env.get(v, f"r_{v}")) for k in range(n)]
         stmts.append(_assign(f"rn_{v}", next_value(per, _name(f"r_{v}"))))
         regs[f"r_{v}"] = f"rn_{v}"
+    # Memories: their 'init' (raw), wrapped to the format they are kept in
+    reg_init: Dict[str, int] = {}
+    mem_info: Dict[str, Dict[str, Any]] = {}
+    for a in memories:
+        meta = fmt(a)
+        init = attr[a].get("init", 0)
+        init = list(init) if isinstance(init, (list, tuple)) else [init] * sq.lists[a]
+        if len(init) != sq.lists[a]:
+            raise _err(f"'init' of memory '{a}' needs {sq.lists[a]} values")
+        w, sgn = int(meta["width"]), bool(meta["signed"])
+        mem_info[a] = {"length": sq.lists[a], "width": w, "signed": int(sgn),
+                       "init": [_wrap(int(v), w, sgn) for v in init]}
     for a in sorted(reg_lists):
         meta = fmt(a)
         for e in range(sq.lists[a]):
             r = f"r_{a}_{e}"
             reg(r, meta)
+            if a in mem_info and mem_info[a]["init"][e]:
+                reg_init[r] = mem_info[a]["init"][e]
             per = [_name(codes[k].elems[a][e]) if a in codes[k].elems else _name(r)
                    for k in range(n)]
             stmts.append(_assign(f"rn_{a}_{e}", next_value(per, _name(r))))
@@ -495,6 +577,8 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                 new_attr[names["wdata"]] = dict(meta, type="wire")
             new_attr[q] = dict(meta, type="wire")
             rfs[q] = dict(meta, depth=depth, address_bits=ab["width"], raddr=raddr, **names)
+            if a in mem_info:
+                rfs[q]["init"] = mem_info[a]["init"]
             extra_params.append(q)
             extra_returns += [raddr, names["we"], names["waddr"], names["wdata"]]
 
@@ -555,7 +639,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     # (reads of a port's data come first: the data is an input of the clock)
     new_fd = copy.deepcopy(fd)
     new_fd.body = stmts
-    new_fd.args.args = (list(fd.args.args) + [ast.arg(arg=phase)]
+    new_fd.args.args = ([x for x in fd.args.args if x.arg not in mem_info] + [ast.arg(arg=phase)]
                         + [ast.arg(arg=r) for r in reg_names] + [ast.arg(arg=q) for q in extra_params])
     tree = ast.fix_missing_locations(ast.Module(body=[new_fd], type_ignores=[]))
     for r in reg_names:                               # (next-value formats as the registers)
@@ -564,8 +648,13 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             "roms": roms, "rfs": rfs, "extra_params": extra_params,
             "extra_returns": extra_returns, "params": {phase} | set(reg_names) | set(extra_params),
             "attr": new_attr, "register_bits": sum(int(new_attr[r]["width"]) for r in reg_names),
-            "blocks": n, "mul_widths": []}
+            "blocks": n, "mul_widths": [], "memories": mem_info, "reg_init": reg_init}
     return tree, info
+
+
+def _wrap(n: int, w: int, signed: bool) -> int:
+    n &= (1 << w) - 1
+    return n - (1 << w) if signed and n >> (w - 1) else n
 
 
 def _err(msg: str):

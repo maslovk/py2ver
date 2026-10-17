@@ -46,6 +46,11 @@ _INTERNAL = re.compile(r"(cx|fxq)\d+(_re|_im)?$")
 
 
 TABLE_MIN = 16          # a tuple of this many constants is a table: shared, not copied
+# (in a namespace) np.sqrt / math.sqrt computed exactly, as an integer square root
+# of the raw value (ISQRT), not looked up in a table
+EXACT_SQRT = "__py2ver_exact_sqrt__"
+ISQRT = "__py2ver_isqrt"
+SQRT_MIN_FRAC = 8       # fraction bits of an exact square root, at least
 
 
 @functools.lru_cache(maxsize=256)
@@ -590,7 +595,12 @@ class _Lower:
         if isinstance(op, ast.Div):
             if divisor is None and not (isinstance(r, ast.Constant) and isinstance(r.value, (int, float))):
                 # By a variable: the dividend's fraction bits, truncated toward zero
-                # (raw (l << fr) / r), as int(a / b) would on the raw values
+                # (raw (l << fr) / r), as int(a / b) would on the raw values; a
+                # constant dividend has const_bits significant bits (1.0 / x isn't
+                # an integer)
+                if isinstance(l, ast.Constant) and isinstance(l.value, int) and l.value:
+                    k = max(0, self.const_bits - abs(l.value).bit_length())
+                    l, fl = ast.copy_location(ast.Constant(l.value << k), l), fl + k
                 n.left = self._shl(l, fr)
                 return n, FX(fl)
             return self._divide(n, l, fl, divisor)
@@ -684,6 +694,18 @@ class _Lower:
         types = [t for _, t in parts]
         one = len(types) == 1 and not n.keywords
         key = ast.unparse(f)
+        if one and key not in self.tables and self.ns.get(EXACT_SQRT) \
+                and is_sqrt(self._global_value(f)):
+            v, t = parts[0]
+            if t is None:
+                return n, None
+            if t[0] == "l" or t == CPLX:
+                self._err(n, "sqrt() takes one real value")
+            # sqrt(r / 2**fi) * 2**fo == sqrt(r * 2**(2 fo - fi)): fo fraction bits
+            fi = _frac(t) if _is_fx(t) else 0
+            fo = max(fi, SQRT_MIN_FRAC)
+            return ast.Call(func=ast.Name(id=ISQRT, ctx=ast.Load()), keywords=[],
+                            args=[self._shl(v, 2 * fo - fi)]), FX(fo)
         if key in self.tables and parts:
             return self._table(n, key, parts[0][0], parts[0][1])
         if one and (name in ("int", "float") or (is_math and f.attr in ("floor", "ceil"))):
@@ -890,6 +912,16 @@ def _table_entries(fn: Callable, rng: Tuple[Any, Any], bits: int, width: int, si
     return s, start, values
 
 
+def is_sqrt(fn: Any) -> bool:
+    return getattr(fn, "__name__", "") == "sqrt" and getattr(fn, "__module__", None) in ("math",
+                                                                                     "numpy")
+
+
+def isqrt(n: int) -> int:
+    """The integer square root (0 for n <= 0, which has none)."""
+    return math.isqrt(n) if n > 0 else 0
+
+
 def is_table(meta: Any) -> bool:
     return isinstance(meta, dict) and "range" in meta
 
@@ -928,7 +960,10 @@ def lower_fixed(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str,
 # ====================================================================
 
 def _tdiv(a: int, b: int) -> int:
-    """Integer a / b truncated toward zero, like int(a / b) without float rounding."""
+    """Integer a / b truncated toward zero, like int(a / b) without float rounding;
+    0 for b == 0 (as the sequenced divider gives)."""
+    if b == 0:
+        return 0
     q = abs(a) // abs(b)
     return -q if (a < 0) != (b < 0) else q
 
@@ -1001,7 +1036,7 @@ def build_model(tree: ast.Module, attr: Dict[str, Dict[str, Any]],
     fd = _Model().visit(fd)
     module = fix_locations(ast.Module(body=[fd], type_ignores=[]))
     env = dict(ns)
-    env.update(__py2ver_wrap=wrap, __py2ver_tdiv=_tdiv, **{FIT_LIST: fit_list},
+    env.update(__py2ver_wrap=wrap, __py2ver_tdiv=_tdiv, **{FIT_LIST: fit_list, ISQRT: isqrt},
                __py2ver_wrapl=lambda xs, w, s: [wrap(int(x), w, s) for x in xs])
     env.update(dict(tables.values()))
     exec(compile(module, "<py2ver bit-exact model>", "exec"), env)

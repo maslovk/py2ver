@@ -43,6 +43,8 @@ def normalize_attr(attr: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+INPUT_ARRAY_MIN = 64      # a list argument this long, read by index: an array of its ports
+
 # ------------------------------------------------------------
 # Supported binary operators
 # ------------------------------------------------------------
@@ -379,6 +381,9 @@ class FunctionVisitor(ast.NodeVisitor):
         """elems[idx] for a variable idx: a balanced mux tree (a ROM if elems are constants)."""
         idx = self._temp(self.visit(idx_node))
         keys = self._index_keys(idx, len(elems))
+        array = self._input_array(elems, idx)
+        if array is not None:
+            return array
 
         def tree(part):
             if len(part) == 1:
@@ -388,6 +393,25 @@ class FunctionVisitor(ast.NodeVisitor):
                     f": ({tree(part[mid:])})")
         # Out-of-range indices (an IndexError in Python) read an arbitrary element
         return f"({tree(keys)})"
+
+    def _input_array(self, elems: List[str], idx: str) -> str | None:
+        """A long list argument read at an index that can't be negative: an array of
+        its ports read by the index (a mux of thousands of inputs as one expression
+        is more than Verilator reads), as a ROM read whose entries are signals."""
+        if len(elems) < INPUT_ARRAY_MIN or self._infer_meta(idx)["signed"] \
+                or not all(e in self.input_args_list for e in elems):
+            return None
+        metas = {(int(m["width"]), int(m["signed"])) for m in map(self._infer_meta, elems)}
+        if len(metas) != 1:
+            return None
+        w, sgn = metas.pop()
+        var = f"__rom{len(self.rom_reads) + 1}"
+        self.attr[var] = {"width": w, "signed": sgn, "type": "wire"}
+        self._declared.add(var)
+        name = self._assign_var(var, idx)
+        self.rom_reads[name] = dict(width=w, signed=sgn, index=idx, signals=list(elems),
+                                    address_bits=max(1, (len(elems) - 1).bit_length()))
+        return name
 
     def _store_index(self, target: ast.Subscript, rhs: str, env: Dict[str, str] | None = None):
         """xs[i] = rhs, at top level (env is None) or into a branch environment."""

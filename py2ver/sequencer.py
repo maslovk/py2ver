@@ -13,7 +13,10 @@ a time:
     loop ends and the next statement follows)
   - loop counters and scalars are registers; small lists are registers too,
     and large ones (RAM_MIN elements or more) are block RAMs; constant tables
-    of ROM_MIN entries or more are ROMs in block RAM
+    of ROM_MIN entries or more are ROMs in block RAM; a memory argument
+    ('memory' in attr) keeps its values from one sample to the next (state:
+    a network's weights while it trains), starting from its 'init'
+  - a division by a variable and an integer square root take a bit a clock
   - a block takes a few clocks: a read from a RAM / ROM gives its value a
     clock after its address, so reads are issued level by level (a read whose
     address needs another read's value waits for it), then everything is
@@ -383,7 +386,13 @@ def _build(sq: _Seq, program, attr, ns):
     ret_block.stmts = ret_block.stmts[:-1]
 
     # ----- which lists are block RAMs, which registers
+    # (a memory argument, 'memory' in attr, is state: a block RAM or registers
+    # that keep their values from one sample to the next, starting from 'init')
+    memories = [p for p in params if "memory" in attr.get(p, {})]
+    inputs -= set(memories)
     returned = {n.id for n in ast.walk(ret) if isinstance(n, ast.Name)}
+    if returned & set(memories):
+        raise NotSequenceable(f"A memory is returned: {sorted(returned & set(memories))}")
     rams = {name for name, n in sq.lists.items()
             if n >= RAM_MIN and name not in inputs and name not in returned}
     reg_lists = {name for name in sq.lists if name not in rams and name not in inputs}
@@ -499,4 +508,4 @@ def _build(sq: _Seq, program, attr, ns):
 
     from .sequencer_blocks import emit_machine
     return emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
-                        DONE, phases, ret, rams, reg_lists, rng, fmt, attr)
+                        DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories)

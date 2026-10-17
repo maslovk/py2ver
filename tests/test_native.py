@@ -112,3 +112,26 @@ def test_tables_are_arrays_any_simulator_reads(monkeypatch, tmp_path):
         monkeypatch.setenv("PY2VER_SIM", "verilator")
         assert p.TB_batch()(samples[:15]) == expected
         assert not list((tmp_path / "native_build").glob("verilator_failed_*"))
+
+
+def picked(xs, i, j):
+    return xs[i] + xs[j], xs[(i + j) % 300]
+
+
+@pytest.mark.sim
+def test_wide_inputs_and_long_lists_read_by_index(monkeypatch, tmp_path):
+    """300 16-bit inputs: the vector is read in parts, and the list read at an index
+    is an array of its ports (both past Verilator's limits otherwise)."""
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(picked, {"xs": dict(I16, length=300), "i": {"signed": 0, "width": 9},
+                        "j": {"signed": 0, "width": 9}})
+    assert "A list argument read by index" in (tmp_path / "hdl" / "main.v").read_text()
+    vectors = [([_rng.randint(-30000, 30000) for _ in range(300)], _rng.randrange(300),
+                _rng.randrange(300)) for _ in range(5)]
+    expected = p.PY_batch()(vectors)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    assert p.TB_batch()(vectors) == expected
+    if shutil.which("verilator"):
+        monkeypatch.setenv("PY2VER_SIM", "verilator")
+        assert p.TB_batch()(vectors) == expected
+        assert not list((tmp_path / "native_build").glob("verilator_failed_*"))

@@ -563,6 +563,8 @@ def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
             return (a, b) if a >= 0 else (-b, -a) if b <= 0 else (0, max(-a, b))
         if fn in ("int", "int_"):                     # (int_: renamed from the keyword)
             return rs[0]
+        if fn == "__py2ver_isqrt":                     # (fixed.ISQRT)
+            return math.isqrt(max(0, rs[0][0])), math.isqrt(max(0, rs[0][1]))
         if fn == "bool":
             return 0, 1
     raise NotShareable(f"Can't bound the values of {ast.unparse(n)}")

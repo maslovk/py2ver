@@ -133,8 +133,10 @@ What the hardware computes:
 - **`/` by a constant**: a power of two only moves the binary point; any
   other constant multiplies by its reciprocal. **By a variable**, the quotient
   keeps the dividend's fraction bits, truncated toward zero (`a / b` is
-  `int((a_raw << fb) / b_raw)` on the raw values); a sequenced design divides a
-  bit per clock, others with a combinational divider.
+  `int((a_raw << fb) / b_raw)` on the raw values; a constant dividend has
+  `const_bits` significant bits, so `1.0 / x` keeps 17 fraction bits); a
+  sequenced design divides a bit per clock (and by 0 gives 0), others with a
+  combinational divider.
 - **Float constants** (literals and module-level floats or tables of floats,
   like filter coefficients) are exact if they fit in `const_bits`
   significant bits, else rounded to that many: `Py2ver(f, attr,
@@ -232,7 +234,9 @@ p = Py2ver(lpf, attr)
 
 It runs the float function on the example inputs, measures the range of
 every parameter and variable, and gives each value that holds floats a
-format with enough integer bits for its range (plus `margin=1`):
+format with enough integer bits for its range (plus `margin=1`), and each
+math function a table over the arguments seen (each end's magnitude `2 **
+margin` times as large):
 
 - `width=W`: every value gets `W` bits (16 for `Py2ver(..., samples=...)`
   unless given); what its integer part leaves over is fraction.
@@ -249,11 +253,15 @@ pass with a `'width'` are kept as they are, and `'next'`, `'init'`,
 format, and states loaded from one another (`d2` from `d1` from `x`) share
 one. Integer inputs get integer formats (just wide enough), integer
 variables keep their exact widths, and float values are signed. `round=True`
-/ `saturate=True` add those options to every chosen format.
+/ `saturate=True` add those options to every chosen format, and `margin=`
+integer bits (1 by default) are added above every range seen (`Py2ver(...,
+samples=..., margin=2)` too).
 
 The ranges come only from the examples, so give inputs that cover the real
 range: a value they never reach can still overflow (add `margin` bits or use
-`saturate=True` if unsure). Trial designs for the search are built in a
+`saturate=True` if unsure). With state that changes over a long run (a
+network's weights and gradients while it trains), the examples should cover
+that run, not just its start. Trial designs for the search are built in a
 temporary directory.
 
 ### State registers (streaming designs)
@@ -430,9 +438,13 @@ machine runs the program a step at a time, for designs far too big to unroll
   clock after their address, so they are issued level by level (a read whose
   address needs another read waits for it); then everything is computed, and
   the registers and the RAMs written (one write per RAM per clock). A division
-  by a variable takes a clock per quotient bit
+  by a variable takes a clock per quotient bit, an exact square root (see
+  below) a clock per two bits of its argument
 - a list in block RAM made by `[0] * n` is filled by a loop, unless the loop
   after it writes every element before anything reads it
+- a memory argument (`'memory'` in attr) is state: its block RAM (or its
+  registers, if it is short) keeps its values from one sample to the next,
+  starting from its `'init'`, and isn't a port
 
 The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
 and register widths come from following the program with intervals, so the
@@ -659,9 +671,16 @@ keeps its loops instead:
   table (an attribute read and never written: trained weights), so `.T`,
   `np.atleast_2d` and constant slices cost nothing; each numpy operation is a
   loop nest writing a new list: `@`, `+ - * / **` and comparisons with
-  broadcasting, `np.exp` / `np.log` / `np.sqrt` / `np.tanh` / ... (tables),
-  `.sum` / `.max` / `.mean` / `.argmax` with `axis` and `keepdims`,
-  `np.maximum` / `np.minimum`, `abs`
+  broadcasting, `np.exp` / `np.log` / `np.tanh` / ... (tables), `np.sqrt`
+  (exact: an integer square root of the raw value), `.sum` / `.max` / `.mean`
+  / `.argmax` with `axis` and `keepdims`, `np.maximum` / `np.minimum`, `abs`
+- elementwise operations are computed where they are used: a chain of them
+  (`m[:] = beta1 * m + (1 - beta1) * g`) is one loop, each operation's
+  result still a variable with a format of its own, as each numpy result
+  would be; work whose result nothing uses is left out
+- an array divided by a computed scalar is multiplied by its reciprocal
+  (computed once), and `c ** n` with a computed integer `n` (Adam's
+  `beta1 ** t`) is the product of the constants `c ** 2 ** k` over `n`'s bits
 - the weight tables get formats like the variables (from their values)
 - the loops are built by the sequencer (see "Sequenced loops")
 
@@ -679,7 +698,52 @@ DE0-Nano's EP4CE22:
 | | test accuracy | logic elements | block RAM | 9-bit multipliers | Fmax | per image |
 |---|---|---|---|---|---|---|
 | numpy (float) | 98.6 % | | | | | |
-| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3457 (15 %) | 275 kbit (45 %) | 6 | 64 MHz | 35,964 clocks: 0.72 ms at 50 MHz |
+| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3064 (14 %) | 270 kbit (44 %) | 6 | 73 MHz | 35,185 clocks: 0.70 ms at 50 MHz |
+
+#### Training: the object's arrays as state
+
+The training step, `net.train_batch(x, y_onehot, lr)` (forward pass,
+backpropagation through the list of layers, Adam), is built the same way, as
+it is. What the method reads and then changes is state:
+
+- the weights and biases and Adam's moments (`p -= ...`, `m[:] = ...`, in
+  place or reassigned) and the step counter `self.t` (`self.t += 1`) become
+  memory arguments of the loop program (`'memory'` in attr, `'init'` the
+  object's values), which the sequencer keeps in block RAM (registers if
+  short) from one step to the next; the counter gets 32 bits
+- attributes written before they are read (`self.x`, `self.mask`,
+  `self.dW`) are variables, and the gradient computed for the layer before
+  the first is never used, so it isn't computed
+- the object itself is left as it is (the check runs on a copy);
+  `p.state_values()` gives the state after the last `PY_stream()` as
+  `{(object, attribute): array}`, to put back on a network
+
+```python
+steps = batches(epochs=3)                                    # [(x, y_onehot, lr)], 32 images each
+train = Py2ver(net.train_batch, samples=steps[:44], width=24, saturate=True, margin=2)
+losses = train.PY_stream()(steps)                            # training in fixed point (bit-exact)
+for (obj, name), value in train.state_values().items():     # the trained weights
+    setattr(obj, name, value)
+train.TB_stream()(steps[:2])                                 # the hardware, simulated
+```
+
+Formats come from a run over the first epoch: activations, gradients and
+Adam's moments grow and shrink as the network learns (activations to 2.7
+times epoch 1's, softmax's `np.exp` arguments to 3 times), so the examples
+should cover training, or `margin=` leave room for it. `examples/digits_training.py` (3 epochs):
+
+| | loss, epochs 1 / 2 / 3 | test accuracy | per step (32 images) |
+|---|---|---|---|
+| numpy (float) | 1.863 / 0.838 / 0.419 | 93.3 % | |
+| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 4,291,843 clocks: 86 ms at 50 MHz |
+
+The bit-exact model trains the three epochs in under 3 minutes; the hardware,
+simulated in Verilator, gives the model's losses bit for bit (2 steps, 72 s).
+
+The state is 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so this
+one is for simulation. The batch's 2,048 inputs are ports: a list argument
+that long read by index is an array of its ports, and the testbench reads
+a vector that wide in parts.
 
 ### Simulation speed (Icarus, Verilator)
 
@@ -933,7 +997,8 @@ fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
 table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained on 4
 shared multipliers and run pipelined in hardware, a 64 -> 128 -> 64 -> 10 numpy
-digit recogniser built with its loops sequenced, a decimate-by-4 filter fed one
+digit recogniser built with its loops sequenced, and its training step with
+Adam (simulated), a decimate-by-4 filter fed one
 sample per handshake, a receiver chain built from plain Python functions, a
 histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
 optionally on the virtual board, in Quartus, or on the real board:
