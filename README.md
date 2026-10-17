@@ -19,8 +19,10 @@ For development, from a clone: `.venv/bin/pip install -e ".[test,hw]"`.
 The `hw` extra (pyserial) is only needed to talk to a physical board.
 
 Simulation also needs [Icarus Verilog](https://steveicarus.github.io/iverilog/)
-(`iverilog`, `vvp`) on `PATH`. The hardware path needs Intel Quartus and a
-DE0-Nano board with a USB-UART adapter.
+(`iverilog`, `vvp`) on `PATH`; with [Verilator](https://www.veripool.org/verilator/)
+installed too, long simulations of large designs run on it (see "Simulation
+speed"). The hardware path needs Intel Quartus and a DE0-Nano board with a
+USB-UART adapter.
 
 ### Example
 
@@ -489,6 +491,9 @@ clocks, and py2ver builds the smallest structure that finishes in time:
 - a loop holding most of the products: that loop folded, onto the fewest
   copies of its body (`unroll`) that finish in time
 - else: the fewest shared multipliers (`multipliers=N`) whose schedule fits
+- a sequenced design (`sequential=True`, or numpy code too big to write out):
+  the fewest lanes for its multiply-accumulate loops (`multipliers=N`, see
+  "Sequenced loops") that finish in time
 
 ```python
 p = Py2ver(fir_step, attr, rate=10e6)
@@ -774,7 +779,7 @@ should cover training, or `margin=` leave room for it. `examples/digits_training
 
 The bit-exact model trains the three epochs in about 3 minutes; the hardware,
 simulated in Verilator, gives the model's losses bit for bit (2 steps). The
-step is now mostly its matrix products, a multiply-accumulate a clock (about
+step is mostly its matrix products, a multiply-accumulate a clock (about
 1.4 million); Adam's division and square root are pipelined, an element a
 clock, for the two large weight matrices. With `multipliers=4` the products
 run four a clock: 631,778 clocks a step (13 ms at 50 MHz).
@@ -1036,11 +1041,12 @@ fixed-point FIR filter from a float model, a biquad filter with automatically
 chosen formats, a complex downconverter, a soft clipper using a `math.tanh`
 table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained on 4
 shared multipliers and run pipelined in hardware, a 64 -> 128 -> 64 -> 10 numpy
-digit recogniser built with its loops sequenced, and its training step with
-Adam (simulated), a decimate-by-4 filter fed one
-sample per handshake, a receiver chain built from plain Python functions, a
-histogram in block RAM, and pipelined SHA-256 rounds). Each checks the hardware against Python in simulation, and
-optionally on the virtual board, in Quartus, or on the real board:
+digit recogniser built with its loops sequenced, on up to 8 lanes, and its
+training step with Adam (simulated), a decimate-by-4 filter fed one sample per
+handshake, a receiver chain built from plain Python functions, a histogram in
+block RAM, and pipelined SHA-256 rounds). Each checks the hardware against
+Python in simulation, and optionally on the virtual board, in Quartus, or on
+the real board:
 
 ```
 python examples/sha256_pipeline.py              # simulation
@@ -1059,7 +1065,7 @@ everything:
 ```
 .venv/bin/python -m pytest -q -n auto -m "not sim and not board"   # no simulator: ~5 s
 .venv/bin/python -m pytest -q -n auto -m "not board"               # + simulation: ~35 s
-.venv/bin/python -m pytest -q -n auto                              # everything: ~1.5 min
+.venv/bin/python -m pytest -q -n auto                              # everything: ~2 min
 .venv/bin/python -m pytest -q -n auto tests/test_share.py          # one feature's tests
 .venv/bin/python -m pytest -q --lf                                 # what failed last time
 QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # + the Quartus tests

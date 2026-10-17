@@ -2,13 +2,14 @@
 # hardware: py2ver builds its training step, net.train_batch, unchanged.
 #
 # The step (forward pass, backpropagation, Adam) runs as loops on a small
-# state machine (sequencer.py), one operation a clock. The weights, the
-# biases and Adam's moments (51,678 numbers) and the step counter self.t are
-# what the method reads and then changes: they are kept in block RAM between
-# steps, starting from the network's values. Adam's beta ** t is a product of
-# constants over t's bits, np.sqrt an exact square root, and divisions take a
-# bit a clock. Formats are chosen from a run over the first epoch (24 bits),
-# with room for the values to grow 4 times as large later on (margin=2).
+# state machine (sequencer.py), each innermost loop pipelined, an iteration a
+# clock. The weights, the biases and Adam's moments (51,678 numbers) and the
+# step counter self.t are what the method reads and then changes: they are
+# kept in block RAM between steps, starting from the network's values. Adam's
+# beta ** t is a product of constants over t's bits, np.sqrt an exact square
+# root, and its divisions and roots are pipelined a bit a stage. Formats are
+# chosen from a run over the first epoch (24 bits), with room for the values
+# to grow 4 times as large later on (margin=2).
 #
 # The state is about 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so
 # this one is for simulation: the bit-exact model trains the network, and the

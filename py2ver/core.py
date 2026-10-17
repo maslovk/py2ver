@@ -240,8 +240,9 @@ class Py2ver:
         running a step at a time with large lists in block RAM (see
         sequencer.py), for designs too big to write out.
         rate: samples per second the design must keep up with at `clock` Hz
-        (default 50 MHz): fold / unroll / multipliers are chosen to fit, as
-        small as possible, and the choice is printed (see choose.py).
+        (default 50 MHz): fold / unroll / multipliers (for a sequenced design,
+        its lanes) are chosen to fit, as small as possible, and the choice is
+        printed (see choose.py).
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
         # numpy / methods: translated into a scalar function first (see numpy_fe.py)

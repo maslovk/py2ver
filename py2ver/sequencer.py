@@ -18,7 +18,12 @@ a time:
     a network's weights while it trains), starting from its 'init'
   - a division by a variable and an integer square root take a bit a clock
   - an innermost loop of one block is pipelined: an iteration a clock, its
-    values carried to later stages by delay registers (pipeline_block)
+    values carried to later stages by delay registers (pipeline_block), a
+    division or a square root in it written out a bit a stage when that saves
+    enough clocks (UNIT_SAVING)
+  - with lanes (multipliers=N), a multiply-accumulate loop runs N iterations
+    at a time, its body once per lane, and a table the lanes read at their own
+    entries is banked, a ROM per lane (_unrolled, _banked)
   - a block takes a few clocks: a read from a RAM / ROM gives its value a
     clock after its address, so reads are issued level by level (a read whose
     address needs another read's value waits for it), then everything is
