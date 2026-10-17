@@ -48,6 +48,9 @@ from .share import _fmt_of, _fmt_range, _hull, _interval, NotShareable
 
 RAM_MIN = 32              # a list this long or longer is a block RAM
 ROM_MIN = 64              # a constant table this long or longer is a ROM
+# A loop with dividers / square roots is pipelined (a register stage per step of
+# each) only if that saves at least this part of a sample's clocks
+UNIT_SAVING = 0.05
 
 
 class NotSequenceable(NotImplementedError):
@@ -431,15 +434,37 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True):
     for lp in loops:
         counters[lp.index] = sq.fresh(f"cnt_{lp.var}")
 
-    def walk(items, scope: Dict[str, str]):
+    scopes: Dict[int, Dict[str, str]] = {}
+    times: Dict[int, int] = {}                     # loop -> how often it runs per sample
+
+    def walk(items, scope: Dict[str, str], n: int):
         for it in items:
             if isinstance(it, Loop):
                 scope[it.var] = counters[it.index]
-                walk(it.body, scope)
+                times[it.index] = n
+                walk(it.body, scope, n * len(it.values))
             else:
-                codes[it.index] = BlockCode(sq, it, dict(scope), rams, reg_lists, inputs, attr,
-                                            rng, ns)
-    walk(program, {})
+                scopes[it.index] = dict(scope)
+                codes[it.index] = BlockCode(sq, it, scopes[it.index], rams, reg_lists, inputs,
+                                            attr, rng, ns)
+    walk(program, {}, 1)
+
+    def clocks_per_sample() -> int:
+        """(a pipelined loop: N + its stages - 1 clocks each time it runs)"""
+        total = 0
+
+        def count(items, n: int):
+            nonlocal total
+            for it in items:
+                if isinstance(it, Block):
+                    total += n * codes[it.index].clocks
+                elif len(it.body) == 1 and isinstance(it.body[0], Block) \
+                        and codes[it.body[0].index].pipe is not None:
+                    total += n * (len(it.values) + codes[it.body[0].index].clocks - 1)
+                else:
+                    count(it.body, n * len(it.values))
+        count(program, 1)
+        return total
 
     # ----- innermost loops of one block: an iteration a clock (see pipeline_block)
     from .sequencer_blocks import pipeline_block
@@ -450,14 +475,35 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True):
         for e in range(sq.lists[a]):
             if a in rng:
                 known[f"r_{a}_{e}"] = rng[a]
-    for code in codes.values():
+
+    def read_ranges(code) -> None:
         for site in code.sites:
             known[site.data] = ((min(site.array), max(site.array)) if site.rom
                                 else rng.get(site.array, (0, 0)))
+    for code in codes.values():
+        read_ranges(code)
+
+    def one_block(lp: Loop) -> bool:
+        return pipelined and len(lp.body) == 1 and isinstance(lp.body[0], Block)
     for lp in loops:
-        if len(lp.body) == 1 and isinstance(lp.body[0], Block) and pipelined:
+        if one_block(lp):
             pipeline_block(codes[lp.body[0].index], counters[lp.index], len(lp.values), known,
                            attr)
+    # A loop that divides or takes square roots: pipelined with them written out a
+    # step a stage (registers for every step), where that saves enough clocks
+    before = clocks_per_sample()
+    for lp in loops:
+        k = lp.body[0].index if one_block(lp) else None
+        if k is None or codes[k].pipe is not None or not codes[k].extra_regs:
+            continue
+        alt = BlockCode(sq, lp.body[0], scopes[k], rams, reg_lists, inputs, attr, rng, ns,
+                        unrolled=True)
+        read_ranges(alt)
+        if pipeline_block(alt, counters[lp.index], len(lp.values), known, attr):
+            n = len(lp.values)
+            saved = times[lp.index] * (n * codes[k].clocks - (n + alt.clocks - 1))
+            if saved >= UNIT_SAVING * before:
+                codes[k] = alt
 
     # ----- the control: successor of each block, how often each runs
     n = len(blocks)
@@ -515,21 +561,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True):
     start_state, start_sets = enter(program[0])
 
     # How many times each block runs, and the clocks of a sample
-    # (a pipelined loop: N + its stages - 1 clocks each time it runs)
-    total = 0
-
-    def count(items, times: int):
-        nonlocal total
-        for it in items:
-            if isinstance(it, Block):
-                total += times * codes[it.index].clocks
-            elif len(it.body) == 1 and isinstance(it.body[0], Block) \
-                    and codes[it.body[0].index].pipe is not None:
-                total += times * (len(it.values) + codes[it.body[0].index].clocks - 1)
-            else:
-                count(it.body, times * len(it.values))
-    count(program, 1)
-    phases = total + 1
+    phases = clocks_per_sample() + 1
 
     from .sequencer_blocks import emit_machine
     return emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,

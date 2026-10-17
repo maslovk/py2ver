@@ -448,9 +448,12 @@ machine runs the program a step at a time, for designs far too big to unroll
   iteration to the next (`acc = acc + x[i] * w[i]`) kept at one stage, so the
   next iteration finds it a clock later. A loop of `N` iterations then takes
   `N + stages - 1` clocks instead of `N * stages` (a matrix product's
-  multiply-accumulates: one a clock instead of one every two). A loop isn't
-  pipelined if it divides or takes a square root (several clocks each), writes
-  a list held in registers, writes one RAM twice, reads a RAM it writes
+  multiply-accumulates: one a clock instead of one every two). A loop that
+  divides or takes square roots is pipelined with them written out a step a
+  stage (a quotient bit, a root bit), a register stage per step, when that
+  saves at least 5 % of a sample's clocks (Adam's update of a large weight
+  matrix: yes; softmax's ten divisions: no). A loop isn't pipelined if it
+  writes a list held in registers, writes one RAM twice, reads a RAM it writes
   anywhere but at the element it writes (a different one each iteration: `m[i]
   = 0.9 * m[i] + g[i]` is fine, `a[i] = a[i - 1] + x[i]` isn't), or carries a
   value through a RAM read
@@ -747,12 +750,13 @@ should cover training, or `margin=` leave room for it. `examples/digits_training
 | | loss, epochs 1 / 2 / 3 | test accuracy | per step (32 images) |
 |---|---|---|---|
 | numpy (float) | 1.863 / 0.838 / 0.419 | 93.3 % | |
-| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 2,878,738 clocks: 58 ms at 50 MHz |
+| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 1,655,826 clocks: 33 ms at 50 MHz |
 
 The bit-exact model trains the three epochs in about 3 minutes; the hardware,
-simulated in Verilator, gives the model's losses bit for bit (2 steps). Most
-of a step's clocks are now Adam's division and square root, a bit a clock for
-each of the 17,226 parameters; the matrix products are pipelined.
+simulated in Verilator, gives the model's losses bit for bit (2 steps). The
+step is now mostly its matrix products, a multiply-accumulate a clock (about
+1.4 million); Adam's division and square root are pipelined, an element a
+clock, for the two large weight matrices.
 
 The state is 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so this
 one is for simulation. The batch's 2,048 inputs are ports: a list argument

@@ -185,3 +185,42 @@ def test_a_deep_pipeline_in_hardware(monkeypatch, tmp_path):
     vectors = [(_vec(),) for _ in range(6)]
     assert p.PY_batch()(vectors) == [(deep(*v),) for v in vectors]
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+import functools                                      # noqa: E402
+from py2ver.fixed import isqrt                        # noqa: E402
+
+__py2ver_isqrt = functools.partial(isqrt)             # (what fixed point lowers np.sqrt to;
+                                                      # not a function, so not inlined)
+
+
+def roots(x):
+    h = [0] * 40
+    for j in range(40):
+        h[j] = x[j % 16] * x[(j + 3) % 16] + 20000
+    s = 0
+    for j in range(40):
+        r = __py2ver_isqrt(h[j] << 4)                    # a root bit a stage
+        s = s + int((h[j] << 6) / (r - x[j % 16]))      # a quotient bit a stage
+    return s
+
+
+def test_loops_with_division_and_square_roots_are_pipelined_step_by_step():
+    fe = front_end(roots, X16)
+    ns = dict(_namespace(roots), int_=int)                 # (int, renamed from the keyword)
+    tree, info = sequence(fe.tree, fe.attr, ns)
+    _, plain = sequence(fe.tree, fe.attr, ns, pipelined=False)
+    assert info["pipelined"] == 2 and info["phases"] < plain["phases"] / 10
+    model = build_model(tree, dict(fe.attr, **info["attr"]), ns)
+    reference = build_model(fe.tree, fe.attr, ns)          # (the loops as written)
+    for _ in range(20):
+        x = _vec()
+        assert simulate(info, model, (x,)) == reference(x)
+
+
+@pytest.mark.sim
+def test_step_by_step_units_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(roots, X16, sequential=True)
+    vectors = [(_vec(),) for _ in range(5)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)

@@ -71,7 +71,7 @@ class BlockCode:
     """One block's statements as the machine's logic."""
 
     def __init__(self, sq, block, scope: Dict[str, str], rams: Set[str], reg_lists: Set[str],
-                 inputs: Set[str], attr, rng, ns) -> None:
+                 inputs: Set[str], attr, rng, ns, unrolled: bool = False) -> None:
         from .sequencer import ROM_MIN, _is_table, _list_elements, NotSequenceable
         self.NotSequenceable = NotSequenceable
         self._is_table, self._list_elements, self.ROM_MIN = _is_table, _list_elements, ROM_MIN
@@ -93,6 +93,10 @@ class BlockCode:
         self.extra_regs: Dict[str, Tuple[str, Dict[str, Any]]] = {}   # register -> (next, format)
         self.reads: Dict[Any, ast.expr] = {}   # (array, address) -> its value (read once)
         self.pipe: Optional[Dict[str, Any]] = None    # set by pipeline_block
+        # unrolled: dividers and square roots written out a step per stage (for a
+        # pipelined loop: a step's results are a stage after its inputs, `bumped`)
+        self.unrolled = unrolled
+        self.bumped: Set[str] = set()
         for s in block.stmts:
             self.stmt(s, None)
         self.schedule()
@@ -101,11 +105,27 @@ class BlockCode:
     def tmp(self, base: str) -> str:
         return self.sq.fresh(f"b{self.k}_{base}")
 
-    def emit(self, base: str, value: ast.expr) -> str:
+    def emit(self, base: str, value: ast.expr, bump: bool = False) -> str:
         name = self.tmp(base)
         self.out.append(_assign(name, value))
-        self.ready[name] = self.when(value)
+        self.ready[name] = self.when(value) + (1 if bump else 0)
+        if bump:
+            self.bumped.add(name)
         return name
+
+    def steps(self, base: str, regs: Dict[str, Tuple[str, int]], step, n: int) -> Dict[str, str]:
+        """A unit written out step by step (unrolled): regs maps each of its values
+        to (its first value, width); step(values) gives their next values (ast);
+        each step's values are a stage after the step before."""
+        cur = {k: v for k, (v, _) in regs.items()}
+        for _ in range(n):
+            nxt = step(cur)
+            new = {}
+            for k, e in nxt.items():
+                new[k] = self.emit(f"{base}{k}", e, bump=True)
+                self.formats[new[k]] = {"signed": 0, "width": regs[k][1], "type": "wire"}
+            cur = new
+        return cur
 
     def when(self, node: ast.expr) -> int:
         return max([0] + [self.ready.get(n.id, 0) for n in ast.walk(node)
@@ -201,6 +221,8 @@ class BlockCode:
         bbits = max(1, max(abs(lo_b), abs(hi_b)).bit_length())
         a = self.emit("dva", self.expr(n.left))
         b = self.emit("dvb", self.expr(n.right))
+        if self.unrolled:
+            return self.divide_steps(a, b, bits, bbits)
         start = max(self.ready[a], self.ready[b])
         absa = self.emit("dvA", ast.IfExp(test=ast.Compare(left=_name(a), ops=[ast.Lt()],
                                                             comparators=[ast.Constant(0)]),
@@ -252,6 +274,76 @@ class BlockCode:
         self.ready[out] = start + bits + 1
         return _name(out)
 
+    def divide_steps(self, a: str, b: str, bits: int, bbits: int) -> ast.expr:
+        """The divider written out, a quotient bit a stage."""
+        def neg_of(x):
+            return ast.Compare(left=_name(x), ops=[ast.Lt()], comparators=[ast.Constant(0)])
+
+        def absolute(x):
+            return ast.IfExp(test=neg_of(x), body=ast.UnaryOp(op=ast.USub(), operand=_name(x)),
+                             orelse=_name(x))
+        absa, absb = self.emit("dvA", absolute(a)), self.emit("dvB", absolute(b))
+        neg = self.emit("dvn", ast.Compare(left=neg_of(a), ops=[ast.NotEq()],
+                                          comparators=[neg_of(b)]))
+        zero = self.emit("dvz", _eq(_name(b), 0))
+        mask = (1 << bits) - 1
+
+        def step(v):
+            rem_in = ast.BinOp(left=ast.BinOp(left=_name(v["r"]), op=ast.LShift(), right=ast.Constant(1)),
+                               op=ast.BitOr(), right=ast.BinOp(
+                                   left=ast.BinOp(left=_name(v["q"]), op=ast.RShift(),
+                                                  right=ast.Constant(bits - 1)),
+                                   op=ast.BitAnd(), right=ast.Constant(1)))
+            rem = self.emit("dvi", rem_in)
+            ge = self.emit("dvg", ast.Compare(left=_name(rem), ops=[ast.GtE()],
+                                             comparators=[_name(absb)]))
+            return {"q": ast.BinOp(left=ast.BinOp(left=ast.BinOp(left=_name(v["q"]), op=ast.LShift(),
+                                                                 right=ast.Constant(1)),
+                                                  op=ast.BitAnd(), right=ast.Constant(mask)),
+                                   op=ast.BitOr(), right=_name(ge)),
+                    "r": ast.IfExp(test=_name(ge), body=ast.BinOp(left=_name(rem), op=ast.Sub(),
+                                                                 right=_name(absb)),
+                                   orelse=_name(rem))}
+        r0 = self.emit("dvr", ast.Constant(0))
+        q = self.steps("dv", {"q": (absa, bits), "r": (r0, bbits + 1)}, step, bits)["q"]
+        return _name(self.emit("dvq", ast.IfExp(test=_name(zero), body=ast.Constant(0),
+                                               orelse=ast.IfExp(test=_name(neg), body=ast.UnaryOp(
+                                                   op=ast.USub(), operand=_name(q)),
+                                                   orelse=_name(q)))))
+
+    def sqrt_steps(self, x: str, bits: int) -> ast.expr:
+        """The square root written out, a root bit (two radicand bits) a stage."""
+        steps = bits // 2
+        x0 = self.emit("sqX", ast.IfExp(test=ast.Compare(left=_name(x), ops=[ast.Lt()],
+                                                         comparators=[ast.Constant(0)]),
+                                        body=ast.Constant(0), orelse=_name(x)))
+
+        def step(v):
+            rem = self.emit("sqi", ast.BinOp(
+                left=ast.BinOp(left=_name(v["r"]), op=ast.LShift(), right=ast.Constant(2)),
+                op=ast.BitOr(), right=ast.BinOp(left=ast.BinOp(left=_name(v["x"]), op=ast.RShift(),
+                                                               right=ast.Constant(bits - 2)),
+                                                op=ast.BitAnd(), right=ast.Constant(3))))
+            trial = self.emit("sqt", ast.BinOp(
+                left=ast.BinOp(left=_name(v["q"]), op=ast.LShift(), right=ast.Constant(2)),
+                op=ast.BitOr(), right=ast.Constant(1)))
+            ge = self.emit("sqg", ast.Compare(left=_name(rem), ops=[ast.GtE()],
+                                             comparators=[_name(trial)]))
+            return {"x": ast.BinOp(left=ast.BinOp(left=_name(v["x"]), op=ast.LShift(),
+                                                  right=ast.Constant(2)),
+                                   op=ast.BitAnd(), right=ast.Constant((1 << bits) - 1)),
+                    "r": ast.IfExp(test=_name(ge), body=ast.BinOp(left=_name(rem), op=ast.Sub(),
+                                                                 right=_name(trial)),
+                                   orelse=_name(rem)),
+                    "q": ast.BinOp(left=ast.BinOp(left=ast.BinOp(left=_name(v["q"]), op=ast.LShift(),
+                                                                 right=ast.Constant(1)),
+                                                  op=ast.BitAnd(), right=ast.Constant((1 << steps) - 1)),
+                                   op=ast.BitOr(), right=_name(ge))}
+        z = self.emit("sqz", ast.Constant(0))
+        q = self.steps("sq", {"x": (x0, bits), "r": (z, steps + 2), "q": (z, steps)}, step,
+                       steps)["q"]
+        return _name(self.emit("sqq", _name(q)))
+
     def sqrt(self, arg: ast.expr) -> ast.expr:
         """The integer square root (0 below 0), two radicand bits a clock: each
         step brings the next two bits into the remainder and takes the next
@@ -262,6 +354,8 @@ class BlockCode:
         bits += bits % 2
         steps = bits // 2
         x = self.emit("sqx", self.expr(arg))
+        if self.unrolled:
+            return self.sqrt_steps(x, bits)
         start = self.ready[x]
         xr, rr, qr = (self.sq.fresh(f"r_b{self.k}_{n}") for n in ("sqx", "sqr", "sqq"))
         here = _eq(_name("st_now"), self.k)
@@ -802,7 +896,7 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
             ready[f"r_{v}"] = ready.get(code.env[v], 0)
         for s in code.out:
             t = s.targets[0].id
-            ready[t] = stage(s.value)
+            ready[t] = stage(s.value) + (1 if t in code.bumped else 0)
             if t in data_of:
                 ready[data_of[t]] = ready[t] + 1
         if ready == before:

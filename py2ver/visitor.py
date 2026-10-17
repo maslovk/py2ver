@@ -1059,6 +1059,8 @@ class FunctionVisitor(ast.NodeVisitor):
             if fn == "abs" and len(args) == 1:
                 x = args[0]
                 return f"((({x}) < 0) ? (-({x})) : ({x}))"
+            if fn in ("int", "int_") and len(args) == 1:
+                return args[0]                 # (of an integer, here: itself)
             if fn in ("min", "max") and len(args) >= 2:
                 op = "<" if fn == "min" else ">"
                 acc = args[0]
