@@ -239,15 +239,53 @@ def test_lanes_run_iterations_side_by_side():
         for _ in range(10):
             x = _vec()
             assert simulate(info, model, (x,)) == mlp(x)
+        if lanes in (2, 3):     # (W banked: each lane a ROM of the rows it reads, W once in all)
+            assert sum(len(r["entries"]) for r in info["roms"].values()) == len(W)
     # 16 products a sum: 2 lanes halve it, 3 run as 2 (16 doesn't split in 3)
     assert clocks[1] > clocks[2] == clocks[3] > clocks[4]
 
 
+def mlp_t(x):
+    h = [0] * 8
+    for j in range(8):
+        acc = 0
+        for i in range(15, -1, -1):                     # (backwards, W by rows)
+            acc = acc + x[i] * W[j * 16 + i]
+        h[j] = acc
+    return h
+
+
+def mlp_masked(x):
+    h = [0] * 8
+    for j in range(8):
+        acc = 0
+        for i in range(16):
+            acc = acc + x[i] * W[(i * 8 + j) & 127]     # (not a sum of loop variables)
+        h[j] = acc
+    return h
+
+
+@pytest.mark.parametrize("f, copies", [(mlp_t, 1), (mlp_masked, 2)])
+def test_tables_are_banked_where_the_lanes_read_their_own_entries(f, copies):
+    fe = front_end(f, X16)
+    ns = _namespace(f)
+    for lanes in (2, 4):     # (on 4, banks of 32 entries: logic, as any short table)
+        tree, info = sequence(fe.tree, fe.attr, ns, lanes=lanes)
+        if lanes == 2:
+            assert sum(len(r["entries"]) for r in info["roms"].values()) == copies * len(W)
+        model = build_model(tree, dict(fe.attr, **info["attr"]), ns)
+        for _ in range(10):
+            x = _vec()
+            assert simulate(info, model, (x,)) == f(x)
+
+
 @pytest.mark.sim
-def test_lanes_in_hardware_with_stalls(monkeypatch, tmp_path):
+@pytest.mark.parametrize("f, dual", [(mlp, False), (mlp_masked, True)])
+def test_lanes_in_hardware_with_stalls(monkeypatch, tmp_path, f, dual):
     monkeypatch.chdir(tmp_path)
-    p = Py2ver(mlp, X16, sequential=True, multipliers=2)
-    assert "read by" in (tmp_path / "hdl" / "main.v").read_text()   # (one dual-port ROM)
+    p = Py2ver(f, X16, sequential=True, multipliers=2)
+    # (W banked, else read by both lanes through one dual-port ROM)
+    assert ("read by" in (tmp_path / "hdl" / "main.v").read_text()) == dual
     vectors = [(_vec(),) for _ in range(6)]
     expected = p.PY_batch()(vectors)
     assert p.TB_batch()(vectors) == expected

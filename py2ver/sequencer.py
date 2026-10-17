@@ -247,49 +247,162 @@ def _writes_lists(stmts: List[ast.stmt]) -> bool:
                for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))
 
 
-def _unrolled(items, lanes: int) -> List[Union[Block, Loop]]:
+def _unrolled(items, lanes: int, fresh, program=None,
+              outer: Optional[Dict[str, List[int]]] = None) -> List[Union[Block, Loop]]:
     """
     Innermost loops of one block that multiply computed values and write no
     list (a matrix product's multiply-accumulates) run `lanes` iterations at a
-    time: the body is written once per lane, lane u with the loop variable +
-    u steps, and the loop steps over lanes iterations. The copies run in order,
-    so a value carried through them (acc = acc + x[i] * w[i]) is computed as
-    Python computes it; each lane reads through ports of its own. The lanes
-    divide the loop's length (a loop of 10 asked for 4 runs on 2).
+    time: the body is written once per lane, and a new counter j steps over the
+    groups of lanes iterations, lane u reading the loop variable as
+    first + (j * lanes + u) * step. The copies run in order, so a value carried
+    through them (acc = acc + x[i] * w[i]) is computed as Python computes it;
+    each lane reads through ports of its own. The lanes divide the loop's length
+    (a loop of 10 asked for 4 runs on 2). A table each lane reads at its own
+    entries (w[i * 128 + o]) is banked: lane u gets a table of the entries it
+    reads, so the lanes together hold the table once (see _banked).
+    fresh: makes new names; outer: the enclosing loops' values.
     """
+    program = items if program is None else program
+    outer = outer or {}
     out: List[Union[Block, Loop]] = []
     for it in items:
         if isinstance(it, Loop):
             body = it.body
             if len(body) == 1 and isinstance(body[0], Block) and _products(body[0].stmts) \
-                    and not _writes_lists(body[0].stmts) and len(it.values) > 1:
+                    and not _writes_lists(body[0].stmts) and len(it.values) > 1 \
+                    and not _reads_elsewhere(program, it):
                 n = len(it.values)
                 k = max(d for d in range(1, lanes + 1) if n % d == 0)
                 step = it.values[1] - it.values[0]
                 if k > 1:
+                    j = fresh(f"{it.var}_j")
                     stmts = []
                     for u in range(k):
+                        at = _plus(_times(_name(j), k * step), it.values[0] + u * step)
                         for st in body[0].stmts:
-                            stmts.append(_shifted(st, it.var, u * step))
-                    out.append(Loop(it.var, it.values[::k], [Block(stmts)]))
+                            st = _banked(st, it, k, u, j, outer)
+                            stmts.append(_substituted(st, it.var, at))
+                    out.append(Loop(j, list(range(n // k)), [Block(stmts)]))
                     continue
-            it.body = _unrolled(body, lanes)
+            it.body = _unrolled(body, lanes, fresh, program, dict(outer, **{it.var: it.values}))
         out.append(it)
     return out
 
 
-def _shifted(stmt: ast.stmt, var: str, d: int) -> ast.stmt:
-    """stmt with the loop variable var read as var + d."""
-    stmt = copy.deepcopy(stmt)
-    if d == 0:
-        return stmt
+def _reads_elsewhere(items, loop: Loop) -> bool:
+    """Is loop's variable read outside it (other than by loops of their own)?"""
+    for it in items:
+        if it is loop:
+            continue
+        if isinstance(it, Loop):
+            if it.var != loop.var and _reads_elsewhere(it.body, loop):
+                return True
+        elif any(isinstance(n, ast.Name) and n.id == loop.var and isinstance(n.ctx, ast.Load)
+                 for s in it.stmts for n in ast.walk(s)):
+            return True
+    return False
 
+
+def _name(x: str) -> ast.Name:
+    return ast.Name(id=x, ctx=ast.Load())
+
+
+def _times(e: ast.expr, c: int) -> ast.expr:
+    return e if c == 1 else ast.BinOp(left=e, op=ast.Mult(), right=ast.Constant(c))
+
+
+def _plus(e: ast.expr, c: int) -> ast.expr:
+    return e if c == 0 else ast.BinOp(left=e, op=ast.Add(), right=ast.Constant(c))
+
+
+def _substituted(stmt: ast.stmt, var: str, value: ast.expr) -> ast.stmt:
+    """stmt with the variable var read as value."""
     class _S(ast.NodeTransformer):
         def visit_Name(self, n: ast.Name):
             if n.id == var and isinstance(n.ctx, ast.Load):
-                return ast.BinOp(left=n, op=ast.Add(), right=ast.Constant(d))
+                return copy.deepcopy(value)
             return n
-    return _S().visit(stmt)
+    return _S().visit(copy.deepcopy(stmt))
+
+
+def _affine(e: ast.expr, names: Set[str]) -> Optional[Dict[Optional[str], int]]:
+    """e as {name: coefficient, None: constant} over the given names, if it is a sum
+    of those times constants; else None."""
+    if isinstance(e, ast.Name):
+        return {e.id: 1} if e.id in names else None
+    if isinstance(e, ast.Constant) and type(e.value) is int:
+        return {None: e.value}
+    if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub):
+        a = _affine(e.operand, names)
+        return None if a is None else {v: -c for v, c in a.items()}
+    if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Sub)):
+        a, b = _affine(e.left, names), _affine(e.right, names)
+        if a is None or b is None:
+            return None
+        sign = 1 if isinstance(e.op, ast.Add) else -1
+        out = dict(a)
+        for v, c in b.items():
+            out[v] = out.get(v, 0) + sign * c
+        return out
+    if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mult):
+        a, b = _affine(e.left, names), _affine(e.right, names)
+        if a is None or b is None:
+            return None
+        for x, y in ((a, b), (b, a)):
+            if set(x) <= {None}:
+                return {v: c * x.get(None, 0) for v, c in y.items()}
+    return None
+
+
+def _banked(stmt: ast.stmt, loop: Loop, k: int, u: int, j: str,
+            outer: Dict[str, List[int]]) -> ast.stmt:
+    """
+    stmt (lane u of loop on k lanes, its counter j) with each read of a table in
+    block RAM at a index a * i + r (i the loop's variable, a != 0, r a sum of the
+    enclosing loops' variables times constants) made a read of lane u's own
+    table: the entries the lane reads, row j (an iteration of the lanes), column
+    (r - its least value) / g, g the gcd of r's coefficients. The lanes' tables
+    together hold the entries of the table that are read; it is banked if they
+    are no larger than the copies the lanes would read otherwise (a table read by
+    two ports is one block RAM).
+    """
+    names = set(outer) | {loop.var}
+    n, step, first = len(loop.values), loop.values[1] - loop.values[0], loop.values[0]
+
+    class _B(ast.NodeTransformer):
+        def visit_Subscript(self, s: ast.Subscript):
+            self.generic_visit(s)
+            if not (_is_table(s.value) and len(s.value.elts) >= ROM_MIN) \
+                    or isinstance(s.slice, ast.Slice):
+                return s
+            f = _affine(s.slice, names)
+            if f is None or not f.get(loop.var) or any(not outer[v] for v in f if v not in (None, loop.var)):
+                return s
+            a = f.pop(loop.var)
+            c = f.pop(None, 0)
+            f = {v: b for v, b in f.items() if b}
+            g = math.gcd(*f.values()) if f else 1
+            low = c + sum(b * (min(outer[v]) if b > 0 else max(outer[v])) for v, b in f.items())
+            high = c + sum(b * (max(outer[v]) if b > 0 else min(outer[v])) for v, b in f.items())
+            cols = (high - low) // g + 1
+            entries = [e.value for e in s.value.elts]
+            if n * cols > (k + 1) // 2 * len(entries):
+                return s
+            table = []
+            for row in range(n // k):
+                i = first + (row * k + u) * step
+                for col in range(cols):
+                    x = a * i + low + g * col
+                    table.append(entries[x] if 0 <= x < len(entries) else 0)
+            addr: ast.expr = _times(_name(j), cols)
+            for v, b in f.items():
+                addr = ast.BinOp(left=addr, op=ast.Add(), right=_times(_name(v), b // g))
+            addr = _plus(addr, -sum(b // g * (min(outer[v]) if b > 0 else max(outer[v]))
+                                    for v, b in f.items()))
+            return ast.Subscript(value=ast.Tuple(elts=[ast.Constant(x) for x in table],
+                                                 ctx=ast.Load()),
+                                 slice=addr, ctx=ast.Load())
+    return _B().visit(copy.deepcopy(stmt))
 
 
 # ==================================================================== intervals
@@ -468,7 +581,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
     # it writes every element before anything reads it
     program = _allocations(program, rams, sq)
     if lanes > 1:
-        program = _unrolled(program, lanes)
+        program = _unrolled(program, lanes, sq.fresh)
     blocks, loops = [], []
     for it in _walk_items(program):
         if isinstance(it, Block):

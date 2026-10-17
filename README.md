@@ -462,9 +462,13 @@ machine runs the program a step at a time, for designs far too big to unroll
   iterations a clock: the body is written once per lane, each lane with its
   own read ports, the copies in order so a sum carried through them is
   Python's. The lanes divide the loop's length (a loop of 10 asked for 4 runs
-  on 2). Two ports reading one table share its block RAM (a dual-port ROM), so
-  2 lanes cost no more weight memory; more lanes copy the tables. `rate=`
-  picks the fewest lanes that keep up
+  on 2). A table the lanes read at their own entries (`W[i * 128 + o]`, `i`
+  the loop's variable, `o` an outer one's) is banked: each lane gets a ROM of
+  the entries it reads (rows `u`, `u + N`, `u + 2N`, ... of `W`), so the lanes
+  together hold the table once, however many there are. Another table (read
+  at an index that isn't a sum of loop variables times constants) is read by
+  two lanes through the two ports of one block RAM, a copy per two lanes.
+  `rate=` picks the fewest lanes that keep up
 - a memory argument (`'memory'` in attr) is state: its block RAM (or its
   registers, if it is short) keeps its values from one sample to the next,
   starting from its `'init'`, and isn't a port
@@ -722,7 +726,14 @@ DE0-Nano's EP4CE22:
 |---|---|---|---|---|---|---|
 | numpy (float) | 98.6 % | | | | | |
 | hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3084 (14 %) | 270 kbit (44 %) | 6 | 76 MHz | 18,173 clocks: 0.36 ms at 50 MHz |
-| 2 lanes (`multipliers=2`) | the same | 3188 (14 %) | 273 kbit (45 %) | 12 | 72 MHz | 9,661 clocks: 0.19 ms at 50 MHz |
+| 2 lanes (`multipliers=2`) | the same | 3109 (14 %) | 273 kbit (45 %) | 12 | 71 MHz | 9,661 clocks: 0.19 ms at 50 MHz |
+| 4 lanes | the same | 3171 (14 %) | 279 kbit (46 %) | 24 | 67 MHz | 5,405 clocks: 0.11 ms at 50 MHz |
+| 8 lanes | the same | 3310 (15 %) | 287 kbit (47 %) | 48 | 61 MHz | 3,277 clocks: 0.07 ms at 50 MHz |
+
+The weight tables are banked, so lanes cost multipliers, not weight memory
+(the few extra kbit are the activations, a copy per lane's read port). 16
+lanes take 2,213 clocks but reach 48 MHz: a sum is carried through all the
+lanes in a clock, rounded at each, so its additions can't be regrouped.
 
 #### Training: the object's arrays as state
 
@@ -766,7 +777,7 @@ simulated in Verilator, gives the model's losses bit for bit (2 steps). The
 step is now mostly its matrix products, a multiply-accumulate a clock (about
 1.4 million); Adam's division and square root are pipelined, an element a
 clock, for the two large weight matrices. With `multipliers=4` the products
-run four a clock: 632,418 clocks a step (13 ms at 50 MHz).
+run four a clock: 631,778 clocks a step (13 ms at 50 MHz).
 
 The state is 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so this
 one is for simulation. The batch's 2,048 inputs are ports: a list argument

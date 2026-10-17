@@ -9,11 +9,12 @@
 # example images (16 bits).
 #
 # With --lanes N, the multiply-accumulate loops run N iterations a clock on N
-# multipliers (multipliers=N); 2 lanes still fit the DE0-Nano (two lanes read
-# each weight table through the two ports of one block RAM).
+# multipliers (multipliers=N), each lane with its own bank of each weight
+# table (the rows it reads), so the weights take the same block RAM on any
+# number of lanes: 8 lanes fit the DE0-Nano at 3,277 clocks per image.
 #
 #   python examples/digits_hardware.py            # fixed point on the test set, hardware simulated
-#   python examples/digits_hardware.py --lanes 2  # two multiply-accumulates a clock
+#   python examples/digits_hardware.py --lanes 8  # eight multiply-accumulates a clock
 #   python examples/digits_hardware.py --syn      # + Quartus area and timing (DE0-Nano's EP4CE22)
 import contextlib
 import io
