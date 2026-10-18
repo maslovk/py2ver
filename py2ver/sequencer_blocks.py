@@ -593,8 +593,8 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     st, cyc = "r_st", "r_cyc"
     reg(st, bits(DONE + 1))
     # A block's clocks each time it runs (a pipelined loop's block: the whole loop)
-    run = {k: (codes[k].pipe["n"] + codes[k].clocks - 1 if codes[k].pipe else codes[k].clocks)
-           for k in codes}
+    run = {k: ((codes[k].pipe["n"] - 1) * codes[k].pipe.get("ii", 1) + codes[k].clocks
+               if codes[k].pipe else codes[k].clocks) for k in codes}
     max_c = max(run.values())
     reg(cyc, bits(max_c + 1))
     at_start("st_now", st, start_state)
@@ -623,8 +623,13 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         if pipe is None:
             continue
         v0 = sq.fresh(f"b{k}_valid0")
-        stmts.append(_assign(v0, _and(_eq(_name("st_now"), k), ast.Compare(
-            left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant(pipe["n"])]))))
+        ii = pipe.get("ii", 1)
+        first = _and(_eq(_name("st_now"), k), ast.Compare(
+            left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant(pipe["n"] * ii)]))
+        if ii > 1:                                   # (an iteration starts every ii clocks)
+            first = _and(first, _eq(ast.BinOp(left=_name("cyc_now"), op=ast.Mod(),
+                                              right=ast.Constant(ii)), 0))
+        stmts.append(_assign(v0, first))
         new_attr[v0] = {"signed": 0, "width": 1, "type": "wire"}
         valid[(k, 0)] = v0
         # (each loaded from a wire: a register's next value can't be another register)
@@ -718,8 +723,13 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             if pipe is not None and pipe["counter"] == cnt:
                 lp = loop_of[cnt]
                 step = lp.values[1] - lp.values[0]
-                value = ast.IfExp(test=_and(_eq(_name("st_now"), k), ast.Compare(
-                    left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant(pipe["n"] - 1)])),
+                ii = pipe.get("ii", 1)
+                test = _and(_eq(_name("st_now"), k), ast.Compare(
+                    left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant((pipe["n"] - 1) * ii)]))
+                if ii > 1:                           # (a step every ii clocks)
+                    test = _and(test, _eq(ast.BinOp(left=_name("cyc_now"), op=ast.Mod(),
+                                                     right=ast.Constant(ii)), ii - 1))
+                value = ast.IfExp(test=test,
                     body=ast.BinOp(left=_name(f"{cnt}_now"), op=ast.Add(), right=ast.Constant(step)),
                     orelse=value)
         stmts.append(_assign(f"rn_{cnt}", value))
@@ -828,11 +838,14 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     if ext_reads or ext_writes:
         def at_base(base: int, a: str) -> ast.expr:
             return ast.BinOp(left=ast.Constant(base), op=ast.Add(), right=_name(a))
-        rd = issue_chain([(k, s.clock, ast.Constant(1)) for k, s in ext_reads], ast.Constant(0))
+        # (in a pipelined loop a read only while an iteration is at its stage: the
+        # reads of an iteration take turns on the port)
+        rd = issue_chain([(k, s.clock, ast.Constant(1)) for k, s in ext_reads], ast.Constant(0),
+                         write=True)
         wr = issue_chain([(k, w.clock, _name(w.cond) if w.cond else ast.Constant(1))
                           for k, w in ext_writes], ast.Constant(0), write=True)
         raddr = issue_chain([(k, s.clock, at_base(s.ext, s.addr)) for k, s in ext_reads],
-                            ast.Constant(0))
+                            ast.Constant(0), write=True)
         waddr = issue_chain([(k, w.clock, at_base(w.ext, w.addr)) for k, w in ext_writes],
                             ast.Constant(0), write=True)
         stmts.append(_assign("ext_we", wr))
@@ -972,9 +985,9 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     from .share import NotShareable, _fmt_of, _fmt_range, _interval
     if code.extra_regs or code.elems or n_iter < 2:
         return False
-    if sum(1 for s in code.sites if s.ext is not None) \
-            + sum(1 for w in code.writes if w.ext is not None) > 1:
-        return False                                  # (the SDRAM: one access a clock)
+    # An iteration every ii clocks: as many as its SDRAM accesses (one a clock)
+    ii = max(1, sum(1 for s in code.sites if s.ext is not None)
+             + sum(1 for w in code.writes if w.ext is not None))
     now = f"{cnt}_now"
     defs = {s.targets[0].id: s.value for s in code.out}
     carried = {v for v in code.read_regs if v in code.env}
@@ -997,23 +1010,45 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     ready: Dict[str, int] = {}
     data_of = {s.addr: s.data for s in code.sites}
     latency = {s.addr: EXT_LATENCY if s.ext is not None else 1 for s in code.sites}
+    ext_addrs = [s.addr for s in code.sites if s.ext is not None]
+    bump: Dict[str, int] = {a: 0 for a in ext_addrs}  # (an SDRAM read issued this much later)
 
     def stage(e: ast.expr) -> int:
         return max([0] + [ready.get(n.id, 0) for n in ast.walk(e)
                           if isinstance(n, ast.Name) and n.id in varying])
-    for _ in range(len(code.out) + 3):
-        before = dict(ready)
-        for v in carried:
-            ready[f"r_{v}"] = ready.get(code.env[v], 0)
-        for s in code.out:
-            t = s.targets[0].id
-            ready[t] = stage(s.value) + (1 if t in code.bumped else 0)
-            if t in data_of:
-                ready[data_of[t]] = ready[t] + latency[t]
-        if ready == before:
-            break
-    else:
+
+    def settle() -> bool:
+        for _ in range(len(code.out) + 3):
+            before = dict(ready)
+            for v in carried:
+                ready[f"r_{v}"] = ready.get(code.env[v], 0)
+            for s in code.out:
+                t = s.targets[0].id
+                ready[t] = stage(s.value) + (1 if t in code.bumped else 0)
+                if t in data_of:
+                    ready[data_of[t]] = ready[t] + bump.get(t, 0) + latency[t]
+            if ready == before:
+                return True
         return False                                  # (carried through a read: no fixed stage)
+    if not settle():
+        return False
+    if ii > 1:
+        # The SDRAM's reads at different clocks of the ii (a read a stage later where
+        # two would meet), the stages settled again
+        for _ in range(4 * ii):
+            used: Set[int] = set()
+            moved = False
+            for a in ext_addrs:
+                at = ready[a] + bump[a]
+                while at % ii in used:
+                    at += 1
+                    moved = True
+                bump[a] = at - ready[a]
+                used.add(at % ii)
+            if not moved:
+                break
+            if not settle():
+                return False
 
     # Ranges of the block's values (for the delay registers' widths)
     rng = dict(known)
@@ -1057,17 +1092,26 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
         t = s.targets[0].id
         out.append(_assign(t, at(s.value, ready[t])))
     last = max([0] + list(ready.values()))
+    taken = {(ready[a] + bump[a]) % ii for a in ext_addrs}
     for w in code.writes:
         w.clock = max(ready.get(w.addr, 0), ready.get(w.data, 0), ready.get(w.cond, 0) if w.cond else 0)
+        if w.ext is not None and ii > 1:             # (its own clock of the ii, too)
+            while w.clock % ii in taken:
+                w.clock += 1
+            taken.add(w.clock % ii)
         w.addr, w.data = (delayed(w.addr, w.clock - ready.get(w.addr, 0)),
                           delayed(w.data, w.clock - ready.get(w.data, 0)))
         if w.cond:
             w.cond = delayed(w.cond, w.clock - ready.get(w.cond, 0))
         last = max(last, w.clock)
     for s in code.sites:
-        s.clock = ready[s.addr]
+        b = bump.get(s.addr, 0)
+        s.clock = ready[s.addr] + b
+        if b:
+            s.addr = delayed(s.addr, b)
+            last = max(last, s.clock)
     code.out = out
     code.clocks = last + 1
-    code.pipe = {"counter": cnt, "n": n_iter, "regs": regs, "formats": formats,
+    code.pipe = {"counter": cnt, "n": n_iter, "ii": ii, "regs": regs, "formats": formats,
                  "stage": {v: ready.get(code.env[v], 0) for v in code.env}}
     return True

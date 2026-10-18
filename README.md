@@ -480,9 +480,14 @@ machine runs the program a step at a time, for designs far too big to unroll
   DE0-Nano's SDRAM until the rest fits its block RAM: the module gets the
   SDRAM's pins and a controller (`templates/hw/sdram`), one access a clock,
   a read's data 5 clocks after its address, and its clock enable stops while
-  the SDRAM opens a row or refreshes. The simulations include a model of the
-  chip, loaded with the tables. (In progress: simulation only so far; a loop
-  with two SDRAM accesses an iteration isn't pipelined yet.)
+  the SDRAM opens a row or refreshes. A pipelined loop starts an iteration
+  every as many clocks as it makes SDRAM accesses, each on its own clock (a
+  product of two lists in the SDRAM: a multiply-accumulate every 2 clocks).
+  The simulations include a model of the chip, loaded with the tables: the
+  PyTorch MNIST network with `sdram=True` keeps 16 Mbit in the SDRAM and takes
+  39,015,936 clocks an image (0.78 s at 50 MHz; 19.7 million all in block
+  RAM), simulated in Verilator as its bit-exact model. (In progress:
+  simulation only so far; Quartus and loading the SDRAM on the board next.)
 
 The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
 and register widths come from following the program with intervals, so the

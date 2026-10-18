@@ -706,7 +706,8 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
                     total += n * codes[it.index].clocks
                 elif len(it.body) == 1 and isinstance(it.body[0], Block) \
                         and codes[it.body[0].index].pipe is not None:
-                    total += n * (len(it.values) + codes[it.body[0].index].clocks - 1)
+                    c = codes[it.body[0].index]
+                    total += n * ((len(it.values) - 1) * c.pipe.get("ii", 1) + c.clocks)
                 else:
                     count(it.body, n * len(it.values))
         count(program, 1)
@@ -747,7 +748,8 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         read_ranges(alt)
         if pipeline_block(alt, counters[lp.index], len(lp.values), known, attr):
             n = len(lp.values)
-            saved = times[lp.index] * (n * codes[k].clocks - (n + alt.clocks - 1))
+            saved = times[lp.index] * (n * codes[k].clocks
+                                       - ((n - 1) * alt.pipe.get("ii", 1) + alt.clocks))
             if saved >= UNIT_SAVING * before:
                 codes[k] = alt
 
