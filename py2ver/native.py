@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 
 _MAIN_CPP = """#include "Vpy2ver_tb.h"
 #include "verilated.h"
+double sc_time_stamp() { return 0; }   // ($time in the SDRAM's model: Verilator 4 asks for it)
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
     Vpy2ver_tb* top = new Vpy2ver_tb;
@@ -88,7 +89,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
     for name, w in outs:
         lines.append(f"  wire [{w - 1}:0] o_{name};")
     for ctl in ("rst", "ce", "vin"):
-        if ctl in ports:
+        if ctl in ports or (ctl == "ce" and "ce_in" in ports):
             lines.append(f"  reg {ctl};")
     if "vout" in {q.name for q in p.ir.outputs}:
         lines.append("  wire vout;")
@@ -99,6 +100,21 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         conns.append(f".{name}(cur[{lo + w - 1}:{lo}])")
     conns += [f".{name}(o_{name})" for name, _ in outs]
     conns += [f".{c}({c})" for c in ("clk", "rst", "ce", "vin") if c in ports]
+    sdram = (getattr(p, "_fold", None) or {}).get("sdram")
+    if "ce_in" in ports:
+        conns.append(".ce_in(ce)")
+    if sdram:
+        # The SDRAM: a model of the chip on the design's pins, its tables loaded
+        for d, w, n in p.SDRAM_PORTS:
+            lines.append(f"  wire {'[' + str(w - 1) + ':0] ' if w > 1 else ''}{n};")
+            conns.append(f".{n}({n})")
+        lines.append("  sdram_model __mem(.clk(dram_clk), .cke(dram_cke), .cs_n(dram_cs_n), "
+                     ".ras_n(dram_ras_n), .cas_n(dram_cas_n), .we_n(dram_we_n), .ba(dram_ba), "
+                     ".sa(dram_addr), .dqm(dram_dqm), .dq(dram_dq));")
+        lines.append("  initial begin")
+        for k, (base, values) in enumerate(sdram_images(p)):
+            lines.append(f'    $readmemh("sdram_{k}.hex", __mem.mem, {base}, {base + len(values) - 1});')
+        lines.append("  end")
     if "vout" in {q.name for q in p.ir.outputs}:
         conns.append(".vout(vout)")
     # (a port a line: Verilator reads at most 20000 tokens a line)
@@ -143,7 +159,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
     kind = mode["kind"]
     if "rst" in ports:
         lines.append("    rst = 1;")
-    if "ce" in ports:
+    if "ce" in ports or "ce_in" in ports:
         lines.append("    ce = 1;")
     if "vin" in ports:
         lines.append("    vin = 0;")
@@ -180,15 +196,28 @@ def testbench(p, mode: Dict[str, Any]) -> str:
                       "      vin <= (c <= total);"]
         else:
             # Each sample holds its inputs for P clocks; outputs are read in the last
-            lines += [f"      if (k == {P - 1}) begin",
+            # (with the SDRAM: P clocks the design advanced in)
+            lines += [f"      if ({'adv && ' if sdram else ''}k == {P - 1}) begin",
                       f"        {write}",
                       "        k = 0; c = c + 1;",
                       "        if (c > total) begin $fclose(fout); $finish; end",
                       "        next_vector; cur <= nxt;",
-                      "      end else k = k + 1;"]
+                      f"      end else{' if (adv)' if sdram else ''} k = k + 1;"]
         lines.append("    end")
     lines += ["  end", "endmodule", ""]
     return "\n".join(x for x in lines if x != "")
+
+
+def sdram_images(p) -> List[Tuple[int, List[int]]]:
+    """(base address, 16-bit words) of each SDRAM list or table with values to start from."""
+    sdram = (getattr(p, "_fold", None) or {}).get("sdram") or {}
+    out = []
+    for kind in ("tables", "lists"):
+        for key, info in sdram.get(kind, {}).items():
+            init = info.get("init")
+            if init is not None:
+                out.append((int(info["base"]), [int(v) & 0xFFFF for v in init]))
+    return out
 
 
 def _chunks(width: int) -> List[Tuple[int, int]]:
@@ -228,15 +257,20 @@ def build(p, mode: Dict[str, Any], simulator: str, workdir: Path) -> Path:
     tmp.mkdir(parents=True)
     (tmp / "main.v").write_text(core, encoding="utf-8")
     (tmp / "tb.v").write_text(tb, encoding="utf-8")
+    extra = []
+    if (getattr(p, "_fold", None) or {}).get("sdram"):
+        model = Path(__file__).parent / "templates" / "hw" / "sdram" / "sdram_model.v"
+        (tmp / "sdram_model.v").write_text(model.read_text(encoding="utf-8"), encoding="utf-8")
+        extra = ["sdram_model.v"]
     if simulator == "icarus":
         (tmp / "clock.v").write_text(_CLOCK_V, encoding="utf-8")
         _run(["iverilog", "-g2012", "-o", "sim.vvp", "-s", "py2ver_clock",
-              "clock.v", "tb.v", "main.v"], tmp)
+              "clock.v", "tb.v", "main.v", *extra], tmp)
     else:
         (tmp / "main.cpp").write_text(_MAIN_CPP, encoding="utf-8")
         _run(["verilator", "--cc", "--exe", "--build", "-O2", "-Wno-fatal", "-Wno-lint",
               "-Wno-style", "-Wno-TIMESCALEMOD", "--top-module", "py2ver_tb", "-Mdir", "obj",
-              "tb.v", "main.v", "main.cpp"], tmp)
+              "tb.v", "main.v", *extra, "main.cpp"], tmp)
     if d.exists():
         shutil.rmtree(d)
     tmp.rename(d)
@@ -278,6 +312,8 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
             else:
                 f.write(" ".join(f"{(word >> lo) & ((1 << (hi - lo + 1)) - 1):x}"
                                  for hi, lo in _chunks(iw)) + "\n")
+    for k, (base, values) in enumerate(sdram_images(p)):      # (the SDRAM's starting contents)
+        (d / f"sdram_{k}.hex").write_text("".join(f"{v:04x}\n" for v in values))
     out = d / "outputs.hex"
     if out.exists():
         out.unlink()

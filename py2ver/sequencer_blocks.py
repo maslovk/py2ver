@@ -69,26 +69,34 @@ def _sel(values: List[ast.expr], idx: ast.expr) -> ast.expr:
                          slice=idx, ctx=ast.Load())
 
 
+EXT_LATENCY = 5          # a read of the SDRAM: its data this many clocks after its address
+
+
 class _Site:
-    def __init__(self, array: Any, addr: str, data: str, clock: int, rom: bool) -> None:
+    def __init__(self, array: Any, addr: str, data: str, clock: int, rom: bool,
+                 ext: Optional[int] = None) -> None:
         self.array = array            # a RAM list's name, or a ROM table's entries
         self.addr = addr
         self.data = data
         self.clock = clock
         self.rom = rom
+        self.ext = ext                # in the SDRAM: its base address
 
 
 class _Write:
-    def __init__(self, array: str, addr: str, data: str, cond: Optional[str], ready: int) -> None:
+    def __init__(self, array: str, addr: str, data: str, cond: Optional[str], ready: int,
+                 ext: Optional[int] = None) -> None:
         self.array, self.addr, self.data, self.cond, self.ready = array, addr, data, cond, ready
         self.clock = 0
+        self.ext = ext                # in the SDRAM: its base address
 
 
 class BlockCode:
     """One block's statements as the machine's logic."""
 
     def __init__(self, sq, block, scope: Dict[str, str], rams: Set[str], reg_lists: Set[str],
-                 inputs: Set[str], attr, rng, ns, unrolled: bool = False) -> None:
+                 inputs: Set[str], attr, rng, ns, unrolled: bool = False,
+                 ext: Optional[Dict[str, Any]] = None) -> None:
         from .sequencer import ROM_MIN, _is_table, _list_elements, NotSequenceable
         self.NotSequenceable = NotSequenceable
         self._is_table, self._list_elements, self.ROM_MIN = _is_table, _list_elements, ROM_MIN
@@ -114,9 +122,21 @@ class BlockCode:
         # pipelined loop: a step's results are a stage after its inputs, `bumped`)
         self.unrolled = unrolled
         self.bumped: Set[str] = set()
+        # Lists and tables in the SDRAM: one access a clock (its port), data
+        # EXT_LATENCY clocks after the address
+        self.ext_lists = (ext or {}).get("lists", {})
+        self.ext_tables = (ext or {}).get("tables", {})
+        self.ext_used: Set[int] = set()
         for s in block.stmts:
             self.stmt(s, None)
         self.schedule()
+
+    def ext_slot(self, c: int) -> int:
+        """The first clock from c the SDRAM's port is free (taken)."""
+        while c in self.ext_used:
+            c += 1
+        self.ext_used.add(c)
+        return c
 
     # ------------------------------------------------------------ names
     def tmp(self, base: str) -> str:
@@ -206,9 +226,15 @@ class BlockCode:
                 return copy.deepcopy(self.reads[key])
             addr = self.emit(f"{a}_ra", idx)
             data = self.tmp(f"{a}_rd")
-            clock = self.ready[addr]
-            self.sites.append(_Site(a, addr, data, clock, rom=False))
-            self.ready[data] = clock + 1
+            if a in self.ext_lists:
+                clock = self.ext_slot(self.ready[addr])
+                self.sites.append(_Site(a, addr, data, clock, rom=False,
+                                        ext=self.ext_lists[a]["base"]))
+                self.ready[data] = clock + EXT_LATENCY
+            else:
+                clock = self.ready[addr]
+                self.sites.append(_Site(a, addr, data, clock, rom=False))
+                self.ready[data] = clock + 1
             value: ast.expr = _name(data)
             # A write earlier in the block to the same element: its value
             for w in self.writes:
@@ -421,9 +447,15 @@ class BlockCode:
             return copy.deepcopy(self.reads[key])
         addr = self.emit("rom_a", idx)
         data = self.tmp("rom_d")
-        clock = self.ready[addr]
-        self.sites.append(_Site(entries, addr, data, clock, rom=True))
-        self.ready[data] = clock + 1
+        if entries in self.ext_tables:
+            clock = self.ext_slot(self.ready[addr])
+            self.sites.append(_Site(entries, addr, data, clock, rom=True,
+                                    ext=self.ext_tables[entries]["base"]))
+            self.ready[data] = clock + EXT_LATENCY
+        else:
+            clock = self.ready[addr]
+            self.sites.append(_Site(entries, addr, data, clock, rom=True))
+            self.ready[data] = clock + 1
         self.reads[key] = _name(data)
         return _name(data)
 
@@ -490,7 +522,9 @@ class BlockCode:
             self.declare(data, a)
             c = self.emit(f"{a}_we", cond) if cond is not None else None
             self.writes.append(_Write(a, addr, data, c, max(self.ready[addr], self.ready[data],
-                                                            self.ready.get(c, 0) if c else 0)))
+                                                            self.ready.get(c, 0) if c else 0),
+                                      ext=self.ext_lists[a]["base"] if a in self.ext_lists
+                                      else None))
             return
         elems = self.elements(a)
         try:
@@ -523,6 +557,8 @@ class BlockCode:
         busy: Dict[str, int] = {}
         for w in self.writes:
             w.clock = max(w.ready, busy.get(w.array, -1) + 1)
+            if w.ext is not None:                      # (the SDRAM's port: one access a clock)
+                w.clock = self.ext_slot(w.clock)
             busy[w.array] = w.clock
             last = max(last, w.clock)
         last = max([last] + [s.clock for s in self.sites])
@@ -530,7 +566,7 @@ class BlockCode:
 
 
 def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
-                 DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories=()):
+                 DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories=(), ext=None):
     """The per-clock function (share.py's form) and its info."""
     from .sequencer import Loop, _walk_items
     fd = sq.fd
@@ -709,7 +745,8 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             out = ast.IfExp(test=test, body=v, orelse=out)
         return out
 
-    for a in sorted(rams):
+    ext_lists = (ext or {}).get("lists", {})
+    for a in sorted(set(rams) - set(ext_lists)):
         meta = fmt(a)
         depth = sq.lists[a]
         ab = bits(depth)
@@ -756,7 +793,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     tables: Dict[Tuple[int, ...], List[Tuple[int, _Site]]] = {}
     for k in codes:
         for s in codes[k].sites:
-            if s.rom:
+            if s.rom and s.ext is None:
                 tables.setdefault(s.array, []).append((k, s))
     for t, (entries, sites) in enumerate(tables.items()):
         nports = max(sum(1 for kk, _ in sites if kk == k) for k in codes)
@@ -782,6 +819,49 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                        "signed": meta["signed"], "address_bits": ab["width"]}
             extra_params.append(q)
             extra_returns.append(idx)
+
+    # ----- the SDRAM's port (sdram=): one access a clock, its address the list's
+    # base plus the index; a read's data on ext_q EXT_LATENCY clocks after it
+    sdram_info = None
+    ext_reads = [(k, s) for k in codes for s in codes[k].sites if s.ext is not None]
+    ext_writes = [(k, w) for k in codes for w in codes[k].writes if w.ext is not None]
+    if ext_reads or ext_writes:
+        def at_base(base: int, a: str) -> ast.expr:
+            return ast.BinOp(left=ast.Constant(base), op=ast.Add(), right=_name(a))
+        rd = issue_chain([(k, s.clock, ast.Constant(1)) for k, s in ext_reads], ast.Constant(0))
+        wr = issue_chain([(k, w.clock, _name(w.cond) if w.cond else ast.Constant(1))
+                          for k, w in ext_writes], ast.Constant(0), write=True)
+        raddr = issue_chain([(k, s.clock, at_base(s.ext, s.addr)) for k, s in ext_reads],
+                            ast.Constant(0))
+        waddr = issue_chain([(k, w.clock, at_base(w.ext, w.addr)) for k, w in ext_writes],
+                            ast.Constant(0), write=True)
+        stmts.append(_assign("ext_we", wr))
+        stmts.append(_assign("ext_req", ast.BoolOp(op=ast.Or(), values=[_name("ext_we"), rd])))
+        stmts.append(_assign("ext_addr", ast.IfExp(test=_name("ext_we"), body=waddr, orelse=raddr)))
+        stmts.append(_assign("ext_wdata", issue_chain(
+            [(k, w.clock, _name(w.data)) for k, w in ext_writes], ast.Constant(0), write=True)))
+        one = {"signed": 0, "width": 1, "type": "wire"}
+        new_attr.update({"ext_we": one, "ext_req": one,
+                         "ext_addr": {"signed": 0, "width": 24, "type": "wire"},
+                         "ext_wdata": {"signed": 0, "width": 16, "type": "wire"},
+                         "ext_q": {"signed": 0, "width": 16, "type": "wire"}})
+        for k, s in ext_reads:
+            meta = (_fmt_of((min(s.array), max(s.array))) if s.rom else fmt(s.array))
+            new_attr[s.data] = dict(meta, type="wire")
+            if codes[k].pipe is not None:
+                # (a pipelined loop: the data at its stage, delayed after as any value)
+                stmts.insert(0, _assign(s.data, _name("ext_q")))
+            else:
+                # (a block: the data held from the clock it comes)
+                hold = sq.fresh(f"r_{s.data}_h")
+                reg(hold, meta)
+                when = _and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), s.clock + EXT_LATENCY))
+                stmts.insert(0, _assign(s.data, ast.IfExp(test=when, body=_name("ext_q"),
+                                                          orelse=_name(hold))))
+                regs[hold] = s.data
+        extra_params.append("ext_q")
+        extra_returns += ["ext_req", "ext_we", "ext_addr", "ext_wdata"]
+        sdram_info = dict(ext, latency=EXT_LATENCY)
 
     # ----- the outputs, from the registers (read in the last clock)
     class _Out(ast.NodeTransformer):
@@ -819,6 +899,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             "extra_returns": extra_returns, "params": {phase} | set(reg_names) | set(extra_params),
             "attr": new_attr, "register_bits": sum(int(new_attr[r]["width"]) for r in reg_names),
             "blocks": n, "mul_widths": [], "memories": mem_info, "reg_init": reg_init,
+            "sdram": sdram_info,
             "pipelined": sum(1 for k in codes if codes[k].pipe is not None)}
     return tree, info
 
@@ -891,6 +972,9 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     from .share import NotShareable, _fmt_of, _fmt_range, _interval
     if code.extra_regs or code.elems or n_iter < 2:
         return False
+    if sum(1 for s in code.sites if s.ext is not None) \
+            + sum(1 for w in code.writes if w.ext is not None) > 1:
+        return False                                  # (the SDRAM: one access a clock)
     now = f"{cnt}_now"
     defs = {s.targets[0].id: s.value for s in code.out}
     carried = {v for v in code.read_regs if v in code.env}
@@ -912,6 +996,7 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     # is there at the stage its new value is
     ready: Dict[str, int] = {}
     data_of = {s.addr: s.data for s in code.sites}
+    latency = {s.addr: EXT_LATENCY if s.ext is not None else 1 for s in code.sites}
 
     def stage(e: ast.expr) -> int:
         return max([0] + [ready.get(n.id, 0) for n in ast.walk(e)
@@ -924,7 +1009,7 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
             t = s.targets[0].id
             ready[t] = stage(s.value) + (1 if t in code.bumped else 0)
             if t in data_of:
-                ready[data_of[t]] = ready[t] + 1
+                ready[data_of[t]] = ready[t] + latency[t]
         if ready == before:
             break
     else:

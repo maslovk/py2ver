@@ -476,6 +476,13 @@ machine runs the program a step at a time, for designs far too big to unroll
 - a memory argument (`'memory'` in attr) is state: its block RAM (or its
   registers, if it is short) keeps its values from one sample to the next,
   starting from its `'init'`, and isn't a port
+- `sdram=True` (or a number of bits) puts the largest lists and tables in the
+  DE0-Nano's SDRAM until the rest fits its block RAM: the module gets the
+  SDRAM's pins and a controller (`templates/hw/sdram`), one access a clock,
+  a read's data 5 clocks after its address, and its clock enable stops while
+  the SDRAM opens a row or refreshes. The simulations include a model of the
+  chip, loaded with the tables. (In progress: simulation only so far; a loop
+  with two SDRAM accesses an iteration isn't pipelined yet.)
 
 The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
 and register widths come from following the program with intervals, so the

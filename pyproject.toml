@@ -36,6 +36,7 @@ py2ver = [
     "templates/hw/*.txt",
     "templates/hw/uart/*.txt",
     "templates/hw/syn/*.txt",
+    "templates/hw/sdram/*.v",
 ]
 
 [tool.pytest.ini_options]

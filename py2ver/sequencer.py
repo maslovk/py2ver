@@ -52,6 +52,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from .share import _fmt_of, _fmt_range, _hull, _interval, NotShareable
 
 RAM_MIN = 32              # a list this long or longer is a block RAM
+SDRAM_WIDTH = 16          # the DE0-Nano's SDRAM: a 16-bit word an address
+SDRAM_BANK_WORDS = 1 << 22  # (4 banks of 8192 rows of 512 words)
+DE0_NANO_BITS = 400_000   # sdram=True: what may stay in block RAM (of the EP4CE22's 594 kbit)
 ROM_MIN = 64              # a constant table this long or longer is a ROM
 # A loop with dividers / square roots is pipelined (a register stage per step of
 # each) only if that saves at least this part of a sample's clocks
@@ -235,6 +238,59 @@ def _writes_all(loop: Loop, name: str, n: int, limit: int = 1 << 20) -> bool:
         for combo in itertools.product(*[vals for _, vals in vars_]):
             seen.add(eval(code, {}, dict(zip(names, combo))))
     return seen >= set(range(n))
+
+
+# ==================================================================== SDRAM
+
+def _external(program, rams: Set[str], fmt, attr, memories, budget,
+              lengths: Dict[str, int]) -> Dict[str, Any]:
+    """
+    The lists (block RAMs) and tables (ROMs) that go to the SDRAM: the largest,
+    one after another, until what stays (their lengths times their widths) is
+    within budget bits. Each gets an address range in a bank (the banks taken in
+    turn, so a product's two operands keep two rows open), its words
+    SDRAM_WIDTH bits: {'lists': {name: info}, 'tables': {entries: info}}, info
+    {'base', 'length', 'meta', 'init' (the values it starts with, or None)}.
+    """
+    budget = DE0_NANO_BITS if budget is True else int(budget)
+    items = []
+    for a in rams:
+        meta = fmt(a)
+        n = lengths[a]
+        init = attr[a].get("init") if a in memories else None
+        items.append(("list", a, n, meta, init))
+    seen = set()
+    for it in _walk_items(program):
+        if isinstance(it, Block):
+            for s in it.stmts:
+                for x in ast.walk(s):
+                    if _is_table(x) and len(x.elts) >= ROM_MIN:
+                        entries = tuple(e.value for e in x.elts)
+                        if entries not in seen:
+                            seen.add(entries)
+                            meta = _fmt_of((min(entries), max(entries)))
+                            items.append(("table", entries, len(entries), meta, list(entries)))
+    items.sort(key=lambda t: -t[2] * int(t[3]["width"]))
+    total = sum(n * int(m["width"]) for _, _, n, m, _ in items)
+    out: Dict[str, Any] = {"lists": {}, "tables": {}}
+    free = [0, 0, 0, 0]
+    k = 0
+    for kind, key, n, meta, init in items:
+        if total <= budget:
+            break
+        if int(meta["width"]) > SDRAM_WIDTH:
+            raise NotSequenceable(f"{'A table' if kind == 'table' else repr(key)} of "
+                                  f"{meta['width']}-bit values can't be in the SDRAM "
+                                  f"({SDRAM_WIDTH}-bit words); use width={SDRAM_WIDTH}")
+        bank = k % 4
+        k += 1
+        if free[bank] + n > SDRAM_BANK_WORDS:
+            raise NotSequenceable("The lists don't fit the SDRAM")
+        info = {"base": (bank << 22) | free[bank], "length": n, "meta": meta, "init": init}
+        free[bank] += -(-n // 512) * 512                  # (each from a row's start)
+        out["lists" if kind == "list" else "tables"][key] = info
+        total -= n * int(meta["width"])
+    return out
 
 
 # ==================================================================== lanes
@@ -532,7 +588,8 @@ class _Seq:
 
 
 def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, Any],
-             pipelined: bool = True, lanes: int = 1) -> Tuple[ast.Module, Dict[str, Any]]:
+             pipelined: bool = True, lanes: int = 1,
+             sdram: Any = None) -> Tuple[ast.Module, Dict[str, Any]]:
     """
     Build the module's first function (lowered integer code with for-range
     loops) as a state machine; returns (tree, info) in share.py's form, or
@@ -540,6 +597,9 @@ def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, An
     loops start an iteration every clock where they can (see pipeline_block).
     lanes: multiply-accumulate loops run that many iterations at a time (see
     _unrolled).
+    sdram: True or a number of bits: the largest lists and tables go to the
+    board's SDRAM until the rest (block RAM) is within that many bits (True: the
+    DE0-Nano's, DE0_NANO_BITS); see _external.
     """
     from .visitor import _Desugar
     fd = _Desugar().visit(copy.deepcopy(tree.body[0]))
@@ -548,10 +608,10 @@ def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, An
     program = st.seq(fd.body)
     if not any(isinstance(it, Loop) for it in program):
         return tree, {"phases": 1}
-    return _build(sq, program, attr, ns, pipelined, lanes)
+    return _build(sq, program, attr, ns, pipelined, lanes, sdram)
 
 
-def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
+def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, sdram=None):
     params = sq.params
     inputs = set(params)
     # Number the blocks and loops in program order
@@ -607,6 +667,10 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
             raise NotSequenceable(f"Can't bound the values of '{name}'")
         return dict(_fmt_of(r), type="wire")
 
+    # ----- lists and tables in the SDRAM (sdram=): the largest, until the rest fits
+    ext = (_external(program, rams, fmt, attr, memories, sdram, sq.lists)
+           if sdram is not None and sdram is not False else None)
+
     # ----- the clocks of each block: read levels, then writes
     from .sequencer_blocks import BlockCode
     codes: Dict[int, "BlockCode"] = {}
@@ -628,7 +692,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
             else:
                 scopes[it.index] = dict(scope)
                 codes[it.index] = BlockCode(sq, it, scopes[it.index], rams, reg_lists, inputs,
-                                            attr, rng, ns)
+                                            attr, rng, ns, ext=ext)
     walk(program, {}, 1)
 
     def clocks_per_sample() -> int:
@@ -679,7 +743,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
         if k is None or codes[k].pipe is not None or not codes[k].extra_regs:
             continue
         alt = BlockCode(sq, lp.body[0], scopes[k], rams, reg_lists, inputs, attr, rng, ns,
-                        unrolled=True)
+                        unrolled=True, ext=ext)
         read_ranges(alt)
         if pipeline_block(alt, counters[lp.index], len(lp.values), known, attr):
             n = len(lp.values)
@@ -747,4 +811,4 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1):
 
     from .sequencer_blocks import emit_machine
     return emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
-                        DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories)
+                        DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories, ext)

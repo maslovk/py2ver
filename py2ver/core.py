@@ -219,7 +219,8 @@ class Py2ver:
                  fold: Any = None, unroll: int = 1,
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
                  multipliers: int | None = None, rate: float | None = None,
-                 clock: float = DEFAULT_CLK_FREQ, sequential: bool = False) -> None:
+                 clock: float = DEFAULT_CLK_FREQ, sequential: bool = False,
+                 sdram: Any = None) -> None:
         """
         func: the function, as written (a method, numpy code, a torch module
         for its forward(), or a function looping over batches: one step of
@@ -243,6 +244,10 @@ class Py2ver:
         sequential: build the loops as they are written, as a state machine
         running a step at a time with large lists in block RAM (see
         sequencer.py), for designs too big to write out.
+        sdram: a sequenced design's largest lists and tables in the DE0-Nano's
+        SDRAM (True: until the rest fits its block RAM; or that many bits of
+        block RAM): the module gets the SDRAM's pins and its controller
+        (templates/hw/sdram), and stops while the SDRAM is busy.
         rate: samples per second the design must keep up with at `clock` Hz
         (default 50 MHz): fold / unroll / multipliers (for a sequenced design,
         its lanes) are chosen to fit, as small as possible, and the choice is
@@ -330,7 +335,8 @@ class Py2ver:
                                           "pipeline=")
             from .sequencer import sequence
             # (multipliers=: lanes for the multiply-accumulate loops)
-            seq_tree, info = sequence(tree, attr, _namespace(func), lanes=int(multipliers or 1))
+            seq_tree, info = sequence(tree, attr, _namespace(func), lanes=int(multipliers or 1),
+                                      sdram=sdram)
             if info["phases"] > 1:
                 tree, self._fold = seq_tree, info
                 attr = dict(attr, **info["attr"])
@@ -487,6 +493,13 @@ class Py2ver:
         self.hdl_dir.mkdir(exist_ok=True)
 
         hdl_path = self.hdl_dir / "main.v"
+        if self._fold and self._fold.get("sdram"):
+            # (the SDRAM's pins in the module's ports; its controller in the file)
+            head = f"module {ir.name}(\n"
+            names = "".join(f"{n},\n" for _, _, n in self.SDRAM_PORTS)
+            verilog_text = verilog_text.replace(head, head + names, 1)
+            verilog_text += "\n" + (template_dir / "hw" / "sdram" / "py2ver_sdram.v").read_text(
+                encoding="utf-8")
         hdl_path.write_text(verilog_text, encoding="utf-8")
         log.info("Generated HDL written to %s", hdl_path)
 
@@ -652,23 +665,85 @@ class Py2ver:
         roms = fold.get("roms", {})
         rfs = fold.get("rfs", {})
         fold_ports = {fold["phase"], *fold["regs"], *roms, *rfs}
+        sdram = fold.get("sdram")
+        if sdram:
+            fold_ports.add("ext_q")
         inputs = [p for p in ir.inputs if p.name not in self.state_map and p.name not in fold_ports]
         have = {p.name for p in inputs}
         for name, kind in (("clk", "clk"), ("rst", "rst"), ("ce", "ce")):
             if name not in have:
                 inputs.append(Port(name=name, width=1, signed=False, kind=kind))
+        ext_items: List[str] = []
+        ext_out: set = set()
+        if sdram:
+            # (the clock enable stops while the SDRAM is busy: the input is ce_in)
+            inputs = [Port(name="ce_in", width=1, signed=False, kind="ce") if p.name == "ce" else p
+                      for p in inputs]
+            ext_items = self._sdram_items(sdram)
+            ext_out = {"ext_req", "ext_we", "ext_addr", "ext_wdata"}
 
         return ModuleIR(
             name=ir.name,
             inputs=inputs,
             outputs=[p for p in ir.outputs if p.name not in
                      set(fold["regs"].values()) | {r["index"] for r in roms.values()}
-                     | {rf[k] for rf in rfs.values() for k in ("raddr", "we", "waddr", "wdata")}],
+                     | {rf[k] for rf in rfs.values() for k in ("raddr", "we", "waddr", "wdata")}
+                     | ext_out],
             assigns=assigns,
             has_clk=True,
-            items=list(ir.items) + self._phase_items() + self._ram_items() + self._rom_items(roms, attr)
-                  + self._rf_items(rfs, attr),
+            items=ext_items + list(ir.items) + self._phase_items() + self._ram_items()
+                  + self._rom_items(roms, attr) + self._rf_items(rfs, attr),
         )
+
+    # The SDRAM's pins (the DE0-Nano's names, lower case), as a module with sdram= has them
+    SDRAM_PORTS = [("output", 13, "dram_addr"), ("output", 2, "dram_ba"), ("output", 1, "dram_cas_n"),
+                   ("output", 1, "dram_cke"), ("output", 1, "dram_clk"), ("output", 1, "dram_cs_n"),
+                   ("inout", 16, "dram_dq"), ("output", 2, "dram_dqm"), ("output", 1, "dram_ras_n"),
+                   ("output", 1, "dram_we_n"), ("output", 1, "adv")]
+
+    @staticmethod
+    def _sdram_items(sdram: Dict[str, Any]) -> List[str]:
+        """The SDRAM's controller and the return path of its reads: the design's
+        reads (ext_req and not ext_we) get their data on ext_q `latency`
+        advancing clocks later, in order, from a FIFO; the design's clock enable
+        ce is ce_in, held low while an access waits (a row opened, a refresh) and
+        until the SDRAM is set up. adv: the design advanced this clock."""
+        L = int(sdram["latency"])
+        decl = [f"{d} {'[' + str(w - 1) + ':0] ' if w > 1 else ''}{n};"
+                for d, w, n in Py2ver.SDRAM_PORTS]
+        return decl + [
+            "// The SDRAM: the lists and tables that don't fit the block RAM (sdram=)",
+            "wire __ext_ready, __ext_rvalid, __ext_init;",
+            "wire [15:0] __ext_rdata;",
+            "wire __ext_stall = !__ext_init || (ext_req && !__ext_ready);",
+            "wire ce = ce_in && !__ext_stall;",
+            "assign adv = ce;",
+            "assign dram_clk = ~clk;",
+            "py2ver_sdram __sdram(.clk(clk), .rst(rst), .req(ext_req && ce_in && __ext_init),",
+            "    .we(ext_we), .addr(ext_addr), .wdata(ext_wdata), .ready(__ext_ready),",
+            "    .rvalid(__ext_rvalid), .rdata(__ext_rdata), .init_done(__ext_init),",
+            "    .sa(dram_addr), .ba(dram_ba), .cs_n(dram_cs_n), .ras_n(dram_ras_n),",
+            "    .cas_n(dram_cas_n), .we_n(dram_we_n), .cke(dram_cke), .dqm(dram_dqm), .dq(dram_dq));",
+            f"// A read's data, in order, taken {L} advancing clocks after its address",
+            "reg [15:0] __ext_fifo [0:7];",
+            "reg [2:0] __ext_wp, __ext_rp;",
+            f"reg [{L - 1}:0] __ext_due;",
+            "wire [15:0] ext_q = __ext_fifo[__ext_rp];",
+            "always @(posedge clk) begin",
+            "  if (rst) begin",
+            "    __ext_wp <= 3'd0; __ext_rp <= 3'd0; __ext_due <= 0;",
+            "  end else begin",
+            "    if (__ext_rvalid) begin",
+            "      __ext_fifo[__ext_wp] <= __ext_rdata;",
+            "      __ext_wp <= __ext_wp + 3'd1;",
+            "    end",
+            "    if (ce) begin",
+            f"      __ext_due <= {{__ext_due[{L - 2}:0], ext_req && !ext_we}};",
+            f"      if (__ext_due[{L - 1}]) __ext_rp <= __ext_rp + 3'd1;",
+            "    end",
+            "  end",
+            "end",
+        ]
 
     def _schedule_rams(self, ir: ModuleIR) -> Tuple[int, Dict[str, Any]]:
         """
