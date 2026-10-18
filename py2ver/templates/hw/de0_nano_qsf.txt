@@ -373,3 +373,6 @@ set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to GPIO_1[33]
 #============================================================
 # End of pin assignments by Terasic System Builder
 #============================================================
+
+# (initial loops filling long block RAMs: more than Quartus's 5000 iterations)
+set_global_assignment -name VERILOG_CONSTANT_LOOP_LIMIT 10000000

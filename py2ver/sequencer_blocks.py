@@ -218,9 +218,9 @@ class BlockCode:
         return n
 
     def read(self, a: str, idx: ast.expr) -> ast.expr:
-        if a in self.inputs:
+        if a in self.inputs and a not in self.ext_lists:
             return ast.Subscript(value=_name(a), slice=idx, ctx=ast.Load())
-        if a in self.rams:
+        if a in self.rams or a in self.ext_lists:
             key = (a, ast.dump(idx))
             if key in self.reads:
                 return copy.deepcopy(self.reads[key])

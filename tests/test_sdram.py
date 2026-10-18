@@ -141,3 +141,51 @@ def test_a_design_with_its_list_and_table_in_the_sdram(monkeypatch, tmp_path):
     # (written and read back through the controller, the design stopped while the
     # SDRAM opens rows and refreshes: the same results as the model)
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+def _input_in_the_sdram(x):
+    s = 0
+    for i in range(64):
+        s = s + x[i] * _W[i * 2]
+    t = 0
+    for i in range(64):
+        t = t + x[63 - i] * x[i]
+    return s, t
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_a_long_input_list_is_written_into_the_sdram(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_input_in_the_sdram, {"x": {"signed": 1, "width": 8, "length": 64}},
+                   sequential=True, sdram=0)
+    # (no ports for x: each sample's values written into the SDRAM before it runs)
+    assert len(p._ext_inputs) == 64 and [q.name for q in p.ir.inputs] == ["clk", "rst", "ce_in"]
+    r = random.Random(1)
+    vectors = [([r.randint(-128, 127) for _ in range(64)],) for _ in range(3)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+@pytest.mark.board
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+@pytest.mark.parametrize("f, n", [(_with_a_list, 16), (_input_in_the_sdram, 64)])
+def test_the_board_loads_the_sdram_over_its_uart(monkeypatch, tmp_path, f, n):
+    # The DE0-Nano's project (UART, the commands, the design, the controller) with
+    # a model of the chip on its pins: the tables written with 'W' commands, a
+    # sample's input lists too, then 'R' and its outputs, as HW() does on the board
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(f, {"x": {"signed": 1, "width": 8, "length": n}}, sequential=True, sdram=0)
+    r = random.Random(2)
+    vectors = [([r.randint(-128, 127) for _ in range(n)],) for _ in range(2)]
+    assert p.HW_sim()(vectors) == p.PY_batch()(vectors)

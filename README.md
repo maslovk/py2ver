@@ -486,8 +486,14 @@ machine runs the program a step at a time, for designs far too big to unroll
   The simulations include a model of the chip, loaded with the tables: the
   PyTorch MNIST network with `sdram=True` keeps 16 Mbit in the SDRAM and takes
   39,015,936 clocks an image (0.78 s at 50 MHz; 19.7 million all in block
-  RAM), simulated in Verilator as its bit-exact model. (In progress:
-  simulation only so far; Quartus and loading the SDRAM on the board next.)
+  RAM), simulated in Verilator as its bit-exact model. An input list of 64
+  values or more is in the SDRAM too (no ports: each sample's values are
+  written there before it runs). `SYN()` gives the SDRAM's pins their
+  DE0-Nano places and timing: the MNIST network fits the EP4CE22, 7,002
+  logic elements (31 %), 297 kbit of block RAM (49 %), 16 multipliers, 56 MHz
+  (timing met at 50 MHz). `HW()` and `HW_sim()` load the SDRAM over the
+  UART (see "On the board" below); the whole board project for MNIST fits
+  too: 7,447 logic elements (33 %), 297 kbit, 56 pins, timing met at 50 MHz.
 
 The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
 and register widths come from following the program with intervals, so the
@@ -1104,6 +1110,18 @@ p.HW_sim()(vectors) == p.TB_batch()(vectors)   # one reply per input vector
 
 It runs at real UART speed in simulation (a few seconds per handful of
 vectors).
+
+With `sdram=` the board project has a small command set on the UART instead:
+`'W'`, a 3-byte address, a 3-byte count and that many 16-bit words (high byte
+first) writes them into the SDRAM, and the board answers `'W'`; `'R'` and the
+sample's port inputs runs a sample (the design pausing whenever the SDRAM is
+busy) and sends its outputs back. `HW()` writes the tables once, on its first
+call (the MNIST network's 16 Mbit: about 3 minutes at 115200 baud; this
+board project is built for `UART_BAUD`, so a faster serial adapter helps),
+then for each sample its input lists
+in the SDRAM and `'R'`. `HW_sim()` runs the same bytes against the project
+with a model of the SDRAM chip on its pins. (Checked in simulation and
+compiled by Quartus; not yet run on a real board.)
 
 ### Supported Python subset
 

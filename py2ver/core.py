@@ -54,6 +54,34 @@ from .fold import fold_loop
 from .share import ROM_MIN, share
 
 ROM_FILE_MIN = 4096         # a table longer than this is read from a file ($readmemh)
+
+# The virtual board with the SDRAM: the DE0-Nano's top and a model of the chip on its pins
+_BOARD_SIM = """`timescale 1ns/1ps
+module py2ver_board(input CLOCK_50, input [1:0] KEY, input [3:0] SW, input GPIO_0_RX,
+                    output GPIO_0_TX);
+    wire [12:0] a; wire [1:0] ba, dqm; wire cas_n, cke, dclk, cs_n, ras_n, we_n;
+    wire [15:0] dq;
+    DE0_Nano board(.CLOCK_50(CLOCK_50), .KEY(KEY), .SW(SW), .LED(), .DRAM_ADDR(a), .DRAM_BA(ba),
+        .DRAM_CAS_N(cas_n), .DRAM_CKE(cke), .DRAM_CLK(dclk), .DRAM_CS_N(cs_n), .DRAM_DQ(dq),
+        .DRAM_DQM(dqm), .DRAM_RAS_N(ras_n), .DRAM_WE_N(we_n), .GPIO_0_RX(GPIO_0_RX),
+        .GPIO_0_TX(GPIO_0_TX));
+    sdram_model chip(.clk(dclk), .cke(cke), .cs_n(cs_n), .ras_n(ras_n), .cas_n(cas_n),
+        .we_n(we_n), .ba(ba), .sa(a), .dqm(dqm), .dq(dq));
+endmodule
+"""
+
+_SDRAM_OUTS = ("[get_ports {DRAM_ADDR[*] DRAM_BA[*] DRAM_CAS_N DRAM_RAS_N DRAM_WE_N DRAM_CS_N "
+               "DRAM_CKE DRAM_DQM[*] DRAM_DQ[*]}]")
+# The SDRAM's timing (IS42S16160B-7 at the inverse of the design's clock): data valid
+# 5.4 ns after its edge (tAC), held 2.7 ns (tOH); commands set up 1.5 ns before it
+# (tIS), held 0.8 ns (tIH)
+_SDRAM_SDC = (
+    "\n# The SDRAM (IS42S16160B-7), its clock the inverse of the design's\n"
+    "create_generated_clock -name dram_clk -source [get_ports clk] -invert [get_ports DRAM_CLK]\n"
+    "set_input_delay -clock dram_clk -max 5.4 [get_ports {DRAM_DQ[*]}]\n"
+    "set_input_delay -clock dram_clk -min 2.7 [get_ports {DRAM_DQ[*]}]\n"
+    f"set_output_delay -clock dram_clk -max 1.5 {_SDRAM_OUTS}\n"
+    f"set_output_delay -clock dram_clk -min -0.8 {_SDRAM_OUTS}\n")
 from .comprehend import expand_comprehensions
 from .control import structure, while_bound
 from .choose import choose, choose_lanes
@@ -427,6 +455,8 @@ class Py2ver:
             )
         if self._fold and (self.rams or ir.has_clk):
             raise NotImplementedError("fold can't be combined with block RAM or 'reg' signals yet")
+        pre_inputs = list(ir.inputs)
+        self._ext_inputs: Dict[str, int] = {}     # (sdram=: an input's port -> its SDRAM address)
         if self.state_map or self.rams or self._fold:
             ir = self._lower_state(ir, f_visitor.attr)
         ir = self._rom_arrays(ir, f_visitor.rom_reads, f_visitor.attr)
@@ -437,9 +467,13 @@ class Py2ver:
 
         self.t_name = ir.name
         control = ("clk", "rst", "ce", "vin")
-        self.input_args_list = [p.name for p in ir.inputs if p.kind not in control]
+        # (an input in the SDRAM is no port, but still an input of each sample)
+        module_in = {p.name for p in ir.inputs}
+        args_in = [p for p in (pre_inputs if self._ext_inputs else ir.inputs)
+                   if p.kind not in control and (p.name in module_in or p.name in self._ext_inputs)]
+        self.input_args_list = [p.name for p in args_in]
         self.output_args_list = [p.name for p in ir.outputs if p.kind != "vout"]
-        self.input_args_width_list = [p.width for p in ir.inputs if p.kind not in control]
+        self.input_args_width_list = [p.width for p in args_in]
         self.output_args_width_list = [p.width for p in ir.outputs if p.kind != "vout"]
         self._has_vin = any(p.kind == "vin" for p in ir.inputs)
 
@@ -668,6 +702,16 @@ class Py2ver:
         sdram = fold.get("sdram")
         if sdram:
             fold_ports.add("ext_q")
+            # Input lists in the SDRAM: no ports (their values are written there)
+            names = {p.name for p in ir.inputs}
+            for a, info in sdram["lists"].items():
+                if info.get("input"):
+                    for i in range(int(info["length"])):
+                        port = f"{a}_{i}" if f"{a}_{i}" in names else (a if i == 0 and a in names
+                                                                       else None)
+                        if port is not None:
+                            self._ext_inputs[port] = int(info["base"]) + i
+            fold_ports |= set(self._ext_inputs)
         inputs = [p for p in ir.inputs if p.name not in self.state_map and p.name not in fold_ports]
         have = {p.name for p in inputs}
         for name, kind in (("clk", "clk"), ("rst", "rst"), ("ce", "ce")):
@@ -699,7 +743,10 @@ class Py2ver:
     SDRAM_PORTS = [("output", 13, "dram_addr"), ("output", 2, "dram_ba"), ("output", 1, "dram_cas_n"),
                    ("output", 1, "dram_cke"), ("output", 1, "dram_clk"), ("output", 1, "dram_cs_n"),
                    ("inout", 16, "dram_dq"), ("output", 2, "dram_dqm"), ("output", 1, "dram_ras_n"),
-                   ("output", 1, "dram_we_n"), ("output", 1, "adv")]
+                   ("output", 1, "dram_we_n"), ("output", 1, "adv"),
+                   # (the host's port: writes into the SDRAM while the design is paused)
+                   ("input", 1, "host_req"), ("input", 24, "host_addr"), ("input", 16, "host_wdata"),
+                   ("output", 1, "host_ready")]
 
     @staticmethod
     def _sdram_items(sdram: Dict[str, Any]) -> List[str]:
@@ -719,8 +766,13 @@ class Py2ver:
             "wire ce = ce_in && !__ext_stall;",
             "assign adv = ce;",
             "assign dram_clk = ~clk;",
-            "py2ver_sdram __sdram(.clk(clk), .rst(rst), .req(ext_req && ce_in && __ext_init),",
-            "    .we(ext_we), .addr(ext_addr), .wdata(ext_wdata), .ready(__ext_ready),",
+            "// (the host writes through it while the design is paused: ce_in low)",
+            "wire __host = !ce_in;",
+            "assign host_ready = __host && __ext_init && __ext_ready;",
+            "py2ver_sdram __sdram(.clk(clk), .rst(rst),",
+            "    .req((__host ? host_req : ext_req) && __ext_init),",
+            "    .we(__host ? 1'b1 : ext_we), .addr(__host ? host_addr : ext_addr),",
+            "    .wdata(__host ? host_wdata : ext_wdata), .ready(__ext_ready),",
             "    .rvalid(__ext_rvalid), .rdata(__ext_rdata), .init_done(__ext_init),",
             "    .sa(dram_addr), .ba(dram_ba), .cs_n(dram_cs_n), .ras_n(dram_ras_n),",
             "    .cas_n(dram_cas_n), .we_n(dram_we_n), .cke(dram_cke), .dqm(dram_dqm), .dq(dram_dq));",
@@ -1204,6 +1256,7 @@ class Py2ver:
             with state, each call is one sample and advances the state.
         """
         self.syn_attr = syn_attr
+        self._sdram_loaded = False                   # (the SDRAM's tables: loaded on the first call)
         self._hw_ok = self.createHWproject()
         if not self._hw_ok:
             self._hw_unavailable(getattr(self, "_hw_error", "board project could not be built (see log)"))
@@ -1239,6 +1292,9 @@ class Py2ver:
         port = self.syn_attr.get("UART_PORT", "/dev/ttyUSB0")
         baud = int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE))
         timeout = float(self.syn_attr.get("UART_TIMEOUT", 1.0))
+
+        if self._sdram:
+            return self._hw_sdram_call(port, baud, timeout, in_arg)
 
         input_bytes = self._pack_inputs(*self._flatten_args(in_arg))
         output_bytes_expected = (self.tx_width + 7) // 8
@@ -1287,6 +1343,26 @@ class Py2ver:
         except (OSError, serial.SerialException) as e:
             return self._hw_unavailable(f"UART communication failed ({e})", *in_arg)
 
+    def _hw_sdram_call(self, port: str, baud: int, timeout: float, in_arg) -> Tuple[int, ...]:
+        """A sample on a board with the SDRAM: its tables (once), its input lists,
+        then 'R' (see de0_nano_sdram_top.txt)."""
+        first = not getattr(self, "_sdram_loaded", False)
+        steps = self._sdram_steps(self._input_vector(tuple(in_arg)), first)
+        try:
+            with serial.Serial(port, baudrate=baud, timeout=max(timeout, 30.0)) as ser:
+                reply = b""
+                for data, n in steps:
+                    ser.write(data)
+                    ser.flush()
+                    reply = ser.read(n)
+                    if len(reply) != n:
+                        return self._hw_unavailable(
+                            f"UART: expected {n} byte(s), got {len(reply)}", *in_arg)
+                self._sdram_loaded = True
+                return self._unpack_outputs(reply)
+        except (OSError, serial.SerialException) as e:
+            return self._hw_unavailable(f"UART communication failed ({e})", *in_arg)
+
     def hw_run(self) -> int:
         """
         Legacy HW runner placeholder (kept for compatibility).
@@ -1306,6 +1382,8 @@ class Py2ver:
         vectors = [tuple(v) for v in vectors]
         if not vectors:
             return []
+        if self._sdram:
+            return self._hw_sim_sdram(vectors)
         project_dir = self.gen_hw_project()
         tx_bytes = (self.tx_width + 7) // 8
         requests = [list(self._pack_inputs(*self._flatten_args(v))) for v in vectors]
@@ -1342,7 +1420,39 @@ class Py2ver:
             outs.append(self._unpack_outputs(bytes(reply)))
         return outs
 
-    def gen_hw_project(self) -> Path:
+    SIM_BAUD = 3_125_000        # the virtual SDRAM board's UART (16 clocks a bit at 50 MHz)
+
+    def _hw_sim_sdram(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
+        """The virtual board with the SDRAM: the board's project and a model of the
+        chip on its pins, the same UART commands as hw_fun() (at SIM_BAUD)."""
+        project_dir = self.gen_hw_project(baud=self.SIM_BAUD)
+        samples = [[(list(d), n) for d, n in self._sdram_steps(self._input_vector(v), k == 0)]
+                   for k, v in enumerate(vectors)]
+        P = int(self.ram_phases)
+        tb_src = self.get_template("tb_hw_sdram.txt").render({
+            "baud": self.SIM_BAUD, "samples": repr(samples), "wait_bits": (4 * P + 50000) // 128})
+        _drop_bytecode(project_dir, "tb_hw_sdram")
+        (project_dir / "tb_hw_sdram.py").write_text(tb_src, encoding="utf-8")
+        model = DEFAULT_TEMPLATE_DIR / "hw" / "sdram" / "sdram_model.v"
+        board = project_dir / "py2ver_board.v"
+        board.write_text(_BOARD_SIM, encoding="utf-8")
+        sources = ([board, project_dir / "DE0_Nano.v", project_dir / f"{self.t_name}.v", model]
+                   + sorted((project_dir / "uart").glob("*.sv")))
+        tb_runner.run_cocotb("py2ver_board", sources, "tb_hw_sdram", project_dir,
+                             timescale=("1ns", "1ps"))
+        with (project_dir / "results" / "results.pickle").open("rb") as handle:
+            replies = pickle.load(handle)
+        outs = []
+        for vec, steps, reply in zip(vectors, samples, replies):
+            want = [n for _, n in steps]
+            acks_ok = all(r == [0x57] for r in reply[:-1])
+            if [len(r) for r in reply] != want or not acks_ok:
+                raise RuntimeError(f"Virtual board replies for {vec}: expected {want} bytes "
+                                   f"('W' acks, then the outputs), got {reply}")
+            outs.append(self._unpack_outputs(bytes(reply[-1])))
+        return outs
+
+    def gen_hw_project(self, baud: int = DEFAULT_BAUD_RATE) -> Path:
         """Write the DE0-Nano Quartus project (board top, UART, core). No compile."""
         project_dir = self._project_dir
         if project_dir.is_dir():
@@ -1403,15 +1513,24 @@ class Py2ver:
         self.get_template("hw/de0_nano_sdc.txt") \
             .stream({}).dump(str(project_dir / "DE0_Nano.SDC"))
 
-        self.get_template("hw/delayed_registers.txt") \
-            .stream(self.syn_data).dump(str(project_dir / "delayed_registers.sv"))
+        if self._sdram:
+            # A design with the SDRAM: the board's top takes commands (see the template)
+            self.get_template("hw/de0_nano_sdram_top.txt").stream(
+                self._sdram_board(baud)).dump(str(project_dir / "DE0_Nano.v"))
+            with open(project_dir / "DE0_Nano.SDC", "a", encoding="utf-8") as f:
+                f.write(_SDRAM_SDC.replace("[get_ports clk]", "[get_ports CLOCK_50]"))
+        else:
+            self.get_template("hw/delayed_registers.txt") \
+                .stream(self.syn_data).dump(str(project_dir / "delayed_registers.sv"))
 
-        # DE0_Nano top you provided
-        self.get_template("hw/de0_nano_top.txt") \
-            .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
+            # DE0_Nano top you provided
+            self.get_template("hw/de0_nano_top.txt") \
+                .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
 
         # Copy generated core HDL
         shutil.copy(self.hdl_dir / "main.v", project_dir / f"{project_name}.v")
+        for hexfile in self.hdl_dir.glob("*.hex"):                 # ($readmemh's tables)
+            shutil.copy(hexfile, project_dir / hexfile.name)
 
         log.info("Quartus project created at %s", project_dir)
 
@@ -1438,7 +1557,7 @@ class Py2ver:
             log.error(self._hw_error)
             return False
 
-        project_dir = self.gen_hw_project()
+        project_dir = self.gen_hw_project(int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE)))
         project_name = self.t_name
 
         # ---- Compile ----
@@ -1755,6 +1874,23 @@ class Py2ver:
         if self.has_clk:
             conns.append("    .clk(clk)")
         conns += [f"    .{p.name}({p.name}_q)" for p in core_in]
+        sdram = bool(self._fold and self._fold.get("sdram"))
+        if sdram:
+            # The SDRAM's pins: real pins (the DE0-Nano's), not registered; adv as an output
+            core_out = core_out + [Port(name="adv", width=1, signed=False)]
+            port_decls.append("  output reg adv_out")
+            for d, w, n in self.SDRAM_PORTS:
+                if n.startswith("dram_"):
+                    port_decls.append(f"  {d} {_rng(w)}{n.upper()}")
+                    conns.append(f"    .{n}({n.upper()})")
+                elif n.startswith("host_"):                     # (registered, as the others)
+                    if d == "input":
+                        core_in = core_in + [Port(name=n, width=w, signed=False)]
+                        port_decls.append(f"  input {_rng(w)}{n}_in")
+                        conns.append(f"    .{n}({n}_q)")
+                    else:
+                        core_out = core_out + [Port(name=n, width=w, signed=False)]
+                        port_decls.append(f"  output reg {_rng(w)}{n}_out")
         conns += [f"    .{p.name}({p.name}_w)" for p in core_out]
 
         ctx = {
@@ -1785,9 +1921,75 @@ class Py2ver:
         ):
             self.get_template(tpl).stream(ctx).dump(str(project_dir / name))
         shutil.copy(self.hdl_dir / "main.v", project_dir / f"{self.t_name}.v")
+        for hexfile in self.hdl_dir.glob("*.hex"):                 # ($readmemh's tables)
+            shutil.copy(hexfile, project_dir / hexfile.name)
+        if sdram:
+            self._syn_sdram(project_dir, wrapper)
 
         log.info("Synthesis project created at %s", project_dir)
         return project_dir
+
+    @property
+    def _sdram(self) -> bool:
+        return bool(self._fold and self._fold.get("sdram"))
+
+    def _port_inputs(self) -> List[Tuple[str, int]]:
+        """(name, width) of the inputs that are ports (not in the SDRAM)."""
+        ext = getattr(self, "_ext_inputs", {})
+        return [(n, w) for n, w in zip(self.input_args_list, self.input_args_width_list)
+                if n not in ext]
+
+    def _sdram_board(self, baud: int) -> Dict[str, Any]:
+        """The SDRAM board top's template context."""
+        ins, lo = [], 0
+        for n, w in self._port_inputs():
+            ins.append({"name": n, "width": w, "lo": lo})
+            lo += (w + 7) // 8 * 8
+        outs = [{"name": n, "width": w, "seg": (w + 7) // 8 * 8}
+                for n, w in zip(self.output_args_list, self.output_args_width_list)]
+        return {"core": self.t_name, "inputs": ins, "outputs": outs, "rx_bytes": lo // 8,
+                "tx_bytes": sum(o["seg"] for o in outs) // 8, "phases": int(self.ram_phases),
+                "baud": int(baud)}
+
+    def _sdram_steps(self, vec: Tuple[int, ...], first: bool) -> List[Tuple[bytes, int]]:
+        """The UART commands of a sample (vec: its raw inputs, as input_args_list):
+        the tables first (first=True), its input lists into the SDRAM, then 'R'.
+        [(bytes, bytes of the reply)]."""
+        from .native import sdram_images, _runs
+        ext = getattr(self, "_ext_inputs", {})
+        steps: List[Tuple[bytes, int]] = []
+
+        def write(base: int, words: List[int]) -> None:
+            for at in range(0, len(words), 4096):
+                part = words[at:at + 4096]
+                head = b"W" + (base + at).to_bytes(3, "big") + len(part).to_bytes(3, "big")
+                steps.append((head + b"".join((w & 0xFFFF).to_bytes(2, "big") for w in part), 1))
+        if first:
+            for base, values in sdram_images(self):
+                write(base, values)
+        names = list(self.input_args_list)
+        addrs = [ext[n] for n in names if n in ext]
+        values = [int(vec[i]) for i, n in enumerate(names) if n in ext]
+        for start, base, count in _runs(addrs):
+            write(base, values[start:start + count])
+        acc, off = 0, 0
+        port = {n for n, _ in self._port_inputs()}
+        for i, (n, w) in enumerate(zip(names, self.input_args_width_list)):
+            if n in port:
+                acc |= (int(vec[i]) & ((1 << w) - 1)) << off
+                off += (w + 7) // 8 * 8
+        steps.append((b"R" + acc.to_bytes(off // 8, "little"), self._sdram_board(0)["tx_bytes"]))
+        return steps
+
+    def _syn_sdram(self, project_dir: Path, wrapper: str) -> None:
+        """A design with the SDRAM: its pins where the DE0-Nano has them, and the
+        chip's timing (IS42S16160B-7 at the inverted clock) for the timing analysis."""
+        qsf = (DEFAULT_TEMPLATE_DIR / "hw" / "de0_nano_qsf.txt").read_text(encoding="utf-8")
+        pins = [line for line in qsf.splitlines() if "DRAM_" in line and not line.startswith("#")]
+        with open(project_dir / f"{wrapper}.qsf", "a", encoding="utf-8") as f:
+            f.write("\n# The SDRAM's pins (DE0-Nano)\n" + "\n".join(pins) + "\n")
+        with open(project_dir / f"{wrapper}.sdc", "a", encoding="utf-8") as f:
+            f.write(_SDRAM_SDC)
 
     # ------------------------------------------------------------------------
     # Testbench

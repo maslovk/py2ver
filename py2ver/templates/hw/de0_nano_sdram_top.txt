@@ -1,0 +1,181 @@
+// DE0-Nano top for a design with its lists in the SDRAM (sdram=): the UART
+// carries commands from the host (py2ver's HW()):
+//
+//   'W' a2 a1 a0 n2 n1 n0, then n 16-bit words (high byte first):
+//       written into the SDRAM from address a (through the design's host port,
+//       the design paused); then 'W' back
+//   'R' then the sample's port inputs ({{ rx_bytes }} bytes, the UART's usual
+//       segments, least significant byte first): the design runs a sample
+//       ({{ phases }} clocks it advances in: it stops while the SDRAM is
+//       busy), then its outputs ({{ tx_bytes }} bytes) are sent back
+//
+// The tables are written once; a sample's input lists (in the SDRAM) before it.
+module DE0_Nano(
+    input              CLOCK_50,
+    input       [1:0]  KEY,
+    input       [3:0]  SW,
+    output      [7:0]  LED,
+    output     [12:0]  DRAM_ADDR,
+    output      [1:0]  DRAM_BA,
+    output             DRAM_CAS_N, DRAM_CKE, DRAM_CLK, DRAM_CS_N,
+    inout      [15:0]  DRAM_DQ,
+    output      [1:0]  DRAM_DQM,
+    output             DRAM_RAS_N, DRAM_WE_N,
+    input              GPIO_0_RX,
+    output             GPIO_0_TX
+);
+    // ---------------- reset: KEY[0] (active low) or power-on
+    reg [3:0] por = 4'd0;
+    always @(posedge CLOCK_50) if (por != 4'hF) por <= por + 4'd1;
+    wire rst = ~KEY[0] | (por != 4'hF);
+    wire rst_n = ~rst;
+
+    // ---------------- UART
+    wire os_tick, baud_tick;
+    uart_baud_gen #(.CLK_HZ(50000000), .BAUD({{ baud }}), .OSR(16)) u_baud(
+        .clk(CLOCK_50), .rst_n(rst_n), .os_tick(os_tick), .baud_tick(baud_tick));
+    wire [7:0] rx_byte;
+    wire rx_ready, rx_ferr;
+    uart_rx_8n1 u_rx(.clk(CLOCK_50), .rst_n(rst_n), .os_tick(os_tick), .rx(GPIO_0_RX),
+        .rx_byte(rx_byte), .rx_byte_ready(rx_ready), .rx_ferr(rx_ferr),
+        .commit_pulse_dbg(), .phase_dbg(), .bitnum_dbg());
+    reg [7:0] tx_byte;
+    reg tx_start;
+    wire tx_busy;
+    uart_tx_8n1 u_tx(.clk(CLOCK_50), .rst_n(rst_n), .baud_tick(baud_tick), .tx_byte(tx_byte),
+        .tx_start(tx_start), .tx(GPIO_0_TX), .tx_busy(tx_busy));
+
+    // ---------------- the design
+    reg ce_run;
+    reg host_req;
+    reg [23:0] host_addr;
+    reg [15:0] host_wdata;
+    wire host_ready, adv;
+    localparam RXW = {{ rx_bytes * 8 if rx_bytes else 8 }};
+    localparam TXW = {{ tx_bytes * 8 if tx_bytes else 8 }};
+    reg [RXW-1:0] rx_word;
+    reg [TXW-1:0] tx_word;
+    wire [TXW-1:0] outs;
+{%- for p in inputs %}
+    wire [{{ p.width - 1 }}:0] in_{{ p.name }} = rx_word[{{ p.lo + p.width - 1 }}:{{ p.lo }}];
+{%- endfor %}
+{%- for p in outputs %}
+    wire [{{ p.width - 1 }}:0] out_{{ p.name }};
+{%- endfor %}
+    assign outs = {{ '{' }}{% for p in outputs|reverse %}{% if p.seg > p.width %}{{ p.seg - p.width }}'d0, {% endif %}out_{{ p.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if not outputs %}8'd0{% endif %}{{ '}' }};
+    {{ core }} dut(
+        .clk(CLOCK_50), .rst(rst), .ce_in(ce_run),
+        .host_req(host_req), .host_addr(host_addr), .host_wdata(host_wdata),
+        .host_ready(host_ready), .adv(adv),
+{%- for p in inputs %}
+        .{{ p.name }}(in_{{ p.name }}),
+{%- endfor %}
+{%- for p in outputs %}
+        .{{ p.name }}(out_{{ p.name }}),
+{%- endfor %}
+        .dram_addr(DRAM_ADDR), .dram_ba(DRAM_BA), .dram_cas_n(DRAM_CAS_N), .dram_cke(DRAM_CKE),
+        .dram_clk(DRAM_CLK), .dram_cs_n(DRAM_CS_N), .dram_dq(DRAM_DQ), .dram_dqm(DRAM_DQM),
+        .dram_ras_n(DRAM_RAS_N), .dram_we_n(DRAM_WE_N));
+
+    // ---------------- the commands
+    localparam S_CMD = 3'd0, S_WHDR = 3'd1, S_WDATA = 3'd2, S_WRITE = 3'd3, S_RIN = 3'd4,
+               S_RUN = 3'd5, S_SEND = 3'd6;
+    reg [2:0]  state;
+    reg [2:0]  hdr_n;
+    reg [47:0] hdr;
+    reg [23:0] words;
+    reg        hi_byte;
+    reg [15:0] word;
+    reg [15:0] nbytes;
+    reg [31:0] k;
+    reg        ack;
+    // A byte handed to the transmitter: wait for it to start (busy at its next baud
+    // tick) and end before the next
+    reg        tx_wait, tx_seen;
+    always @(posedge CLOCK_50) begin
+        if (rst) begin tx_wait <= 1'b0; tx_seen <= 1'b0; end
+        else if (tx_start) begin tx_wait <= 1'b1; tx_seen <= 1'b0; end
+        else if (tx_wait) begin
+            if (tx_busy) tx_seen <= 1'b1;
+            else if (tx_seen) tx_wait <= 1'b0;
+        end
+    end
+
+    assign LED = {state, ce_run, host_req, ack, rx_ferr, ~rst};
+
+    always @(posedge CLOCK_50) begin
+        tx_start <= 1'b0;
+        if (rst) begin
+            state <= S_CMD; ce_run <= 1'b0; host_req <= 1'b0; ack <= 1'b0;
+        end else case (state)
+        S_CMD: if (rx_ready) begin
+            if (rx_byte == 8'h57) begin state <= S_WHDR; hdr_n <= 3'd0; end
+            else if (rx_byte == 8'h52) begin
+                nbytes <= 16'd0;
+                state <= {{ 'S_RIN' if rx_bytes else 'S_RUN' }};
+                k <= 32'd0;
+                ce_run <= {{ "1'b0" if rx_bytes else "1'b1" }};
+            end
+        end
+        S_WHDR: if (rx_ready) begin                    // address, count
+            hdr <= {hdr[39:0], rx_byte};
+            hdr_n <= hdr_n + 3'd1;
+            if (hdr_n == 3'd5) begin
+                host_addr <= hdr[39:16];
+                words <= {hdr[15:0], rx_byte};
+                hi_byte <= 1'b1;
+                state <= ({hdr[15:0], rx_byte} == 24'd0) ? S_SEND : S_WDATA;
+                ack <= 1'b1;
+            end
+        end
+        S_WDATA: if (rx_ready) begin                   // a word, high byte first
+            if (hi_byte) begin word[15:8] <= rx_byte; hi_byte <= 1'b0; end
+            else begin
+                host_wdata <= {word[15:8], rx_byte};
+                host_req <= 1'b1;
+                state <= S_WRITE;
+            end
+        end
+        S_WRITE: if (host_ready) begin                 // written: the next one
+            host_req <= 1'b0;
+            host_addr <= host_addr + 24'd1;
+            words <= words - 24'd1;
+            hi_byte <= 1'b1;
+            state <= (words == 24'd1) ? S_SEND : S_WDATA;
+        end
+        S_RIN: if (rx_ready) begin                     // the sample's port inputs
+{%- if rx_bytes > 1 %}
+            rx_word <= {rx_byte, rx_word[RXW-1:8]};
+{%- else %}
+            rx_word <= rx_byte;
+{%- endif %}
+            nbytes <= nbytes + 16'd1;
+            if (nbytes == {{ rx_bytes - 1 if rx_bytes else 0 }}) begin
+                state <= S_RUN;
+                ce_run <= 1'b1;
+            end
+        end
+        S_RUN: if (adv) begin                          // a sample: its clocks
+            if (k == {{ phases - 1 }}) begin
+                ce_run <= 1'b0;
+                tx_word <= outs;
+                nbytes <= 16'd0;
+                ack <= 1'b0;
+                state <= S_SEND;
+            end else k <= k + 32'd1;
+        end
+        S_SEND: if (!tx_wait && !tx_start) begin       // the reply, a byte at a time
+            if (ack) begin
+                tx_byte <= 8'h57; tx_start <= 1'b1; ack <= 1'b0; state <= S_CMD;
+            end else begin
+                tx_byte <= tx_word[7:0];
+                tx_word <= tx_word >> 8;
+                tx_start <= 1'b1;
+                nbytes <= nbytes + 16'd1;
+                if (nbytes == {{ tx_bytes - 1 if tx_bytes else 0 }}) state <= S_CMD;
+            end
+        end
+        default: state <= S_CMD;
+        endcase
+    end
+endmodule

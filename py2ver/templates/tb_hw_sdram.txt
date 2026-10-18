@@ -1,0 +1,76 @@
+import pickle
+from pathlib import Path
+
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import FallingEdge, Timer
+
+# Virtual DE0-Nano with its SDRAM (a model of the chip on the board's pins):
+# the same UART commands as hw_fun() sends: 'W' (words into the SDRAM, acked),
+# 'R' (a sample: its outputs back).
+
+BAUD = {{ baud }}
+BIT_PS = round(1e12 / BAUD)
+
+# Per sample: [(bytes to send, bytes of its reply), ...]
+SAMPLES = {{ samples }}
+
+
+async def save_results(ret_val):
+    results_dir = Path(__file__).resolve().parent / "results"
+    results_dir.mkdir(exist_ok=True)
+    with open(results_dir / "results.pickle", "wb") as handle:
+        pickle.dump(ret_val, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+async def uart_send(pin, byte):
+    pin.value = 0
+    await Timer(BIT_PS, unit="ps")
+    for i in range(8):
+        pin.value = (byte >> i) & 1
+        await Timer(BIT_PS, unit="ps")
+    pin.value = 1
+    await Timer(BIT_PS, unit="ps")
+
+
+async def uart_receive(pin, sink):
+    while True:
+        await FallingEdge(pin)
+        await Timer(BIT_PS // 2, unit="ps")
+        if not pin.value.is_resolvable or int(pin.value) != 0:
+            continue
+        byte = 0
+        for i in range(8):
+            await Timer(BIT_PS, unit="ps")
+            byte |= (int(pin.value) if pin.value.is_resolvable else 0) << i
+        await Timer(BIT_PS, unit="ps")
+        sink.append(byte)
+
+
+@cocotb.test()
+async def tb_hw_sdram(dut):
+    cocotb.start_soon(Clock(dut.CLOCK_50, 20, unit="ns").start())
+    dut.SW.value = 0b1111
+    dut.GPIO_0_RX.value = 1
+    dut.KEY.value = 0b10
+    await Timer(1, unit="us")
+    dut.KEY.value = 0b11
+    await Timer(250, unit="us")                     # (the SDRAM's 200 us of start-up)
+
+    received = []
+    cocotb.start_soon(uart_receive(dut.GPIO_0_TX, received))
+    replies = []
+    for steps in SAMPLES:
+        reply = []                                  # (every step's reply: acks, then outputs)
+        for data, n in steps:
+            received.clear()
+            for byte in data:
+                await uart_send(dut.GPIO_0_RX, byte)
+            for _ in range({{ wait_bits }}):
+                if len(received) >= n:
+                    break
+                await Timer(BIT_PS * 8, unit="ps")
+            await Timer(BIT_PS * 20, unit="ps")
+            reply.append(list(received))
+        replies.append(reply)
+    await save_results(replies)

@@ -79,7 +79,8 @@ def mode_of(p) -> Optional[Dict[str, Any]]:
 
 def testbench(p, mode: Dict[str, Any]) -> str:
     """The Verilog testbench (top py2ver_tb, clocked by its clk input)."""
-    ins = list(zip(p.input_args_list, p.input_args_width_list))
+    ext_in = getattr(p, "_ext_inputs", {})
+    ins = [(n, w) for n, w in zip(p.input_args_list, p.input_args_width_list) if n not in ext_in]
     outs = list(zip(p.output_args_list, p.output_args_width_list))
     iw = max(1, sum(w for _, w in ins))
     ports = {q.name for q in p.ir.inputs}
@@ -106,7 +107,8 @@ def testbench(p, mode: Dict[str, Any]) -> str:
     if sdram:
         # The SDRAM: a model of the chip on the design's pins, its tables loaded
         for d, w, n in p.SDRAM_PORTS:
-            lines.append(f"  wire {'[' + str(w - 1) + ':0] ' if w > 1 else ''}{n};")
+            tie = " = 0" if d == "input" else ""          # (the host's port: unused here)
+            lines.append(f"  wire {'[' + str(w - 1) + ':0] ' if w > 1 else ''}{n}{tie};")
             conns.append(f".{n}({n})")
         lines.append("  sdram_model __mem(.clk(dram_clk), .cke(dram_cke), .cs_n(dram_cs_n), "
                      ".ras_n(dram_ras_n), .cas_n(dram_cas_n), .we_n(dram_we_n), .ba(dram_ba), "
@@ -115,6 +117,9 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         for k, (base, values) in enumerate(sdram_images(p)):
             lines.append(f'    $readmemh("sdram_{k}.hex", __mem.mem, {base}, {base + len(values) - 1});')
         lines.append("  end")
+        if ext_in:
+            lines.append("  integer fext, e;")
+            lines.append("  reg [15:0] word;")
     if "vout" in {q.name for q in p.ir.outputs}:
         conns.append(".vout(vout)")
     # (a port a line: Verilator reads at most 20000 tokens a line)
@@ -143,6 +148,28 @@ def testbench(p, mode: Dict[str, Any]) -> str:
             read.append(f"        got = $fscanf(fin, \"%h\", part); nxt[{hi}:{lo}] = part[{hi - lo}:0];")
         read.append("        n = n - 1;")
         read.append("      end")
+    if ext_in:
+        # (the sample's inputs in the SDRAM: written into the chip's model, in order)
+        addrs = [ext_in[n] for n in p.input_args_list if n in ext_in]
+        read = read[:-1] + [f"        for (e = 0; e < {len(addrs)}; e = e + 1) begin",
+                            '          got = $fscanf(fext, "%h", word);',
+                            "          __mem.mem[ext_addr(e)] = word;",
+                            "        end"] + read[-1:] if len(read) > 1 else read
+        if len(read) == 1:                       # (the one-line form: open it up)
+            read = ["      if (n > 0) begin", '        got = $fscanf(fin, "%h\\n", nxt);',
+                    f"        for (e = 0; e < {len(addrs)}; e = e + 1) begin",
+                    '          got = $fscanf(fext, "%h", word);',
+                    "          __mem.mem[ext_addr(e)] = word;",
+                    "        end",
+                    "        n = n - 1;",
+                    "      end"]
+        runs = _runs(addrs)
+        lines.append("  function integer ext_addr(input integer e);")
+        lines.append("    begin")
+        for start, base, count in runs:
+            lines.append(f"      if (e >= {start} && e < {start + count}) ext_addr = {base} + e - {start};")
+        lines.append("    end")
+        lines.append("  endfunction")
     lines += [
         "  task next_vector;",
         "    begin",
@@ -152,6 +179,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         "  endtask",
         "  initial begin",
         '    fin = $fopen("vectors.hex", "r");',
+        *(['    fext = $fopen("inputs.hex", "r");'] if ext_in else []),
         '    fout = $fopen("outputs.hex", "w");',
         '    if (!$value$plusargs("n=%d", total)) total = 0;',
         "    n = total; k = 0; c = 0; cur = 0; nxt = 0;",
@@ -206,6 +234,17 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         lines.append("    end")
     lines += ["  end", "endmodule", ""]
     return "\n".join(x for x in lines if x != "")
+
+
+def _runs(addrs: List[int]) -> List[Tuple[int, int, int]]:
+    """Consecutive addresses as (first position, first address, count)."""
+    out: List[Tuple[int, int, int]] = []
+    for i, a in enumerate(addrs):
+        if out and out[-1][1] + out[-1][2] == a:
+            out[-1] = (out[-1][0], out[-1][1], out[-1][2] + 1)
+        else:
+            out.append((i, a, 1))
+    return out
 
 
 def sdram_images(p) -> List[Tuple[int, List[int]]]:
@@ -300,7 +339,15 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
                 failed.write_text(str(e))
                 simulator = "icarus"
     d = build(p, mode, simulator, workdir)
-    widths = list(p.input_args_width_list)
+    ext_in = getattr(p, "_ext_inputs", {})
+    keep = [i for i, n in enumerate(p.input_args_list) if n not in ext_in]
+    ext_pos = [i for i, n in enumerate(p.input_args_list) if n in ext_in]
+    if ext_in:
+        with (d / "inputs.hex").open("w") as f:
+            for vec in vectors:
+                f.write("".join(f"{int(vec[i]) & 0xFFFF:04x}\n" for i in ext_pos))
+    widths = [p.input_args_width_list[i] for i in keep]
+    vectors = [tuple(vec[i] for i in keep) for vec in vectors]
     with (d / "vectors.hex").open("w") as f:
         for vec in vectors:
             word = 0

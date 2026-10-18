@@ -34,6 +34,7 @@ module sdram_model #(
     integer    since_ref, since_refresh;
     integer    cl;
     integer    errors;
+    reg        refreshed;    // (the interval is checked from the first refresh: after start-up)
     reg [15:0] out_data [0:7];
     reg [7:0]  out_valid;
     reg        driving;
@@ -52,6 +53,7 @@ module sdram_model #(
         open = 0;
         cl = 2;
         errors = 0;
+        refreshed = 0;
         out_valid = 0;
         driving = 0;
         since_ref = 1000000;
@@ -76,7 +78,7 @@ module sdram_model #(
         end
         since_ref = since_ref + 1;
         since_refresh = since_refresh + 1;
-        if (since_refresh > T_REF_MAX && open !== 4'bx) begin
+        if (refreshed && since_refresh > T_REF_MAX) begin
             error("refresh interval exceeded");
             since_refresh = 0;
         end
@@ -113,6 +115,7 @@ module sdram_model #(
                 if (open != 0) error("REFRESH with a bank open");
                 since_ref = 0;
                 since_refresh = 0;
+                refreshed = 1;
             end
             4'b0000: cl = sa[6:4];                             // LOAD MODE
             default: ;

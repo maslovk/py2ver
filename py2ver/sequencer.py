@@ -293,6 +293,31 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
     return out
 
 
+def _external_inputs(ext: Dict[str, Any], inputs: Set[str], fmt, lengths: Dict[str, int]) -> None:
+    """Input lists long enough to be ports by the hundred (INPUT_ARRAY_MIN) go to the
+    SDRAM too: written there before each sample (by the testbench, by the board's
+    loader), read like its other lists."""
+    from .visitor import INPUT_ARRAY_MIN
+    top = [0, 0, 0, 0]
+    for kind in ("lists", "tables"):
+        for info in ext[kind].values():
+            b = info["base"] >> 22
+            top[b] = max(top[b], (info["base"] & (SDRAM_BANK_WORDS - 1))
+                         + -(-info["length"] // 512) * 512)
+    for a in sorted(inputs):
+        n = lengths.get(a, 0)
+        if n < INPUT_ARRAY_MIN:
+            continue
+        meta = fmt(a)
+        if int(meta["width"]) > SDRAM_WIDTH:
+            raise NotSequenceable(f"The input {a!r} of {meta['width']}-bit values can't be in "
+                                  f"the SDRAM ({SDRAM_WIDTH}-bit words)")
+        bank = min(range(4), key=lambda b: top[b])
+        ext["lists"][a] = {"base": (bank << 22) | top[bank], "length": n, "meta": meta,
+                           "init": None, "input": True}
+        top[bank] += -(-n // 512) * 512
+
+
 # ==================================================================== lanes
 
 def _products(stmts: List[ast.stmt]) -> bool:
@@ -670,6 +695,8 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
     # ----- lists and tables in the SDRAM (sdram=): the largest, until the rest fits
     ext = (_external(program, rams, fmt, attr, memories, sdram, sq.lists)
            if sdram is not None and sdram is not False else None)
+    if ext is not None:
+        _external_inputs(ext, inputs, fmt, sq.lists)
 
     # ----- the clocks of each block: read levels, then writes
     from .sequencer_blocks import BlockCode
