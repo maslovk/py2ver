@@ -41,8 +41,16 @@ symbolic:
     runs the original with the same numbers in its place (_drawing)
   - work whose result nothing uses is left out
 
+A function whose body loops over an argument given as batches (a training
+epoch, train(model, loader, optimizer, ...)) is built as one step of that
+loop (loop_step): its objects copied together, the loop's target the inputs,
+the locals it changes state and results. PyTorch code (torch_ops.py,
+autograd.py, torch_optim.py) runs in the same interpreter, with torch's
+meanings for tensors.
+
 The program is plain Python on flat lists, checked against the original in
-float on the examples when it is made (on a copy of the object).
+float on the examples when it is made (on a copy of the object; a loop step
+against the original loop over the first two batches).
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ import inspect
 import itertools
 import linecache
 import math
+import re
 import textwrap
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -105,8 +114,10 @@ class Lazy(Arr):
     list it reads (it holds the values from before)."""
 
     def __init__(self, it: "_Interp", shape: Tuple[int, ...], fn: Callable[..., ast.expr],
-                 vals: Tuple[Any, ...], extra: Tuple[Arr, ...] = ()) -> None:
+                 vals: Tuple[Any, ...], extra: Tuple[Arr, ...] = (),
+                 op: Optional[Tuple] = None) -> None:
         self.it, self.shape, self.fn, self.vals = it, tuple(shape), fn, vals
+        self.op = op                           # (what fn computes, for autograd: ('add',) ...)
         self.extra = extra                     # (lists fn reads besides vals: a gather's)
         self.const = False
         self.real: Optional[Arr] = None
@@ -120,6 +131,7 @@ class Lazy(Arr):
                                         value=self.it.elem(self, self.shape, idx)))
             self.it.loops(self.shape, body)
             self.real = out
+            self.it.record("copy", out, self)
         return self.real
 
     name = property(lambda self: self.materialize().name)
@@ -160,6 +172,9 @@ def _contiguous(shape: Tuple[int, ...]) -> Tuple[int, ...]:
 class Sym:
     """A scalar in the program (an expression)."""
     expr: ast.expr
+    op: Optional[Tuple] = None                 # (an elementwise result's: see Lazy)
+    vals: Tuple[Any, ...] = ()
+    arr: Optional["Arr"] = None                # (a list's element: that element, a view)
 
 
 class _Return(Exception):
@@ -223,6 +238,14 @@ class _Interp:
         self.fills: Dict[str, float] = {}               # list -> the value it was made with
         self.dirty: set = set()                         # lists written since they were made
         self.handed: Dict[int, Optional[float]] = {}    # Arr given to Python code -> its fill
+        self.torch = False                              # tensors: torch's meanings
+        # Autograd (see autograd.py): the operations on values that need gradients
+        self.tape: List[Tuple[str, Any, Tuple[Any, ...], Dict[str, Any]]] = []
+        self.req_lists: set = set()                     # lists whose values need gradients
+        self.recording = True
+        self.grads: Dict[str, Arr] = {}                 # parameter list -> its gradient (.grad)
+        # numbers held in dicts that are state: key -> (the dict, the steps to them)
+        self.item_paths: Dict[Tuple[int, str], Tuple[Any, Tuple]] = {}
 
     # ------------------------------------------------------------ program text
     def fresh(self, base: str) -> str:
@@ -263,6 +286,18 @@ class _Interp:
         for s in inner:
             self.emit(s)
 
+    def rename(self, value: Sym, base: str) -> Sym:
+        """A scalar expression kept in a variable (autograd: the same value)."""
+        if not isinstance(value, Sym):
+            return value                              # (a Python number)
+        if value.arr is not None and isinstance(value.expr, ast.Subscript):
+            return value                              # (a list's element: kept there)
+        out = self.scalar(value.expr, base)
+        if out is not value:
+            out = Sym(out.expr)
+            self.record("rename", out, value)
+        return out
+
     def scalar(self, value: ast.expr, base: str = "s") -> Sym:
         """A scalar expression kept in a variable (computed once)."""
         if isinstance(value, (ast.Name, ast.Constant)):
@@ -281,12 +316,12 @@ class _Interp:
         return out
 
     # ------------------------------------------------------------ values
-    def const_array(self, owner: Any, attr: str, value) -> Arr:
+    def const_array(self, owner: Any, attr: str, value, hint: Optional[str] = None) -> Arr:
         key = (id(owner), attr)
         if key not in self.table_of:
-            base = f"{type(owner).__name__}_{attr}" if owner is not None else attr
+            base = hint or (f"{type(owner).__name__}_{attr}" if owner is not None else attr)
             name = f"T_{base}_{len(self.table_of)}"
-            arr = self.np.asarray(value, dtype=float)
+            arr = _values(value)
             self.tables[name] = tuple(float(v) for v in arr.ravel())
             self.ns[name] = self.tables[name]
             from .auto import WEIGHT_TABLES
@@ -297,14 +332,14 @@ class _Interp:
             self.real_of[name] = value
         return self.table_of[key]
 
-    def state_value(self, obj: Any, attr: str, value: Any) -> Any:
+    def state_value(self, obj: Any, attr: str, value: Any, hint: Optional[str] = None) -> Any:
         """An attribute that is state: its list (an array) or its value now (a number)."""
         key = (id(obj), attr)
         if key not in self.state:
-            name = self.fresh(f"S_{type(obj).__name__}_{attr}_")
+            name = self.fresh(re.sub(r"\W+", "_", f"S_{hint or type(obj).__name__ + '_' + attr}_"))
             self.real_of[name] = value
-            if isinstance(value, self.np.ndarray):
-                value = self.np.array(value, dtype=float)
+            if _is_array(value):
+                value = _values(value)
                 self.lists[name] = max(1, value.size)
             elif isinstance(value, (int, float, self.np.integer, self.np.floating)) \
                     and not isinstance(value, (bool, self.np.bool_)):
@@ -322,15 +357,112 @@ class _Interp:
         return self.scalar(ast.Subscript(value=_load(name), slice=ast.Constant(0), ctx=ast.Load()),
                            "st")
 
-    def adopt(self, v: Any) -> Any:
-        """A float array reached in Python values (a dict's or a list's item, not an
-        attribute): a table, or state if the method changes it (by its identity)."""
-        if isinstance(v, self.np.ndarray) and v.dtype.kind == "f":
+    def adopt(self, v: Any, hint: Optional[str] = None) -> Any:
+        """An array reached in Python values (an attribute, a dict's or a list's item; a
+        numpy array or a torch tensor): a table, or state if the method changes it.
+        Arrays are known by their identity, however they are reached."""
+        if _is_array(v):
             key = (id(v), "")
             if self.state_keys is not None and key in self.state_keys:
-                return self.state_value(v, "", v)
-            return self.const_array(v, "", v)
+                out = self.state_value(v, "", v, hint)
+            else:
+                out = self.const_array(v, "", v, hint)
+            if self.torch and getattr(v, "requires_grad", False):
+                self.req_lists.add(out.name)          # (a parameter: autograd's leaf)
+            return out
         return v
+
+    def requires(self, v: Any) -> bool:
+        """Does v depend on a value that needs gradients (a torch parameter)?"""
+        if isinstance(v, Lazy):
+            return getattr(v, "req", False) or (v.real is not None and v.real.name in self.req_lists)
+        if isinstance(v, Arr):
+            return v.name in self.req_lists
+        if isinstance(v, Sym):
+            return getattr(v, "req", False) or (v.arr is not None and v.arr.name in self.req_lists)
+        return False
+
+    def record(self, what: str, out: Any, *ins: Any, **info: Any) -> None:
+        """An operation for autograd, if one of its inputs needs gradients."""
+        if not self.recording or not any(self.requires(v) for v in ins):
+            return
+        if isinstance(out, (Lazy, Sym)):
+            out.req = True
+        if isinstance(out, Arr) and not (isinstance(out, Lazy) and out.real is None):
+            self.req_lists.add(out.name)
+        self.tape.append((what, out, ins, info))
+
+    # ------------------------------------------------------------ numbers as state
+    def _number_state(self, key, obj, attr: str, value: Any) -> Any:
+        if self.state_keys is not None and key in self.state_keys:
+            return self.state_value(obj, attr, value)
+        return value
+
+    def _set_number(self, key, expr: ast.expr) -> Sym:
+        if self.state_keys is None:
+            self.mutated.add(key)
+        if key in self.state:
+            name = self.state[key][0]
+            self.emit(ast.Assign(targets=[ast.Subscript(value=_load(name), slice=ast.Constant(0),
+                                                        ctx=ast.Store())], value=expr))
+            return Sym(ast.Subscript(value=_load(name), slice=ast.Constant(0), ctx=ast.Load()))
+        return Sym(expr)
+
+    def attr_value(self, obj: Any, attr: str) -> Any:
+        """A number attribute that Python code (a scheduler's step) changes: state."""
+        return self._number_state((id(obj), attr), obj, attr, getattr(obj, attr))
+
+    def set_attr(self, obj: Any, attr: str, expr: ast.expr) -> Sym:
+        return self._set_number((id(obj), attr), expr)
+
+    def int_value(self, t: Any) -> Any:
+        """An integer held in a tensor (a step count): state, an integer."""
+        value = int(t.item()) if _is_tensor(t) else int(t)
+        return self._number_state((id(t), ""), t, "", value)
+
+    def set_int(self, t: Any, expr: ast.expr) -> Sym:
+        return self._set_number((id(t), ""), expr)
+
+    def item_value(self, container: Any, key: Any, sub: Optional[int] = None) -> Any:
+        """A number in a dict (an optimizer's group['lr'], ['betas'][0]): state if it
+        is changed."""
+        k = (id(container), f"[{key!r}]" + (f"[{sub}]" if sub is not None else ""))
+        self.item_paths[k] = (container, (("item", key),) + ((("item", sub),) if sub is not None
+                                                             else ()))
+        value = container[key] if sub is None else container[key][sub]
+        return self._number_state(k, container, k[1], float(value))
+
+    def set_item(self, container: Any, key: Any, expr: ast.expr, sub: Optional[int] = None) -> Sym:
+        k = (id(container), f"[{key!r}]" + (f"[{sub}]" if sub is not None else ""))
+        self.item_paths[k] = (container, (("item", key),) + ((("item", sub),) if sub is not None
+                                                             else ()))
+        return self._set_number(k, expr)
+
+    def power_of(self, base: Any, n: Any) -> Any:
+        """base ** n for an integer n computed in hardware; base a constant or computed
+        (then squared for n's bits)."""
+        if not isinstance(n, Sym):
+            return self.binop(ast.Pow(), base, n)
+        if not isinstance(base, Sym):
+            return self.power(float(base), n)
+        p, b, k = self.fresh("pw"), self.fresh("pb"), self.fresh("k")
+        self.emit(_assign(p, ast.Constant(1.0)))
+        self.emit(_assign(b, copy.deepcopy(base.expr)))
+        bit = ast.BinOp(left=ast.BinOp(left=copy.deepcopy(n.expr), op=ast.RShift(), right=_load(k)),
+                        op=ast.BitAnd(), right=ast.Constant(1))
+        self.emit(ast.For(target=ast.Name(id=k, ctx=ast.Store()),
+                          iter=ast.Call(func=_load("range"), args=[ast.Constant(POW_BITS)],
+                                        keywords=[]),
+                          body=[ast.If(test=bit, body=[_assign(p, ast.BinOp(
+                              left=_load(p), op=ast.Mult(), right=_load(b)))], orelse=[]),
+                                _assign(b, ast.BinOp(left=_load(b), op=ast.Mult(), right=_load(b)))],
+                          orelse=[], type_comment=None))
+        return Sym(_load(p))
+
+    def param(self, mod: Any, attr: str) -> Any:
+        """A module's parameter or buffer (None if it has none)."""
+        v = getattr(mod, attr)
+        return None if v is None else self.adopt(v, f"{type(mod).__name__}_{attr}")
 
     def written(self, target: Arr) -> None:
         """target (a constant table) is written: an attribute changed in place."""
@@ -380,12 +512,18 @@ class _Interp:
             return self.const_array(None, f"c{next(self.counter)}", v)
         return v
 
-    def elementwise(self, fn: Callable[..., ast.expr], *vals: Any, base: str = "a") -> Any:
+    def elementwise(self, fn: Callable[..., ast.expr], *vals: Any, base: str = "a",
+                    op: Optional[Tuple] = None) -> Any:
+        """fn of the operands' elements, broadcast: a Lazy (a Sym of scalars). op says
+        what fn computes (for autograd)."""
         vals = tuple(v if isinstance(v, Lazy) else self.to_arr(v) for v in vals)
         shapes = [v.shape for v in vals if isinstance(v, Arr)]
         if not shapes:
-            return Sym(fn(*[self.elem(v, (), []) for v in vals]))
-        return Lazy(self, _bcast(*shapes), fn, vals)
+            out: Any = Sym(fn(*[self.elem(v, (), []) for v in vals]), op, vals)
+        else:
+            out = Lazy(self, _bcast(*shapes), fn, vals, op=op)
+        self.record("ew", out, *vals, op=op)
+        return out
 
     def reduce(self, a: Arr, axis, keepdims: bool, kind: str) -> Any:
         a = self.to_arr(a)
@@ -449,10 +587,14 @@ class _Interp:
                 else:
                     strides.append(result.strides[k])
                     k += 1
-            return result.view(shape, strides)
-        if not out_shape:
-            return Sym(result.at([ast.Constant(0)]))
-        return result
+            out: Any = result.view(shape, strides)
+        elif not out_shape:
+            out = Sym(result.at([ast.Constant(0)]), arr=Arr(result.name, (), (), 0))
+        else:
+            out = result
+        if kind != "argmax":
+            self.record("reduce", out, a, axes=axes, kind=kind, result=result)
+        return out
 
     def matmul(self, a: Any, b: Any) -> Arr:
         a, b = self.to_arr(a), self.to_arr(b)
@@ -477,6 +619,7 @@ class _Interp:
             self.loops((k,), inner)
             self.emit(ast.Assign(targets=[_store(out.at([i, j]))], value=_load(acc)))
         self.loops((n, m), body)
+        self.record("matmul", out, va, vb)
         shape = ((n,) if len(a.shape) == 2 else ()) + ((m,) if len(b.shape) == 2 else ())
         return out.view(shape, _contiguous(shape)) if shape != (n, m) else out
 
@@ -497,6 +640,67 @@ class _Interp:
         finally:
             self.frames.pop()
         return None
+
+    def loop_step(self, fn: Callable, loop, roots: Any, inputs: List[Any], holder: Any) -> Tuple:
+        """One step of a function's loop over batches (see translate): the statements
+        before the loop run as Python (model.train(), total = 0), the loop's body is
+        the step, its target the inputs; the locals the body changes are state (kept
+        from one step to the next) and the results."""
+        np = self.np
+        loader, fd, _, _ = loop
+        g = fn.__globals__
+        sig = inspect.signature(fn)
+        frame: Dict[str, Any] = {}
+        for p, par in sig.parameters.items():
+            if p == loader:
+                frame[p] = None
+            elif hasattr(roots, p):
+                frame[p] = getattr(roots, p)
+            elif par.default is not inspect.Parameter.empty:
+                frame[p] = par.default
+        self.frames.append(frame)
+        try:
+            at = next(i for i, st in enumerate(fd.body) if isinstance(st, ast.For)
+                      and isinstance(st.iter, ast.Name) and st.iter.id == loader)
+            self.block(fd.body[:at], frame, g)
+            lp = fd.body[at]
+            assigned = {n.id for st in lp.body for n in ast.walk(st)
+                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)} | {
+                st.target.id for st in ast.walk(lp) if isinstance(st, ast.AugAssign)
+                and isinstance(st.target, ast.Name)}
+            carried = [v for v in frame if v in assigned and isinstance(
+                frame[v], (int, float, np.integer, np.floating)) and not isinstance(frame[v], bool)]
+            for v in carried:
+                key = (id(holder), v)
+                if self.state_keys is None:
+                    self.mutated.add(key)
+                value = frame[v]
+                value = int(value) if isinstance(value, (int, np.integer)) else float(value)
+                frame[v] = (self.state_value(holder, v, value)
+                            if self.state_keys is not None and key in self.state_keys else value)
+            self.store(lp.target, tuple(inputs) if len(inputs) > 1 else inputs[0], frame, g)
+            try:
+                self.block(lp.body, frame, g)
+            except _Continue:
+                pass
+            except _Break:
+                raise NotTranslatable("break in the loop over batches is not supported")
+            out = []
+            for v in carried:
+                key, new = (id(holder), v), frame[v]
+                if key in self.state:
+                    name = self.state[key][0]
+                    self.emit(ast.Assign(targets=[ast.Subscript(value=_load(name),
+                                                                slice=ast.Constant(0),
+                                                                ctx=ast.Store())],
+                                         value=self.elem(new, (), [])))
+                out.append(new if isinstance(new, Sym) else Sym(ast.Constant(new)))
+            if not out:
+                raise NotTranslatable("The loop over batches computes nothing it keeps (its "
+                                      "results are the locals it changes, like a total loss)")
+            return tuple(out)
+        finally:
+            self.frames.pop()
 
     def block(self, stmts, frame, g) -> None:
         for s in stmts:
@@ -550,7 +754,7 @@ class _Interp:
     def store(self, t: ast.expr, value: Any, frame, g) -> None:
         if isinstance(t, ast.Name):
             if isinstance(value, Sym) and not isinstance(value.expr, (ast.Name, ast.Constant)):
-                value = self.scalar(value.expr, t.id + "_")
+                value = self.rename(value, t.id + "_")
             frame[t.id] = value
             return
         if isinstance(t, ast.Attribute):
@@ -560,7 +764,7 @@ class _Interp:
                     and t.attr not in self.shadow.get(id(obj), {}):
                 self.mutated.add(key)                 # (read, then changed: state)
             if isinstance(value, Sym) and not isinstance(value.expr, (ast.Name, ast.Constant)):
-                value = self.scalar(value.expr, t.attr + "_")
+                value = self.rename(value, t.attr + "_")
             self.shadow.setdefault(id(obj), {})[t.attr] = value
             return
         if isinstance(t, (ast.Tuple, ast.List)):
@@ -622,6 +826,7 @@ class _Interp:
             self.emit(ast.Assign(targets=[_store(target.at(idx))],
                                  value=self.elem(value, target.shape, idx)))
         self.loops(target.shape, body)
+        self.record("copy", target, value)
 
     def held(self) -> List[Lazy]:
         """The elementwise results in the running functions' variables and the objects'
@@ -691,6 +896,8 @@ class _Interp:
             obj = self.expr(n.value, frame, g)
             if isinstance(obj, Arr):
                 return self.arr_attr(obj, n.attr)
+            if isinstance(obj, Sym) and self.torch:
+                return _Method(obj, n.attr)
             sh = self.shadow.get(id(obj), {})
             if n.attr in sh:
                 return sh[n.attr]
@@ -698,10 +905,8 @@ class _Interp:
             self.first.setdefault(key, "r")
             value = getattr(obj, n.attr)
             if self.state_keys is not None and key in self.state_keys:
-                return self.state_value(obj, n.attr, value)
-            if isinstance(value, np.ndarray) and value.dtype.kind in "fiub":
-                return self.const_array(obj, n.attr, value)
-            return value
+                return self.state_value(obj, n.attr, value)       # (reassigned, or a number)
+            return self.adopt(value, f"{type(obj).__name__}_{n.attr}")
         if isinstance(n, (ast.Tuple, ast.List)):
             vals = [self.expr(e, frame, g) for e in n.elts]
             return tuple(vals) if isinstance(n, ast.Tuple) else vals
@@ -711,7 +916,8 @@ class _Interp:
             v = self.expr(n.operand, frame, g)
             if isinstance(v, (Arr, Sym)):
                 if isinstance(n.op, ast.USub):
-                    return self.elementwise(lambda x: ast.UnaryOp(op=ast.USub(), operand=x), v)
+                    return self.elementwise(lambda x: ast.UnaryOp(op=ast.USub(), operand=x), v,
+                                            op=("neg",))
                 raise NotTranslatable(f"Unsupported operator in {ast.unparse(n)}")
             return {ast.USub: lambda x: -x, ast.UAdd: lambda x: +x, ast.Not: lambda x: not x,
                     ast.Invert: lambda x: ~x}[type(n.op)](v)
@@ -722,7 +928,8 @@ class _Interp:
                 if type(op) not in _CMPS:
                     raise NotTranslatable(f"Unsupported comparison in {ast.unparse(n)}")
                 return self.elementwise(lambda x, y: ast.Compare(left=x, ops=[type(op)()],
-                                                                 comparators=[y]), a, b, base="m")
+                                                                 comparators=[y]), a, b, base="m",
+                                        op=("cmp",))
             return {ast.Is: lambda x, y: x is y, ast.IsNot: lambda x, y: x is not y,
                     ast.In: lambda x, y: x in y, ast.NotIn: lambda x, y: x not in y,
                     **_CMPS}[type(op)](a, b)
@@ -777,11 +984,16 @@ class _Interp:
         return out
 
     def arr_attr(self, a: Arr, attr: str) -> Any:
+        if self.torch and attr == "grad":
+            g = self.grads.get(a.name) if not isinstance(a, Lazy) else None
+            return None if g is None else Arr(g.name, a.shape, a.strides, a.offset)
+        if self.torch and attr == "data":
+            return a
         if attr == "T":
             return a.view(a.shape[::-1], a.strides[::-1])
         if attr == "shape":
             return a.shape
-        if attr == "size":
+        if attr == "size" and not self.torch:        # (torch's is a method)
             return a.size
         if attr == "ndim":
             return len(a.shape)
@@ -816,7 +1028,8 @@ class _Interp:
         shape += list(a.shape[d:])
         strides += list(a.strides[d:])
         if not shape:
-            return Sym(Arr(a.name, (1,), (1,), offset, a.const).at([ast.Constant(0)]))
+            return Sym(Arr(a.name, (1,), (1,), offset, a.const).at([ast.Constant(0)]),
+                       arr=Arr(a.name, (), (), offset, a.const))
         return a.view(tuple(shape), tuple(strides), offset)
 
     def is_index_array(self, v: Any) -> bool:
@@ -837,7 +1050,10 @@ class _Interp:
         shape = _bcast(*[o.shape for o in ops if isinstance(o, Arr)])
         if store:
             return _Scatter(a, ops, shape)
-        return Lazy(self, shape, lambda *ix: a.at([_int_index(x) for x in ix]), ops, extra=(a,))
+        out = Lazy(self, shape, lambda *ix: a.at([_int_index(x) for x in ix]), ops, extra=(a,),
+                   op=("gather",))
+        self.record("gather", out, a, *ops)
+        return out
 
     def binop(self, op: ast.operator, a: Any, b: Any) -> Any:
         if isinstance(op, ast.MatMult):
@@ -857,9 +1073,11 @@ class _Interp:
         if isinstance(op, ast.Div) and isinstance(b, Sym) and isinstance(self.to_arr(a), Arr) \
                 and not isinstance(b.expr, ast.Constant):
             # An array by a computed scalar: by its reciprocal, computed once
-            inv = self.scalar(ast.BinOp(left=ast.Constant(1.0), op=ast.Div(),
-                                        right=copy.deepcopy(b.expr)), "inv")
-            return self.elementwise(lambda x, y: ast.BinOp(left=x, op=ast.Mult(), right=y), a, inv)
+            inv = self.rename(self.elementwise(
+                lambda y: ast.BinOp(left=ast.Constant(1.0), op=ast.Div(), right=y), b,
+                op=("recip",)), "inv")
+            return self.elementwise(lambda x, y: ast.BinOp(left=x, op=ast.Mult(), right=y), a, inv,
+                                    op=("mul",))
         if isinstance(op, ast.Pow) and isinstance(b, int) and not isinstance(a, int):
             k = b                                    # x ** k: products
             if k < 1:
@@ -870,8 +1088,10 @@ class _Interp:
                 for _ in range(k - 1):
                     out = ast.BinOp(left=out, op=ast.Mult(), right=copy.deepcopy(x))
                 return out
-            return self.elementwise(power, a)
-        return self.elementwise(lambda x, y: ast.BinOp(left=x, op=type(op)(), right=y), a, b)
+            return self.elementwise(power, a, op=("pow", k))
+        tag = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div"}.get(type(op), "int")
+        return self.elementwise(lambda x, y: ast.BinOp(left=x, op=type(op)(), right=y), a, b,
+                                op=(tag,))
 
     def power(self, c: float, n: Sym) -> Sym:
         """c ** n for an integer n computed in hardware (n >= 0, below 2 ** POW_BITS):
@@ -899,11 +1119,20 @@ class _Interp:
         return out
 
     def call_expr(self, n: ast.Call, frame, g) -> Any:
-        np = self.np
         fn = self.expr(n.func, frame, g)
         args = [self.expr(a, frame, g) for a in n.args]
         kwargs = {k.arg: self.expr(k.value, frame, g) for k in n.keywords}
+        return self.call_value(fn, args, kwargs, ast.unparse(n))
+
+    def call_value(self, fn: Any, args: List[Any], kwargs: Dict[str, Any], text: str = "") -> Any:
+        """Calling fn (a Python value) on interpreter values."""
+        np = self.np
         if isinstance(fn, _Method):
+            if self.torch:
+                from .torch_ops import tensor_method
+                out = tensor_method(self, fn.arr, fn.name, args, kwargs)
+                if out is not NotImplemented:
+                    return out
             return self.method(fn.arr, fn.name, args, kwargs)
         if isinstance(getattr(fn, "__self__", None), np.random.Generator):
             if getattr(fn, "__name__", "") != "random":
@@ -911,6 +1140,18 @@ class _Interp:
                                       "(only .random)")
             return self.random(fn.__self__, args, kwargs)
         sym = any(isinstance(v, (Arr, Sym)) for v in list(args) + list(kwargs.values()))
+        if self.torch:
+            from . import torch_ops, torch_optim
+            if torch_ops.is_module(fn):
+                return torch_ops.module_call(self, fn, args, kwargs)
+            if torch_ops.is_torch_function(fn):
+                if sym or any(isinstance(x, Arr) for v in args if isinstance(v, (list, tuple))
+                              for x in v):
+                    return torch_ops.function(self, fn, args, kwargs)
+                return fn(*args, **kwargs)
+            out = torch_optim.method_call(self, fn, args, kwargs)
+            if out is not NotImplemented:
+                return out
         if getattr(fn, "__module__", None) in ("numpy", "numpy.lib.stride_tricks") or (
                 isinstance(fn, np.ufunc)):
             name = getattr(fn, "__name__", "")
@@ -932,7 +1173,7 @@ class _Interp:
             return a.shape[0] if isinstance(a, Arr) else len(a)
         if fn in (abs,) and sym:
             return self.elementwise(lambda x: ast.Call(func=ast.Name(id="abs", ctx=ast.Load()),
-                                                       args=[x], keywords=[]), args[0])
+                                                       args=[x], keywords=[]), args[0], op=("abs",))
         if fn in (print,):
             return None
         if inspect.ismethod(fn) and not getattr(fn.__self__, "__module__", "").startswith("numpy"):
@@ -940,8 +1181,7 @@ class _Interp:
         if inspect.isfunction(fn):
             return self.call(fn, args, kwargs)
         if sym:
-            raise NotTranslatable(f"Unsupported call on values computed in hardware: "
-                                  f"{ast.unparse(n)}")
+            raise NotTranslatable(f"Unsupported call on values computed in hardware: {text}")
         for a in _arrays_in(list(args) + list(kwargs.values())):    # (kept by Python code?)
             if not isinstance(a, Lazy):
                 self.handed[id(a)] = (self.fills.get(a.name) if a.name not in self.dirty
@@ -955,6 +1195,8 @@ class _Interp:
         size = kwargs.get("size", args[0] if args else None)
         shape = () if size is None else (
             tuple(int(x) for x in size) if isinstance(size, (tuple, list)) else (int(size),))
+        if gen is None:                          # (torch's: its default generator)
+            gen = _torch_generator()
         key = (id(gen), RANDOM_STATE)
         self.generators[id(gen)] = gen
         if self.state_keys is None:
@@ -988,9 +1230,10 @@ class _Interp:
             axis = kwargs.get("axis", args[0] if args else None)
             keep = bool(kwargs.get("keepdims", False))
             if name == "min":
-                neg = self.elementwise(lambda x: ast.UnaryOp(op=ast.USub(), operand=x), a)
+                neg = self.elementwise(lambda x: ast.UnaryOp(op=ast.USub(), operand=x), a,
+                                       op=("neg",))
                 return self.elementwise(lambda x: ast.UnaryOp(op=ast.USub(), operand=x),
-                                        self.reduce(neg, axis, keep, "max"))
+                                        self.reduce(neg, axis, keep, "max"), op=("neg",))
             return self.reduce(a, axis, keep, name)
         if name == "reshape":
             shape = args[0] if len(args) == 1 and isinstance(args[0], (tuple, list)) else tuple(args)
@@ -1018,11 +1261,12 @@ class _Interp:
         if name in TABLE_UFUNCS:
             return self.elementwise(lambda x: ast.Call(
                 func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr=name,
-                                   ctx=ast.Load()), args=[x], keywords=[]), args[0])
+                                   ctx=ast.Load()), args=[x], keywords=[]), args[0], op=(name,))
         if name in ("maximum", "minimum"):
             fn = "max" if name == "maximum" else "min"
             return self.elementwise(lambda x, y: ast.Call(func=ast.Name(id=fn, ctx=ast.Load()),
-                                                          args=[x, y], keywords=[]), *args[:2])
+                                                          args=[x, y], keywords=[]), *args[:2],
+                                    op=(fn,))
         if name in ("sum", "max", "mean", "argmax", "amax"):
             return self.method(self.to_arr(args[0]), "max" if name == "amax" else name,
                                list(args[1:]), kwargs)
@@ -1033,13 +1277,13 @@ class _Interp:
             return a
         if name == "abs":
             return self.elementwise(lambda x: ast.Call(func=ast.Name(id="abs", ctx=ast.Load()),
-                                                       args=[x], keywords=[]), args[0])
+                                                       args=[x], keywords=[]), args[0], op=("abs",))
         if name == "transpose":
             return self.method(self.to_arr(args[0]), "transpose", list(args[1:2]), {})
         if name == "reshape":
             return self.method(self.to_arr(args[0]), "reshape", [args[1]], {})
         if name == "pad":
-            a = self.to_arr(args[0])
+            a = args[0] if isinstance(args[0], Lazy) else self.to_arr(args[0])   # (computed in the copy)
             mode = kwargs.get("mode", args[2] if len(args) > 2 else "constant")
             if mode != "constant" or kwargs.get("constant_values", 0) != 0:
                 raise NotTranslatable("np.pad: only zeros around (mode='constant') are supported")
@@ -1096,6 +1340,27 @@ class _Method:
         self.arr, self.name = arr, name
 
 
+def _is_tensor(v: Any) -> bool:
+    return type(v).__module__.startswith("torch") and hasattr(v, "detach") \
+        and hasattr(v, "is_floating_point")
+
+
+def _is_array(v: Any) -> bool:
+    """A numpy array of numbers or a torch tensor (an array the program holds)."""
+    np = _np()
+    if isinstance(v, np.ndarray):
+        return v.dtype.kind in "fiub"
+    return _is_tensor(v)
+
+
+def _values(v: Any) -> Any:
+    """An array's values as a float numpy array (a torch tensor's too)."""
+    np = _np()
+    if _is_tensor(v):
+        v = v.detach().cpu().numpy()
+    return np.array(v, dtype=float)
+
+
 def _arrays_in(v: Any, depth: int = 0) -> List[Arr]:
     if isinstance(v, Arr):
         return [v]
@@ -1116,31 +1381,45 @@ def _children(x: Any) -> List[Tuple[Tuple[str, Any], Any]]:
         return [(("item", k), v) for k, v in x.items()]
     if isinstance(x, (list, tuple)):
         return [(("item", i), v) for i, v in enumerate(x)]
-    if isinstance(x, (np.ndarray, type)) or inspect.ismodule(x) or callable(x) \
-            or isinstance(x, (Arr, Sym)):
+    if isinstance(x, (np.ndarray, type)) or inspect.ismodule(x) or inspect.isroutine(x) \
+            or isinstance(x, (Arr, Sym)) or _is_tensor(x):
         return []
     d = getattr(x, "__dict__", None)
     return [(("attr", k), v) for k, v in d.items()] if isinstance(d, dict) else []
 
 
-def _paths(root: Any, depth: int = 8) -> Dict[int, Tuple]:
-    """id(x) -> the path from root to x (attributes, items), for what root holds. A
-    dict key that is id() of an array root holds is written as that array's path."""
+def _paths(root: Any, depth: int = 16) -> Dict[int, Tuple]:
+    """id(x) -> the path from root to x (attributes, items), for what root holds (for
+    _Roots, each object in turn: the first's paths first). A dict key that is id()
+    of an array root holds, or such an object (a parameter), is written as its path."""
     out: Dict[int, Tuple] = {id(root): ()}
-    queue = [(root, ())]
-    while queue:
-        x, path = queue.pop(0)
-        if len(path) >= depth:
+    starts = ([(v, (("attr", k),)) for k, v in vars(root).items()] if isinstance(root, _Roots)
+              else [(root, ())])
+    for start, p0 in starts:
+        if isinstance(start, _ATOMS):
             continue
-        for step, v in _children(x):
-            if isinstance(v, _ATOMS) or id(v) in out:
+        out.setdefault(id(start), p0)
+        queue = [(start, p0)]
+        while queue:
+            x, path = queue.pop(0)
+            if len(path) >= depth:
                 continue
-            out[id(v)] = path + (step,)
-            queue.append((v, path + (step,)))
-    for k, path in out.items():
-        out[k] = tuple(("id", out[s[1]]) if s[0] == "item" and type(s[1]) is int and s[1] in out
-                       and s[1] != id(None) and len(out[s[1]]) else s for s in path)
-    return out
+            for step, v in _children(x):
+                if isinstance(v, _ATOMS) or id(v) in out:
+                    continue
+                out[id(v)] = path + (step,)
+                queue.append((v, path + (step,)))
+
+    def symbolic(s):
+        if s[0] != "item":
+            return s
+        k = s[1]
+        if type(k) is int and k in out and k != id(None) and len(out[k]):
+            return ("id", out[k])
+        if not isinstance(k, _ATOMS) and id(k) in out and len(out[id(k)]):
+            return ("key", out[id(k)])
+        return s
+    return {k: tuple(symbolic(s) for s in path) for k, path in out.items()}
 
 
 def _resolve(root: Any, path: Tuple) -> Any:
@@ -1150,15 +1429,103 @@ def _resolve(root: Any, path: Tuple) -> Any:
             x = getattr(x, k)
         elif kind == "item":
             x = x[k]
+        elif kind == "key":
+            x = x[_resolve(root, k)]
         else:
             x = x[id(_resolve(root, k))]
     return x
 
 
+def loops_only(func: Callable, samples: List[Any]) -> bool:
+    """Designs only this translator takes: torch code, or a loop over batches."""
+    if not samples:
+        return False
+    first = samples[0] if isinstance(samples[0], tuple) else (samples[0],)
+    owner = func.__self__ if inspect.ismethod(func) else None
+    if any(_is_tensor(v) for v in first) or (owner is not None and _torchy(owner)):
+        return True
+    return owner is None and _training_loop(func, first) is not None
+
+
+class _Roots:
+    """The objects a function is given (the model, the optimizer, ...), by name."""
+
+    def __init__(self, objs: Dict[str, Any]) -> None:
+        self.__dict__.update(objs)
+
+
+def _torchy(obj: Any) -> bool:
+    """Is obj (or what it holds, for _Roots) one of torch's objects?"""
+    objs = list(vars(obj).values()) if isinstance(obj, _Roots) else [obj]
+    return any(any(c.__module__.startswith("torch") for c in type(o).__mro__) for o in objs)
+
+
+def _training_loop(fn: Callable, first: Tuple[Any, ...]):
+    """A function whose body loops over an argument given as batches (a list of
+    tuples of arrays, a training epoch): (that argument, the function's AST, its
+    position, the loop's target names); else None."""
+    try:
+        fd = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
+    except (OSError, TypeError, SyntaxError):
+        return None
+    params = [a.arg for a in fd.args.args]
+    for st in fd.body:
+        if isinstance(st, ast.For) and isinstance(st.iter, ast.Name) and st.iter.id in params:
+            k = params.index(st.iter.id)
+            if k >= len(first):
+                return None
+            batches = first[k]
+            if not isinstance(batches, (list, tuple)) or not batches:
+                return None
+            b0 = batches[0]
+            items = b0 if isinstance(b0, (tuple, list)) else (b0,)
+            if not all(_is_array(x) for x in items):
+                return None
+            t = st.target
+            names = ([e.id for e in t.elts] if isinstance(t, (ast.Tuple, ast.List))
+                     and all(isinstance(e, ast.Name) for e in t.elts)
+                     else [t.id] if isinstance(t, ast.Name) else None)
+            if names is None or len(names) != len(items):
+                raise NotTranslatable("The loop over batches must unpack each into names")
+            return st.iter.id, fd, k, names
+    return None
+
+
+def _callable(func: Callable) -> Callable:
+    """A torch module stands for its forward method."""
+    import sys
+    if "torch" in sys.modules:
+        from .torch_ops import is_module
+        if is_module(func):
+            return func.forward
+    return func
+
+
+def _holder(path: Tuple) -> Optional[Tuple[Tuple, str]]:
+    """(the path of the object, the attribute) if path ends at an attribute (a torch
+    module's parameter or buffer too); else None."""
+    if path and path[-1][0] == "attr":
+        return path[:-1], path[-1][1]
+    if len(path) >= 2 and path[-2] in (("attr", "_parameters"), ("attr", "_buffers")) \
+            and path[-1][0] == "item":
+        return path[:-2], path[-1][1]
+    return None
+
+
 def _path_text(path: Tuple) -> str:
     out = ""
-    for kind, k in path:
+    path = list(path)
+    for i, (kind, k) in enumerate(path):
+        # (a torch module's children and parameters as you would write them)
+        if kind == "attr" and k in ("_modules", "_parameters", "_buffers") \
+                and i + 1 < len(path) and path[i + 1][0] == "item":
+            name = path[i + 1][1]
+            path[i + 1] = ("attr" if str(name).isidentifier() else "item",
+                           name if str(name).isidentifier() else
+                           (int(name) if str(name).isdigit() else name))
+            continue
         out += (f".{k}" if kind == "attr" else f"[{k!r}]" if kind == "item"
+                else f"[{_path_text(k).lstrip('.')}]" if kind == "key"
                 else f"[id({_path_text(k)})]")
     return out
 
@@ -1168,9 +1535,16 @@ _XORSHIFT = ((ast.LShift, 13), (ast.RShift, 17), (ast.LShift, 5))
 
 
 def _seed(gen: Any) -> int:
-    """A generator's starting state in hardware, from its numpy state (not drawing)."""
+    """A generator's starting state in hardware, from its state (not drawing)."""
     import zlib
-    return zlib.crc32(repr(gen.bit_generator.state).encode()) or 1
+    if hasattr(gen, "bit_generator"):
+        return zlib.crc32(repr(gen.bit_generator.state).encode()) or 1
+    return zlib.crc32(bytes(gen.get_state().tolist())) or 1          # (torch's)
+
+
+def _torch_generator() -> Any:
+    import torch
+    return torch.default_generator
 
 
 def _xorshift(x: int) -> int:
@@ -1240,20 +1614,36 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     np = _np()
     if not samples:
         raise NotTranslatable("A numpy design needs example inputs (samples=...) for its shapes")
+    func = _callable(func)
     original = func.__self__ if inspect.ismethod(func) else None
     fn = func.__func__ if original is not None else func
-    # (run on a copy: Python code the method calls, dict.setdefault, may change the object)
-    memo: Dict[int, Any] = {}
-    obj = copy.deepcopy(original, memo) if original is not None else None
-    back = {id(memo[id(o)]): o for o in memo.get(id(memo), []) if id(o) in memo}
     sig = inspect.signature(func)
     first = samples[0] if isinstance(samples[0], tuple) else (samples[0],)
-    names = list(sig.parameters)[:len(first)]
+    loop = _training_loop(fn, first) if original is None else None
+    # (run on a copy: Python code the method calls, dict.setdefault, may change the object)
+    memo: Dict[int, Any] = {}
+    steps: Optional[List[Any]] = None
+    if loop is not None:
+        # A function with a loop over batches: one step of the loop, its objects copied
+        params, (loader, fd, k, targets) = list(sig.parameters), loop
+        steps = [b for smp in samples for b in (smp if isinstance(smp, tuple) else (smp,))[k]]
+        steps = [tuple(b) if isinstance(b, (tuple, list)) else (b,) for b in steps]
+        original = _Roots({p: v for p, v in zip(params, first) if p != loader})
+        names = targets
+        first = steps[0]
+    else:
+        names = list(sig.parameters)[:len(first)]
+    obj = copy.deepcopy(original, memo) if original is not None else None
+    back = {id(memo[id(o)]): o for o in memo.get(id(memo), []) if id(o) in memo}
     shapes = {p: tuple(np.shape(v)) for p, v in zip(names, first)}
+
+    torch_mode = any(_is_tensor(v) for v in first) or _torchy(original)
+    carried_holder = type(fn.__name__, (), {})()               # (the loop's carried locals)
 
     def run(state_keys):
         ns: Dict[str, Any] = {"np": np, EXACT_SQRT: True}
         it = _Interp(ns, state_keys)
+        it.torch = torch_mode
         args = []
         for p in names:
             if shapes[p] == ():
@@ -1261,6 +1651,8 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
             else:
                 it.lists[p] = math.prod(shapes[p])
                 args.append(Arr(p, shapes[p], _contiguous(shapes[p])))
+        if loop is not None:
+            return it, it.loop_step(fn, loop, obj, args, carried_holder)
         return it, it.call(fn, args, {}, obj=obj)
 
     # First to find the state (attributes read, then changed), then to build it
@@ -1317,12 +1709,30 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     memories: Dict[str, Tuple[str, Any, Any]] = {}
     paths = _paths(obj) if obj is not None else {}
     tr_paths: Dict[str, Tuple] = {}
+    root_name = "" if isinstance(original, _Roots) else type(original).__name__
+
+    def where(path):
+        text = _path_text(path)
+        return text[1:] if not root_name and text.startswith(".") else root_name + text
     for key, (name, value, label, owner) in list(it.state.items()):
-        if key[1] == "":                       # (an array the object holds in a container)
+        if key in it.item_paths:               # (a number in a dict: its path)
+            container, steps_to = it.item_paths[key]
+            if id(container) not in paths:
+                raise NotTranslatable("A number the method changes isn't held by the object")
+            path = paths[id(container)] + steps_to
+            tr_paths[name] = path
+            label, owner = where(path), original
+        elif key[1] == "":                     # (an array: where the object holds it)
             if key[0] not in paths:
                 raise NotTranslatable("An array the method changes isn't held by the object")
-            tr_paths[name] = paths[key[0]]
-            label, owner = type(original).__name__ + _path_text(paths[key[0]]), original
+            path = paths[key[0]]
+            held = _holder(path)
+            if held is not None:               # (an attribute: of its object)
+                holder = _resolve(obj, held[0])
+                label, owner = f"{type(holder).__name__}.{held[1]}", back.get(id(holder), holder)
+            else:                              # (in a dict or a list: its path)
+                tr_paths[name] = path
+                label, owner = where(path), original
         else:
             owner = back.get(id(owner), owner)
         it.state[key] = (name, value, label, owner)
@@ -1342,7 +1752,13 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     tr.memories = memories
     tr.generators = {id(gen): _seed(gen) for gen in it.generators.values()}
     tr.paths = tr_paths
-    _check(tr, func, samples)
+    tr.torch = torch_mode
+    tr.steps = steps
+    if loop is not None:
+        tr.carried = type(carried_holder).__name__
+        _check_loop(tr, fn, original, loop, steps)
+    else:
+        _check(tr, func, samples)
     return tr
 
 
@@ -1418,22 +1834,81 @@ class _drawing:
 
     def __enter__(self):
         import sys
+        draws = {g: _Draws(seed) for g, seed in self.generators.items()}
+        torch_gen = id(_torch_generator()) if "torch" in sys.modules else None
         for mod in list(sys.modules.values()):
             d = getattr(mod, "__dict__", None)
-            if not isinstance(d, dict):
+            if not isinstance(d, dict) or getattr(mod, "__name__", "").startswith("torch"):
                 continue
             for k, v in list(d.items()):
                 if id(v) in self.generators:
-                    self.saved.append((d, k, v))
-        draws = {g: _Draws(seed) for g, seed in self.generators.items()}
-        for d, k, v in self.saved:
-            d[k] = draws[id(v)]
+                    self.saved.append((d, k, draws[id(v)], v))
+        if torch_gen in draws:                    # (torch's dropout: these numbers)
+            import torch.nn.functional as F
+            self.saved.append((F.__dict__, "dropout", _dropout(draws[torch_gen]), F.dropout))
+        for d, k, new, _ in self.saved:
+            d[k] = new
         return self
 
     def __exit__(self, *exc):
-        for d, k, v in self.saved:
-            d[k] = v
+        for d, k, _, old in self.saved:
+            d[k] = old
         return False
+
+
+def _dropout(draws: "_Draws") -> Callable:
+    """torch.nn.functional.dropout with the hardware's numbers (as torch_ops.dropout)."""
+    import torch
+
+    def dropout(input, p=0.5, training=True, inplace=False):
+        if not training or p == 0:
+            return input
+        u = torch.tensor(draws.random(tuple(input.shape)), dtype=input.dtype)
+        return input * ((u > p).to(input.dtype) * (1.0 / (1.0 - p)))
+    return dropout
+
+
+def _flat(result: Any) -> Any:
+    """A result (arrays, tensors, numbers, tuples of them) as a flat float array."""
+    np = _np()
+    parts = result if isinstance(result, (tuple, list)) else (result,)
+    return np.concatenate([np.ravel(_values(x)) if _is_array(x) or isinstance(x, np.ndarray)
+                           else np.ravel(np.asarray(x, dtype=float)) for x in parts]) \
+        if parts else np.zeros(0)
+
+
+def _check_loop(tr: Translation, fn: Callable, original: Any, loop, steps: List[Any]) -> None:
+    """A loop step against the original loop: the original runs over the first two
+    batches (on a copy of its objects), the program twice; the objects' state must
+    agree."""
+    np = _np()
+    loader = loop[0]
+    memo: Dict[int, Any] = {}
+    mine = copy.deepcopy(original, memo)
+    sig = inspect.signature(fn)
+    args = [steps[:2] if p == loader else getattr(mine, p)
+            for p in sig.parameters if p == loader or hasattr(mine, p)]
+    import warnings
+    with _drawing(getattr(tr, "generators", {})), warnings.catch_warnings():
+        warnings.simplefilter("ignore")                 # (torch's, about the copies)
+        fn(*args)
+    state = {name: list(tr.attr[name]["init"]) for name in tr.memories}
+    for s in steps[:2]:
+        tr.func(*tr.adapt(s), *state.values())
+    tol = dict(rtol=1e-3, atol=1e-4) if tr.torch else dict(rtol=1e-6, atol=1e-9)
+    for name, (label, _, owner) in tr.memories.items():
+        if label.endswith("." + RANDOM_STATE) or label.startswith(tr.carried + "."):
+            continue
+        path = tr.paths.get(name)
+        value = (_resolve(mine, path) if path is not None
+                 else getattr(memo.get(id(owner), owner), label.split(".", 1)[1]))
+        want, got = np.ravel(_values(value)), np.asarray(state[name], dtype=float)
+        if not np.allclose(want, got, **tol):
+            bad = ~np.isclose(want, got, **tol)
+            raise NotTranslatable(
+                f"The loop translation of {fn.__name__} changes {label} differently from the "
+                f"original: {bad.sum()} of {bad.size} values, by up to "
+                f"{np.abs(want - got).max():.3g} (e.g. {got[bad][:3]} vs {want[bad][:3]})")
 
 
 def _check(tr: Translation, func: Callable, samples: List[Any]) -> None:
@@ -1451,13 +1926,15 @@ def _check(tr: Translation, func: Callable, samples: List[Any]) -> None:
 
 def _check_runs(tr, func, samples, memo, state) -> None:
     np = _np()
+    # (torch computes in float32)
+    tol = dict(rtol=1e-3, atol=1e-4) if getattr(tr, "torch", False) else dict(rtol=1e-6, atol=1e-9)
     for s in samples[:2 if tr.memories else 3]:
         args = s if isinstance(s, tuple) else (s,)
-        want = np.ravel(np.asarray(func(*args), dtype=float))
+        want = _flat(func(*args))
         got = tr.func(*tr.adapt(args), *state.values())
         got = np.ravel(np.asarray([x for g in (got if isinstance(got, tuple) else (got,))
                                    for x in (g if isinstance(g, list) else [g])], dtype=float))
-        if want.shape != got.shape or not np.allclose(want, got, rtol=1e-6, atol=1e-9):
+        if want.shape != got.shape or not np.allclose(want, got, **tol):
             raise NotTranslatable(f"The loop translation of {getattr(func, '__name__', func)} "
                                   f"disagrees with it on an example: {got[:6]} vs {want[:6]}")
         for name, (label, _, owner) in tr.memories.items():
@@ -1467,7 +1944,6 @@ def _check_runs(tr, func, samples, memo, state) -> None:
             path = getattr(tr, "paths", {}).get(name)
             value = (_resolve(mine, path) if path is not None
                      else getattr(mine, label.split(".", 1)[1]))
-            if not np.allclose(np.ravel(np.asarray(value, dtype=float)), state[name],
-                               rtol=1e-6, atol=1e-9):
+            if not np.allclose(np.ravel(_values(value)), state[name], **tol):
                 raise NotTranslatable(f"The loop translation of {func.__name__} changes "
                                       f"{label} differently from the original")

@@ -24,3 +24,7 @@ examples/syn/
 build/
 dist/
 *.egg-info/
+
+# Datasets and weights the examples download or save
+examples/data/
+examples/*.pt

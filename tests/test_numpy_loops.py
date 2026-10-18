@@ -387,7 +387,7 @@ def test_a_cnn_trains_in_hardware(monkeypatch, tmp_path):
         p = Py2ver(net.train_batch, samples=steps, width=24, saturate=True, margin=2)
     model = [r[0] for r in p.PY_stream()(steps)]
     twin = copy.deepcopy(net)
-    with numpy_loops._drawing(p._numpy.generators):          # (the hardware's dropout numbers)
+    with p.hardware_random():                 # (the hardware's dropout numbers)
         numpy_losses = [twin.train_batch(*s) for s in steps]
     # (the first step's untrained probabilities are tiny, where the log table is steep)
     assert np.allclose(model[1:], numpy_losses[1:], atol=0.05)

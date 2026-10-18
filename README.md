@@ -6,7 +6,8 @@
 
 py2ver turns a plain Python function into a Verilog module and gives you back
 callables with the same signature that run it in simulation (cocotb + Icarus)
-or on an FPGA (DE0-Nano, over UART).
+or on an FPGA (DE0-Nano, over UART). Code written with numpy, and PyTorch
+models and training loops, are built as they are written too.
 
 ### Setup
 
@@ -16,7 +17,8 @@ python3 -m venv .venv
 ```
 
 For development, from a clone: `.venv/bin/pip install -e ".[test,hw]"`.
-The `hw` extra (pyserial) is only needed to talk to a physical board.
+The `hw` extra (pyserial) is only needed to talk to a physical board; the
+`numpy` and `torch` extras for designs written with numpy or PyTorch.
 
 Simulation also needs [Icarus Verilog](https://steveicarus.github.io/iverilog/)
 (`iverilog`, `vvp`) on `PATH`; with [Verilator](https://www.veripool.org/verilator/)
@@ -850,6 +852,102 @@ forward, for the filters' gradients and back), most of its clocks. Verilator
 simulates a step in 3 minutes, the same as the model's; the state (weights,
 moments: 41,120 numbers, 1 Mbit at 24 bits) is for simulation.
 
+### PyTorch
+
+PyTorch code is built the same way, as it is (the `torch` extra): a
+model's forward pass, and a training loop's step with autograd, an optimizer
+and a learning-rate schedule.
+
+```python
+model.eval()
+p = Py2ver(model, samples=images, width=16, round=True)      # its forward(), in eval mode
+p.PY_batch()(images)                                         # ten scores an image
+
+train = Py2ver(train_one_epoch,                              # the function, as written
+               samples=[(model, batches, optimizer, scheduler, device)],
+               width=24, round=True, saturate=True, margin=2)
+train.PY_stream()(batches)                                   # (total_loss, correct, seen) a step
+```
+
+- calling a module: `nn.Sequential` runs its children; `Conv2d` (im2col, as
+  above, then one matrix product), `BatchNorm1d/2d`, `MaxPool2d`, `Linear`,
+  `ReLU`, `Flatten`, `Dropout`, `Identity`, `Softmax`, `LogSoftmax`, `Tanh`
+  are built from the translator's operations; a module of your own runs its
+  `forward()` as written. Parameters and buffers are tables, or state when a
+  training step changes them
+- `torch` / `torch.nn.functional` functions (`relu`, `softmax`,
+  `log_softmax`, `cross_entropy`, `conv2d`, `linear`, `max_pool2d`, `dropout`,
+  `flatten`, `cat`, `argmax`, `exp`, `log`, ...) and tensor methods with
+  torch's meanings (`view`, `reshape`, `flatten`, `transpose(d0, d1)`,
+  `permute`, `unsqueeze`, `squeeze`, `size()`, `max(dim)` giving values and
+  indices, `sum` / `mean` / `argmax` with `dim` and `keepdim`, `item()`, `to()`)
+- in eval mode BatchNorm is a scale and a shift per channel, computed from its
+  running statistics when translating, and Dropout nothing; in training mode
+  BatchNorm uses the batch's mean and variance and updates its running
+  statistics (state), and Dropout draws from the generator in hardware
+- a function whose body loops over an argument given as batches (a training
+  epoch) is built as one step of that loop: the statements before it run as
+  Python (`model.train()`, `total_loss = 0.0`), the loop's body is the step,
+  its target (`images, labels`) the inputs, and the locals it changes are
+  state and the step's results. Its objects (the model, the optimizer, the
+  scheduler) are copied together, so the optimizer's parameters are the
+  model's
+- `loss.backward()`: reverse-mode gradients, as loops (`autograd.py`): each
+  operation on values that depend on a parameter is recorded, and backward
+  writes each one's gradient code in reverse; a list's gradient is a list of
+  its length, so a view's contribution (a transpose, a convolution's
+  overlapping windows) is added at its positions, as col2im does. Max
+  pooling's gradient goes to each window's first maximum, as torch's does
+- `optimizer.step()`: `torch.optim.Adam`, `AdamW` and `SGD` as torch computes
+  them (the single-tensor algorithm), their state (moments, made as zeros on
+  the first step; the step count, an integer) kept by the hardware;
+  `optimizer.zero_grad()` and `model.train()` run as Python
+- `scheduler.step()`: `OneCycleLR`'s learning rate and momentum (Adam's beta1)
+  depend only on the step's number, so torch's values for every step are
+  tables, read at the scheduler's step count; they are the optimizer's
+  `param_groups[0]['lr']` and `['betas'][0]`, state
+- the translation is checked against torch on the examples: a training step
+  against torch's own training over the first two batches (on copies), with
+  the hardware's random numbers. `p.hardware_random()` gives the original
+  those numbers, to compare it with the hardware step by step
+
+Deep networks want `round=True`: a sum of hundreds of products truncated term
+by term loses half a bit each time, and four convolutions of that shrank the
+MNIST network's scores by a quarter.
+
+`examples/pytorch_mnist_cnn.py` is a PyTorch CNN for MNIST (28x28 digits, two
+blocks of two 3x3 convolutions with BatchNorm, 468,010 parameters, AdamW and
+a one-cycle schedule), unchanged. `examples/pytorch_mnist_hardware.py` builds
+its trained forward pass (16 bits, rounded; the model of one epoch):
+
+| | test images | scores | per image |
+|---|---|---|---|
+| torch (float) | 20 of 20 | | |
+| fixed point, 16 bits | 20 of 20, the same digits as torch | within 0.034 of torch's | 19,719,168 clocks: 0.39 s at 50 MHz |
+
+Verilator simulates an image in 33 s, the same as the model's. The weights
+(7.5 Mbit) are ROMs: a table longer than 4,096 entries is written to a file
+next to `main.v` and read with `$readmemh`, which simulators and Quartus
+take, rather than as an assignment an entry. They are more than the
+DE0-Nano's block RAM, so this one is for simulation.
+
+`examples/pytorch_mnist_training.py` builds one step of its
+`train_one_epoch` loop (24 bits, batches of 2 of its augmented images) and
+trains 4 steps in fixed point, torch the same 4 with the hardware's dropout
+numbers:
+
+| step | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| torch (float) | 2.7769 | 2.2949 | 2.0928 | 2.2563 |
+| fixed point, 24 bits | 2.7784 | 2.2950 | 2.0960 | 2.2553 |
+
+After the 4 steps the weights of `Linear(3136, 128)` are within 0.0004 of
+torch's. A step is 133,119,948 clocks (2.7 s at 50 MHz): 56 million
+multiply-accumulates an image forward and back. It takes a while to build
+(17 minutes: the translation and the formats run the step in Python) and the
+model 100 s a step; its state (the weights, AdamW's moments: 1.4 million
+numbers, 34 Mbit) is for simulation.
+
 ### Simulation speed (Icarus, Verilator)
 
 `TB()`, `TB_batch()` and `TB_stream()` run a plain Verilog testbench: it reads
@@ -1104,8 +1202,9 @@ table, a 32-tap FIR folded onto 4 multipliers, a numpy XOR network trained on 4
 shared multipliers and run pipelined in hardware, a 64 -> 128 -> 64 -> 10 numpy
 digit recogniser built with its loops sequenced, on up to 8 lanes, and its
 training step with Adam (simulated), a convolutional network with pooling and
-dropout, its forward pass and its training step, a decimate-by-4 filter fed
-one sample per handshake, a receiver chain built from plain Python functions,
+dropout, its forward pass and its training step, a PyTorch MNIST network's
+forward pass and a step of its training loop (autograd, AdamW, a one-cycle
+schedule), a decimate-by-4 filter fed one sample per handshake, a receiver chain built from plain Python functions,
 a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the
 hardware against Python in simulation, and optionally on the virtual board, in
 Quartus, or on the real board:
@@ -1126,8 +1225,8 @@ everything:
 
 ```
 .venv/bin/python -m pytest -q -n auto -m "not sim and not board"   # no simulator: ~5 s
-.venv/bin/python -m pytest -q -n auto -m "not board"               # + simulation: ~35 s
-.venv/bin/python -m pytest -q -n auto                              # everything: ~2 min
+.venv/bin/python -m pytest -q -n auto -m "not board and not slow"  # + simulation: ~1 min
+.venv/bin/python -m pytest -q -n auto                              # everything: ~9 min
 .venv/bin/python -m pytest -q -n auto tests/test_share.py          # one feature's tests
 .venv/bin/python -m pytest -q --lf                                 # what failed last time
 QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # + the Quartus tests
@@ -1138,7 +1237,9 @@ QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   #
   A test that isn't marked `sim` (or `board`) and starts a simulator fails and
   says so, which keeps the quick run quick.
 - `board`: the virtual DE0-Nano (`HW_sim()`): the whole project, UART
-  included, simulated; the slowest tests.
+  included, simulated.
+- `slow`: a large design simulated (a torch training step: minutes, most of
+  them compiling its Verilog).
 - `quartus`: a real Quartus compile, skipped unless Quartus is found.
 
 Every test builds in its own temporary directory, so they can run in parallel.

@@ -52,6 +52,8 @@ from .hwtypes import _namespace, normalize_attr, read_annotations
 from .cplx import split_complex
 from .fold import fold_loop
 from .share import ROM_MIN, share
+
+ROM_FILE_MIN = 4096         # a table longer than this is read from a file ($readmemh)
 from .comprehend import expand_comprehensions
 from .control import structure, while_bound
 from .choose import choose, choose_lanes
@@ -219,7 +221,9 @@ class Py2ver:
                  multipliers: int | None = None, rate: float | None = None,
                  clock: float = DEFAULT_CLK_FREQ, sequential: bool = False) -> None:
         """
-        func: the function, as written. attr: widths, formats and state (see
+        func: the function, as written (a method, numpy code, a torch module
+        for its forward(), or a function looping over batches: one step of
+        its loop, see numpy_loops.py). attr: widths, formats and state (see
         the README). With `samples` (example inputs), formats missing from
         attr (or all of them, without attr) are chosen by auto_fixed() from
         the ranges seen: `width` bits per value (default 16), or the fewest
@@ -249,11 +253,14 @@ class Py2ver:
         self._adapt: Callable[[Any], tuple] | None = None
         self._numpy = None
         from . import numpy_fe
+        from .numpy_loops import _callable
+        func = _callable(func)                       # (a torch module: its forward)
         if numpy_fe.needs_frontend(func):
             from . import numpy_loops
             given = list(samples) if samples is not None else []
-            if sequential:
+            if sequential or numpy_loops.loops_only(func, given):
                 tr = numpy_loops.translate(func, given)
+                sequential = True
             else:
                 try:
                     tr = numpy_fe.translate(func, given)
@@ -268,7 +275,7 @@ class Py2ver:
             user = {k.replace("self.", "self_", 1): v for k, v in normalize_attr(attr).items()}
             attr = {k: dict(tr.attr.get(k, {}), **user.get(k, {}))
                     for k in dict.fromkeys([*tr.attr, *user])}
-            samples = [tr.adapt(x) for x in samples]
+            samples = [tr.adapt(x) for x in (getattr(tr, "steps", None) or samples)]
             func = tr.func
         if samples is not None:
             attr = auto_fixed(func, samples, attr, width=width or 16, max_error=max_error,
@@ -791,9 +798,20 @@ class Py2ver:
                              + (f", read by {ports}" if len(pair) > 1 else ""))
                 items.append(f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];")
                 items += [f"reg {sig}[{w - 1}:0] {q};" for q in pair]
-                items.append("initial begin")
-                items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
-                items.append("end")
+                if len(entries) > ROM_FILE_MIN:
+                    # (a large table from a file next to main.v: simulators and Quartus
+                    # read it, instead of an assignment an entry to compile)
+                    hdl = Path(os.getcwd()) / "hdl"
+                    hdl.mkdir(exist_ok=True)
+                    path = hdl / f"{arr}.hex"
+                    digits = (w + 3) // 4
+                    path.write_text("".join(f"{int(v) & mask:0{digits}x}\n" for v in entries),
+                                    encoding="utf-8")
+                    items.append(f'initial $readmemh("{path.as_posix()}", {arr});')
+                else:
+                    items.append("initial begin")
+                    items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+                    items.append("end")
                 idxs = []
                 for q in pair:
                     idx = roms[q]["index"]
@@ -1744,6 +1762,13 @@ class Py2ver:
             for v, n, w in zip(_flatten_outputs(ret), self.output_args_list,
                                self.output_args_width_list)
         )
+
+    def hardware_random(self):
+        """A context manager: inside it, the original code's random numbers (numpy
+        Generators' .random, torch's dropout) are the ones the hardware draws, from
+        their start, so the original can be compared with the hardware step by step."""
+        from .numpy_loops import _drawing
+        return _drawing(getattr(self._numpy, "generators", None) or {})
 
     def state_values(self, row: Tuple[Any, ...] | None = None) -> Dict[str, Any]:
         """

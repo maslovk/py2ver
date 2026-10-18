@@ -59,7 +59,7 @@ def _np():
 
 
 def needs_frontend(func: Callable) -> bool:
-    """A method, or a function using numpy."""
+    """A method, or a function using numpy (or torch)."""
     if inspect.ismethod(func):
         return True
     try:
@@ -67,7 +67,8 @@ def needs_frontend(func: Callable) -> bool:
     except (OSError, TypeError, SyntaxError):
         return False
     ns = getattr(func, "__globals__", {})
-    np_names = {k for k, v in ns.items() if getattr(v, "__name__", None) == "numpy"}
+    np_names = {k for k, v in ns.items() if inspect.ismodule(v) and (
+        v.__name__ == "numpy" or v.__name__ == "torch" or v.__name__.startswith("torch."))}
     return any(isinstance(n, ast.Name) and n.id in np_names for n in ast.walk(tree))
 
 
@@ -623,6 +624,8 @@ class Translation:
     def adapt(self, args: Any) -> tuple:
         """Arguments as the original takes them -> as the generated function does."""
         np = _np()
+        if isinstance(args, list) and len(self.params) > 1 and len(args) == len(self.params):
+            args = tuple(args)                   # (a batch from a DataLoader: a list)
         if not isinstance(args, tuple):
             args = (args,)
         out = []
