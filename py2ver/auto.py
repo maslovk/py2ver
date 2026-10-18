@@ -123,6 +123,7 @@ def _returned_names(fd: ast.FunctionDef) -> List[str]:
 
 
 _TRACED: Dict[Any, Any] = {}
+_TABLE_KEYS: Dict[Any, Tuple[str, ...]] = {}      # (func, source) -> its table functions' keys
 
 
 def _traced(func: Callable, record: Callable[[str, Any], None],
@@ -248,6 +249,7 @@ def _traced_code(func: Callable, source: str):
     fd.decorator_list = []
 
     code = compile(ast.fix_missing_locations(tree), f"<traced {fd.name}>", "exec")
+    _TABLE_KEYS[(func, source)] = tuple(tables)
     return code, fd.name, order + list(tables), returned, ann
 
 
@@ -305,8 +307,8 @@ def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]
     traced, order, returned, _ = _traced(func, rec, rec_elem)
     if getattr(func, "__py2ver_loops__", None) is not None:      # (a loop program: numpy)
         from . import vectorize
-        traced = vectorize.program(func.__py2ver_loops__, func.__globals__, traced, rec,
-                                   tuple(k for k in order if not k.isidentifier()))
+        keys = _TABLE_KEYS.get((func, inspect.getsource(func)), ())
+        traced = vectorize.program(func.__py2ver_loops__, func.__globals__, traced, rec, keys)
     params = list(inspect.signature(func).parameters)
     state = [p for p in params if "next" in attr.get(p, {}) or "memory" in attr.get(p, {})]
     inputs = [p for p in params if p not in state]
@@ -606,7 +608,7 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             ib = max(auto[m][1] for m in members)
             for m in members:
                 auto[m] = (auto[m][0], ib)
-    bits = {n: DEFAULT_TABLE_BITS for n in auto if n in tables}
+    bits = {n: int(base.get(n, {}).get("bits", DEFAULT_TABLE_BITS)) for n in auto if n in tables}
 
     def formats(fracs: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
         out = {k: dict(base[k]) for k in params if k in base}
@@ -615,7 +617,9 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             f = max(0, fracs[name])
             fmt = _fmt(r, ib, f)
             if name in tables:                       # 'math.sin': {'range', 'bits', format}
-                fmt = dict(range=_table_range(ranges[f"{name}{_TABLE_IN}"], margin),
+                given = base.get(name, {}).get("range")   # (yours, if you gave one)
+                fmt = dict(range=tuple(given) if given is not None
+                           else _table_range(ranges[f"{name}{_TABLE_IN}"], margin),
                            bits=bits[name], **fmt)
             elif name in params and r.is_complex:
                 fmt["complex"] = True

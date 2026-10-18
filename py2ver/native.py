@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # above this many clock-lines (some seconds) Verilator is worth its compile
 LONG_RUN = 5_000_000
 CHUNK = 4096              # an input vector wider than this is read in parts of this many bits
+OUT_GROUP = 256           # outputs written by one $fwrite
 
 log = logging.getLogger(__name__)
 
@@ -102,8 +103,19 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         conns.append(".vout(vout)")
     # (a port a line: Verilator reads at most 20000 tokens a line)
     lines.append(f"  {p.t_name} dut(\n    " + ",\n    ".join(conns) + ");")
-    fmt = " ".join(["%h"] * len(outs))
-    write = f'$fwrite(fout, "{fmt}\\n", {", ".join(f"o_{n}" for n, _ in outs)});'
+    # The outputs a line a vector, written a group at a time (Verilator reads at most
+    # 20000 tokens a line: a model's thousands of scores)
+    groups = [outs[i:i + OUT_GROUP] for i in range(0, len(outs), OUT_GROUP)] or [[]]
+    lines.append("  task write_outputs;")
+    lines.append("    begin")
+    for gi, grp in enumerate(groups):
+        end = "\\n" if gi == len(groups) - 1 else " "
+        fmt = " ".join(["%h"] * len(grp)) + end
+        args = "".join(f", o_{n}" for n, _ in grp)
+        lines.append(f'      $fwrite(fout, "{fmt}"{args});')
+    lines.append("    end")
+    lines.append("  endtask")
+    write = "write_outputs;"
     # The next vector, into nxt (applied with <= after the edge that reads the last);
     # a wide one in parts (Verilator reads at most 8192 bits an argument)
     if iw <= CHUNK:

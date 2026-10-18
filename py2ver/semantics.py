@@ -397,21 +397,19 @@ def exact_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]]) -> Tuple[ModuleIR, D
     def meta(name: str) -> Dict[str, Any]:
         return resolve_meta(name, attr, ports)
 
-    trees: List[Optional[Node]] = []
+    views: Set[str] = set()
+    assigns: List[Assignment] = []
     for a in ir.assigns:
+        # (one assignment at a time: a state machine's expressions are long, and
+        # all their trees at once took gigabytes)
         try:
-            tree = parse(a.right)
+            tree: Optional[Node] = parse(a.right)
             analyze(tree, meta)
             if max_bits(tree, meta) > MAX_WIDTH:
                 raise Unsupported(f"needs more than {MAX_WIDTH} bits")
         except Unsupported as e:
             log.warning("Leaving '%s = %s' as is: %s", a.left, a.right, e)
             tree = None
-        trees.append(tree)
-
-    views: Set[str] = set()
-    assigns: List[Assignment] = []
-    for a, tree in zip(ir.assigns, trees):
         if tree is None:
             assigns.append(Assignment(a.left, a.right.replace(" // ", " / "), a.is_reg))
             continue

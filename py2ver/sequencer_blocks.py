@@ -617,8 +617,17 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                           + [ast.Constant(0)], _name("st_now"))])))
 
     def next_value(per_block: List[ast.expr], keep: ast.expr) -> ast.expr:
-        return ast.IfExp(test=copy.deepcopy(end), body=_sel(per_block + [keep], _name("st_now")),
-                         orelse=keep)
+        # (a register only a few blocks set: a chain over those, not a multiplexer over
+        # every block; a state machine of hundreds of blocks made gigantic ones)
+        kept = _key(keep)
+        writers = [(k, v) for k, v in enumerate(per_block) if _key(v) != kept]
+        if len(writers) <= max(8, len(per_block) // 4):
+            value: ast.expr = _copy(keep)
+            for k, v in reversed(writers):
+                value = ast.IfExp(test=_eq(_name("st_now"), k), body=_copy(v), orelse=value)
+        else:
+            value = _sel(per_block + [keep], _name("st_now"))
+        return ast.IfExp(test=copy.deepcopy(end), body=value, orelse=keep)
 
     for v in scalars:
         if v not in rng:

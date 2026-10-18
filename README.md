@@ -871,16 +871,25 @@ train.PY_stream()(batches)                                   # (total_loss, corr
 
 - calling a module: `nn.Sequential` runs its children; `Conv2d` (im2col, as
   above, then one matrix product), `BatchNorm1d/2d`, `MaxPool2d`, `Linear`,
-  `ReLU`, `Flatten`, `Dropout`, `Identity`, `Softmax`, `LogSoftmax`, `Tanh`
-  are built from the translator's operations; a module of your own runs its
-  `forward()` as written. Parameters and buffers are tables, or state when a
-  training step changes them
-- `torch` / `torch.nn.functional` functions (`relu`, `softmax`,
-  `log_softmax`, `cross_entropy`, `conv2d`, `linear`, `max_pool2d`, `dropout`,
-  `flatten`, `cat`, `argmax`, `exp`, `log`, ...) and tensor methods with
-  torch's meanings (`view`, `reshape`, `flatten`, `transpose(d0, d1)`,
-  `permute`, `unsqueeze`, `squeeze`, `size()`, `max(dim)` giving values and
-  indices, `sum` / `mean` / `argmax` with `dim` and `keepdim`, `item()`, `to()`)
+  `Embedding` (a gather of its rows), `LayerNorm` (each row's mean and
+  variance), `GELU` (a table), `ReLU`, `Flatten`, `Dropout`, `Identity`,
+  `Softmax`, `LogSoftmax`, `Tanh` are built from the translator's operations;
+  a module of your own runs its `forward()` as written. Parameters and buffers
+  are tables, or state when a training step changes them; a parameter two
+  modules share (weight tying) is one table
+- `torch` / `torch.nn.functional` functions (`relu`, `gelu`, `softmax`,
+  `log_softmax`, `cross_entropy`, `layer_norm`, `embedding`, `conv2d`,
+  `linear`, `max_pool2d`, `dropout`, `flatten`, `cat`, `argmax`, `exp`, `log`,
+  ...) and tensor methods with torch's meanings (`view`, `reshape`, `flatten`,
+  `transpose(d0, d1)`, `permute`, `unsqueeze`, `squeeze`, `split`, `chunk`,
+  `masked_fill`, `size()`, `max(dim)` giving values and indices, `sum` /
+  `mean` / `argmax` with `dim` and `keepdim`, `item()`, `to()`); `@` broadcasts
+  its leading dimensions (attention's heads), and a reshape that only splits or
+  merges contiguous dimensions stays a view
+- `masked_fill(mask, -inf)` with a constant mask (causal attention), then a
+  softmax: the mask stays a mask, the softmax's exponentials multiplied by it,
+  so the masked weights are 0 as with torch's -inf, with no infinities in
+  fixed point
 - in eval mode BatchNorm is a scale and a shift per channel, computed from its
   running statistics when translating, and Dropout nothing; in training mode
   BatchNorm uses the batch's mean and variance and updates its running
@@ -902,6 +911,8 @@ train.PY_stream()(batches)                                   # (total_loss, corr
   them (the single-tensor algorithm), their state (moments, made as zeros on
   the first step; the step count, an integer) kept by the hardware;
   `optimizer.zero_grad()` and `model.train()` run as Python
+- `torch.nn.utils.clip_grad_norm_`: the gradients' total norm, each gradient
+  scaled by `min(1, max_norm / (norm + 1e-6))`, as torch does
 - `scheduler.step()`: `OneCycleLR`'s learning rate and momentum (Adam's beta1)
   depend only on the step's number, so torch's values for every step are
   tables, read at the scheduler's step count; they are the optimizer's
@@ -913,7 +924,12 @@ train.PY_stream()(batches)                                   # (total_loss, corr
 
 Deep networks want `round=True`: a sum of hundreds of products truncated term
 by term loses half a bit each time, and four convolutions of that shrank the
-MNIST network's scores by a quarter.
+MNIST network's scores by a quarter. The examples' ranges are all the formats
+know, so give samples that cover the inputs (a GPT: windows with the rare
+characters too) or more `margin`; and a table spread wide (attention's
+exponentials, whose arguments reach -50) wants more entries than the default
+1,024: `attr={'np.exp': {'bits': 14}}` (a table's `bits` and `range` in attr
+are kept when the formats are chosen).
 
 `examples/pytorch_mnist_cnn.py` is a PyTorch CNN for MNIST (28x28 digits, two
 blocks of two 3x3 convolutions with BatchNorm, 468,010 parameters, AdamW and
@@ -947,6 +963,29 @@ multiply-accumulates an image forward and back. It builds in about 2 minutes
 and the model runs a step in 10 s (see "The models, with numpy" below); its
 state (the weights, AdamW's moments: 1.4 million numbers, 34 Mbit) is for
 simulation.
+
+`examples/tiny_gpt.py` is a character-level GPT in PyTorch (4 Transformer
+blocks of causal self-attention with 6 heads and a GELU MLP, LayerNorm,
+residual connections, token and position embeddings, the output layer tied to
+the token embedding: 1.8 million parameters), unchanged. Its training loop is
+written inside `main()`, so the hardware is its forward pass;
+`tests/test_torch.py` trains a small one with a loop function of the usual
+shape (dropout, the tied embedding, gradient clipping, AdamW with two groups),
+checked against torch. `examples/tiny_gpt_hardware.py` builds the model
+`tiny_gpt.py` saves (300 steps of training; 16 bits, rounded, `margin=2`,
+16,384-entry exp and GELU tables, formats from 12 windows of the text):
+
+| | 6 other windows of 128 characters |
+|---|---|
+| scores against torch's | within 0.158 (mean 0.011) |
+| the likeliest next character | torch's at 99.5 % of the positions |
+| per window | 269,648,258 clocks: 5.4 s at 50 MHz |
+
+It builds in about 4 minutes, and the bit-exact model runs a window in 13 s,
+so the example also writes text with the hardware's scores, a character at a
+time. The small GPT of the tests is simulated (Verilog), the same as its
+model; the full one's simulation (a 7 MB design, 270 million clocks) doesn't
+run yet: it crashes in the simulation step.
 
 ### Simulation speed (Icarus, Verilator)
 

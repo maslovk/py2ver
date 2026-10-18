@@ -597,31 +597,43 @@ class _Interp:
         return out
 
     def matmul(self, a: Any, b: Any) -> Arr:
+        """a @ b with numpy's rules: 1-D operands as a row / a column, the dimensions
+        before the last two broadcast (batches of products: attention's heads)."""
         a, b = self.to_arr(a), self.to_arr(b)
-        va = a if len(a.shape) == 2 else a.view((1,) + a.shape, (0,) + a.strides)
-        vb = b if len(b.shape) == 2 else b.view(b.shape + (1,), b.strides + (0,))
-        n, k = va.shape
-        k2, m = vb.shape
+        a1, b1 = len(a.shape) == 1, len(b.shape) == 1
+        va = a.view((1,) + a.shape, (0,) + a.strides) if a1 else a
+        vb = b.view(b.shape + (1,), b.strides + (0,)) if b1 else b
+        n, k = va.shape[-2:]
+        k2, m = vb.shape[-2:]
         if k != k2:
             raise NotTranslatable(f"Shapes {a.shape} @ {b.shape} don't match")
-        out = self.new_list((n, m), "mm")
+        batch = _bcast(va.shape[:-2], vb.shape[:-2]) if len(va.shape) > 2 or len(vb.shape) > 2 \
+            else ()
+        out = self.new_list(batch + (n, m), "mm")
+
+        def lead(v, bidx):
+            nb = len(v.shape) - 2
+            mine = bidx[len(bidx) - nb:] if nb else []
+            return [ast.Constant(0) if v.shape[d] == 1 else copy.deepcopy(mine[d])
+                    for d in range(nb)]
 
         def body(idx):
-            i, j = idx
+            bidx, i, j = idx[:-2], idx[-2], idx[-1]
             acc = self.fresh("acc")
             self.emit(_assign(acc, ast.Constant(0)))
 
             def inner(t):
                 self.emit(_assign(acc, ast.BinOp(
                     left=_load(acc), op=ast.Add(),
-                    right=ast.BinOp(left=va.at([copy.deepcopy(i), t[0]]), op=ast.Mult(),
-                                    right=vb.at([t[0], copy.deepcopy(j)])))))
+                    right=ast.BinOp(left=va.at(lead(va, bidx) + [copy.deepcopy(i), t[0]]),
+                                    op=ast.Mult(),
+                                    right=vb.at(lead(vb, bidx) + [t[0], copy.deepcopy(j)])))))
             self.loops((k,), inner)
-            self.emit(ast.Assign(targets=[_store(out.at([i, j]))], value=_load(acc)))
-        self.loops((n, m), body)
+            self.emit(ast.Assign(targets=[_store(out.at(list(idx)))], value=_load(acc)))
+        self.loops(batch + (n, m), body)
         self.record("matmul", out, va, vb)
-        shape = ((n,) if len(a.shape) == 2 else ()) + ((m,) if len(b.shape) == 2 else ())
-        return out.view(shape, _contiguous(shape)) if shape != (n, m) else out
+        shape = batch + ((n,) if not a1 else ()) + ((m,) if not b1 else ())
+        return out.view(shape, _contiguous(shape)) if shape != out.shape else out
 
     # ------------------------------------------------------------ running Python
     def call(self, fn: Callable, args: List[Any], kwargs: Dict[str, Any], obj: Any = None) -> Any:
@@ -918,12 +930,21 @@ class _Interp:
                 if isinstance(n.op, ast.USub):
                     return self.elementwise(lambda x: ast.UnaryOp(op=ast.USub(), operand=x), v,
                                             op=("neg",))
+                if isinstance(n.op, (ast.Invert, ast.Not)) and isinstance(v, Arr):
+                    from .torch_ops import const_values
+                    c = const_values(self, v)
+                    if c is not None:                  # (a constant mask: ~ when translating)
+                        return self.to_arr(self.np.logical_not(c != 0).astype(float))
+                    return self.elementwise(lambda x: ast.BinOp(left=ast.Constant(1), op=ast.Sub(),
+                                                                right=x), v, op=("cmp",))
                 raise NotTranslatable(f"Unsupported operator in {ast.unparse(n)}")
             return {ast.USub: lambda x: -x, ast.UAdd: lambda x: +x, ast.Not: lambda x: not x,
                     ast.Invert: lambda x: ~x}[type(n.op)](v)
         if isinstance(n, ast.Compare) and len(n.ops) == 1:
             a, b = self.expr(n.left, frame, g), self.expr(n.comparators[0], frame, g)
             op = n.ops[0]
+            if isinstance(op, (ast.Is, ast.IsNot)):        # (identity: Python's, x is None)
+                return (a is b) if isinstance(op, ast.Is) else (a is not b)
             if isinstance(a, (Arr, Sym)) or isinstance(b, (Arr, Sym)):
                 if type(op) not in _CMPS:
                     raise NotTranslatable(f"Unsupported comparison in {ast.unparse(n)}")
@@ -989,6 +1010,12 @@ class _Interp:
             return None if g is None else Arr(g.name, a.shape, a.strides, a.offset)
         if self.torch and attr == "data":
             return a
+        if self.torch and attr == "device":
+            import torch
+            return torch.device("cpu")
+        if self.torch and attr == "dtype":
+            import torch
+            return torch.float32
         if attr == "T":
             return a.view(a.shape[::-1], a.strides[::-1])
         if attr == "shape":
@@ -1034,19 +1061,40 @@ class _Interp:
 
     def is_index_array(self, v: Any) -> bool:
         return (isinstance(v, self.np.ndarray) and v.dtype.kind in "iu") or (
-            isinstance(v, Arr) and not isinstance(v, slice))
+            isinstance(v, Arr) and not isinstance(v, slice)) or (
+            _is_tensor(v) and not v.is_floating_point() and v.dtype != _torch_bool())
 
     def fancy(self, a: Arr, vals: List[Any], store: bool) -> Any:
         """a[i0, i1, ...] with arrays of indices (one per dimension, numpy's integer
         arrays or arrays computed in hardware, broadcast together): the elements
         they pick, read where used (a gather) or, as a target, a _Scatter."""
-        if len(vals) != len(a.shape) or any(isinstance(v, slice) or v is None or v is Ellipsis
-                                            for v in vals):
-            raise NotTranslatable("Indexing with arrays is supported with an array (or an "
-                                  "integer) for every dimension")
+        np = self.np
+        nadv = 0
+        while nadv < len(vals) and not (isinstance(vals[nadv], slice) or vals[nadv] is None
+                                        or vals[nadv] is Ellipsis):
+            nadv += 1
+        rest = vals[nadv:]
+        if any(not (isinstance(v, slice) and v == slice(None)) for v in rest) \
+                or len(vals) > len(a.shape):
+            raise NotTranslatable("Indexing with arrays is supported with arrays (or integers) "
+                                  "for the first dimensions, the others whole")
         if isinstance(a, Lazy):
             a = a.materialize()
-        ops = tuple(self.to_arr(v) if isinstance(v, self.np.ndarray) else v for v in vals)
+        ops = [self.to_arr(v) if isinstance(v, np.ndarray) else self.adopt(v) if _is_tensor(v)
+               else v for v in vals[:nadv]]
+        adv = _bcast(*[o.shape for o in ops if isinstance(o, Arr)])
+        trail = a.shape[nadv:]
+        if trail:
+            # (a[idx] with whole dimensions after: idx broadcast against their aranges)
+            t = len(trail)
+            ops = [o.view(o.shape + (1,) * t, o.strides + (0,) * t) if isinstance(o, Arr)
+                   else o for o in ops]
+            for d, size in enumerate(trail):
+                r = self.to_arr(np.arange(size))
+                sh = (1,) * len(adv) + (1,) * d + (size,) + (1,) * (t - 1 - d)
+                st = (0,) * len(adv) + (0,) * d + (1,) + (0,) * (t - 1 - d)
+                ops.append(r.view(sh, st))
+        ops = tuple(ops)
         shape = _bcast(*[o.shape for o in ops if isinstance(o, Arr)])
         if store:
             return _Scatter(a, ops, shape)
@@ -1139,14 +1187,15 @@ class _Interp:
                 raise NotTranslatable(f"Generator.{getattr(fn, '__name__', fn)} is not supported "
                                       "(only .random)")
             return self.random(fn.__self__, args, kwargs)
-        sym = any(isinstance(v, (Arr, Sym)) for v in list(args) + list(kwargs.values()))
+        sym = any(isinstance(v, (Arr, Sym)) or type(v).__name__ == "NegInf"
+                  for v in list(args) + list(kwargs.values()))
         if self.torch:
             from . import torch_ops, torch_optim
             if torch_ops.is_module(fn):
                 return torch_ops.module_call(self, fn, args, kwargs)
             if torch_ops.is_torch_function(fn):
-                if sym or any(isinstance(x, Arr) for v in args if isinstance(v, (list, tuple))
-                              for x in v):
+                if sym or getattr(fn, "__name__", "") in torch_ops.UTILS or any(
+                        isinstance(x, Arr) for v in args if isinstance(v, (list, tuple)) for x in v):
                     return torch_ops.function(self, fn, args, kwargs)
                 return fn(*args, **kwargs)
             out = torch_optim.method_call(self, fn, args, kwargs)
@@ -1243,6 +1292,9 @@ class _Interp:
                 shape = tuple(a.size // rest if x == -1 else x for x in shape)
             if math.prod(shape) != a.size:
                 raise NotTranslatable(f"Can't reshape {a.shape} to {shape}")
+            strides = _reshaped(a, shape)
+            if strides is not None:
+                return a.view(shape, strides)
             if not _is_contiguous(a):
                 a = self.method(a, "copy", [], {})      # (a view of another order: a copy)
             return a.view(shape, _contiguous(shape))
@@ -1542,6 +1594,11 @@ def _seed(gen: Any) -> int:
     return zlib.crc32(bytes(gen.get_state().tolist())) or 1          # (torch's)
 
 
+def _torch_bool() -> Any:
+    import torch
+    return torch.bool
+
+
 def _torch_generator() -> Any:
     import torch
     return torch.default_generator
@@ -1583,6 +1640,46 @@ def _is_contiguous(a: Arr) -> bool:
     """Is the view its list's elements in order, from its offset (dimensions of 1 aside)?"""
     want = _contiguous(a.shape)
     return isinstance(a, Lazy) or all(s == w for n, s, w in zip(a.shape, a.strides, want) if n != 1)
+
+
+def _reshaped(a: Arr, shape: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
+    """The strides of a's view reshaped to shape without a copy (dimensions split, or
+    merged where they are contiguous with each other), or None."""
+    if isinstance(a, Lazy):
+        return None
+    old = [(n, st) for n, st in zip(a.shape, a.strides) if n != 1]
+    new = [n for n in shape if n != 1]
+    out: List[int] = []
+    i = j = 0
+    while i < len(old) and j < len(new):
+        # Take dimensions from both sides until their sizes agree
+        ni, nj = old[i][0], new[j]
+        i2, j2 = i + 1, j + 1
+        while ni != nj:
+            if ni < nj:
+                if i2 >= len(old):
+                    return None
+                ni *= old[i2][0]
+                i2 += 1
+            else:
+                if j2 >= len(new):
+                    return None
+                nj *= new[j2]
+                j2 += 1
+        for k in range(i, i2 - 1):                      # (merged: contiguous with each other)
+            if old[k][1] != old[k + 1][1] * old[k + 1][0]:
+                return None
+        st = old[i2 - 1][1]
+        part = []
+        for k in range(j2 - 1, j - 1, -1):              # (split: from the last)
+            part.insert(0, st)
+            st *= new[k]
+        out += part
+        i, j = i2, j2
+    if i != len(old) or j != len(new):
+        return None
+    it = iter(out)
+    return tuple(next(it) if n != 1 else 0 for n in shape)
 
 
 def _int_index(e: ast.expr) -> ast.expr:
@@ -1678,6 +1775,8 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     # The results: arrays as flat lists, scalars as they are
     outs, ret = [], []
     for r in (result if isinstance(result, tuple) else (result,)):
+        if r is None and isinstance(result, tuple) and any(x is not None for x in result):
+            continue                                  # (a result not computed: logits, None)
         if isinstance(r, Arr):
             out = it.new_list(r.shape, "out")
             it.copy_into(out, r)
@@ -1877,6 +1976,7 @@ def _flat(result: Any) -> Any:
     """A result (arrays, tensors, numbers, tuples of them) as a flat float array."""
     np = _np()
     parts = result if isinstance(result, (tuple, list)) else (result,)
+    parts = [x for x in parts if x is not None] if len(parts) > 1 else parts   # (logits, None)
     return np.concatenate([np.ravel(_values(x)) if _is_array(x) or isinstance(x, np.ndarray)
                            else np.ravel(np.asarray(x, dtype=float)) for x in parts]) \
         if parts else np.zeros(0)

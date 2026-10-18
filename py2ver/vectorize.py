@@ -471,7 +471,8 @@ class _Run:
         if isinstance(fn, np.ufunc) or getattr(fn, "__module__", None) == "numpy":
             with np.errstate(all="ignore"):
                 return fn(*[_arith(a) for a in args])
-        if callable(fn) and not any(isinstance(a, np.ndarray) for a in args):
+        if callable(fn) and (getattr(fn, "__py2ver_vectorized__", False)
+                             or not any(isinstance(a, np.ndarray) for a in args)):
             return fn(*args)
         raise Unsupported(ast.unparse(n))
 

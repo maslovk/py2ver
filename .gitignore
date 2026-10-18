@@ -28,3 +28,4 @@ dist/
 # Datasets and weights the examples download or save
 examples/data/
 examples/*.pt
+examples/*.txt

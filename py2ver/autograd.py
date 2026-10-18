@@ -174,10 +174,15 @@ class _Backward:
         from .torch_ops import transpose
         it = self.it
         va, vb = ins
+
+        def t(v):                                     # (the last two dimensions swapped)
+            axes = list(range(len(v.shape)))
+            axes[-2], axes[-1] = axes[-1], axes[-2]
+            return transpose(v, axes)
         if it.requires(va):
-            self.add(va, it.matmul(g, transpose(vb, (1, 0))), tuple(va.shape))
+            self.add(va, it.matmul(g, t(vb)), tuple(it.to_arr(g).shape[:-1]) + (va.shape[-1],))
         if it.requires(vb):
-            self.add(vb, it.matmul(transpose(va, (1, 0)), g), tuple(vb.shape))
+            self.add(vb, it.matmul(t(va), g), tuple(it.to_arr(g).shape[:-2]) + tuple(vb.shape[-2:]))
 
     def on_reduce(self, out, g, ins, info) -> None:
         it = self.it
@@ -289,6 +294,14 @@ class _Backward:
             give(0, lambda d, o: mul(d, sub(_c(1), mul(o, o))), out)
         elif kind == "sqrt":
             give(0, lambda d, o: div(mul(d, _c(0.5)), o), out)
+        elif kind == "table":                          # (a function as a table: its derivative's)
+            grad = op[1] + "_grad"
+            if grad not in it.ns:
+                raise NotTranslatable(f"Can't differentiate {op[1]}")
+            give(0, lambda d, x: mul(d, ast.Call(func=ast.Name(id=grad, ctx=ast.Load()),
+                                                 args=[x], keywords=[])), ins[0])
+        elif kind == "where":                          # (masked_fill: x where not masked)
+            give(0, lambda d, m: mul(d, sub(_c(1), m)), ins[1])
         elif kind == "recip":
             give(0, lambda d, y: neg(div(d, mul(y, y))), ins[0])
         elif kind == "abs":

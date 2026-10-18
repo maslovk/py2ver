@@ -18,8 +18,16 @@ giving values and indices, dim / keepdim):
                       training mode the batch's mean and variance, the running
                       statistics updated (state)
       MaxPool2d       a maximum over each window (a view)
+      Embedding       its weight's rows the indices pick (a gather)
+      LayerNorm       the mean and the variance of each row (its last
+                      dimensions), the row normalized, scaled and shifted
+      GELU            a table of the function (erf's, or tanh's approximation)
       Linear, ReLU, Flatten, Dropout (eval: nothing; training: a mask from
       the generator in hardware), Identity, Softmax, LogSoftmax, Tanh, Sigmoid
+  - matrix products broadcast their leading dimensions (attention's heads)
+  - masked_fill(mask, -inf) before a softmax (causal attention): the mask, a
+    constant, stays a mask, and the softmax's exponentials are multiplied by
+    it, so the masked entries are 0, as torch's, without infinities
   - torch / torch.nn.functional functions: the same operations (relu,
     softmax, log_softmax, cross_entropy, conv2d, linear, max_pool2d, dropout,
     flatten, cat, argmax, exp, log, tanh, sigmoid, sqrt, ...)
@@ -51,7 +59,11 @@ def is_module(v: Any) -> bool:
 
 def is_torch_function(fn: Any) -> bool:
     mod = getattr(fn, "__module__", None) or ""
-    return mod == "torch" or mod.startswith("torch.nn.functional") or mod.startswith("torch._C")
+    return mod == "torch" or mod.startswith("torch.nn.functional") or mod.startswith("torch._C") \
+        or (mod.startswith("torch.nn.utils") and getattr(fn, "__name__", "") in UTILS)
+
+
+UTILS = {"clip_grad_norm_", "clip_grad_norm"}
 
 
 def _pair(v: Any) -> Tuple[int, int]:
@@ -60,6 +72,46 @@ def _pair(v: Any) -> Tuple[int, int]:
 
 def _dim(d: int, nd: int) -> int:
     return d % nd if nd else 0
+
+
+class NegInf:
+    """x with -inf where mask (a constant) is true: only a softmax takes it."""
+
+    def __init__(self, x: Any, keep: Any) -> None:
+        self.x, self.keep = x, keep          # (keep: 1.0 where x is kept, a numpy array)
+        self.shape = tuple(x.shape)
+
+
+def const_values(it, a) -> Any:
+    """A constant table's view as a numpy array (its values when translating), or None."""
+    np = it.np
+    from .numpy_loops import Lazy
+    if isinstance(a, Lazy) or not getattr(a, "const", False) or a.name not in it.tables:
+        return None
+    flat = np.asarray(it.tables[a.name], dtype=float)
+    idx = np.zeros(a.shape, dtype=np.int64) + a.offset
+    for d, (n, st) in enumerate(zip(a.shape, a.strides)):
+        shape = [1] * len(a.shape)
+        shape[d] = n
+        idx = idx + (np.arange(n) * st).reshape(shape)
+    return flat[idx] if a.shape else flat[a.offset]
+
+
+def masked_fill(it, x, mask, value):
+    np = it.np
+    if isinstance(value, (int, float)) and math.isinf(value) and value < 0:
+        m = const_values(it, it.to_arr(mask)) if not isinstance(mask, np.ndarray) else mask
+        if m is None:
+            raise NotTranslatable("masked_fill(mask, -inf): the mask must be a constant")
+        keep = np.broadcast_to(1.0 - (np.asarray(m) != 0), tuple(np.broadcast_shapes(
+            np.shape(m), tuple(x.shape)))).copy()
+        return NegInf(x, keep)
+    if isinstance(value, (int, float)) and math.isinf(value):
+        raise NotTranslatable("masked_fill with +inf is not supported")
+    # (a finite value: x where the mask is false, value where it is true)
+    return it.elementwise(lambda xv, mv: ast.IfExp(test=mv, body=ast.Constant(float(value)),
+                                                   orelse=xv),
+                          x, mask, op=("where", float(value)))
 
 
 # ==================================================================== views
@@ -150,6 +202,33 @@ def max_pool2d(it, x, kernel_size, stride=None, padding=0, dilation=1, ceil_mode
 
 
 def softmax(it, x, dim):
+    if isinstance(x, NegInf):
+        # exp((x - max) * keep) * keep / sum: the masked entries 0, as -inf's would be.
+        # The maximum is the kept entries' (the masked ones replaced by a column kept
+        # in every row: causal attention's first), and the exponential's argument 0
+        # where masked, so the exp table covers only what is kept
+        np = it.np
+        keep = x.keep
+        x = it.to_arr(x.x)
+        nd = len(x.shape)
+        d = dim % nd
+        moved = np.moveaxis(keep, d, -1).reshape(-1, keep.shape[d])
+        common = np.flatnonzero(moved.all(axis=0))
+        if common.size:
+            j = int(common[0])
+            idx = [slice(None)] * nd
+            idx[d] = slice(j, j + 1)
+            shape, strides = list(x.shape), list(x.strides)
+            shape[d], strides[d] = 1, 0
+            col = x.view(tuple(shape), tuple(strides), x.offset + j * x.strides[d])
+            kept = it.binop(ast.Add(), it.binop(ast.Mult(), x, keep),
+                            it.binop(ast.Mult(), col, 1.0 - keep))
+            m = it.reduce(it.to_arr(kept), dim, True, "max")
+        else:
+            m = it.reduce(x, dim, True, "max")
+        arg = it.binop(ast.Mult(), it.binop(ast.Sub(), x, m), keep)
+        e = it.binop(ast.Mult(), it.numpy("exp", [arg], {}), keep)
+        return it.binop(ast.Div(), e, it.reduce(it.to_arr(e), dim, True, "sum"))
     x = it.to_arr(x)
     m = it.reduce(x, dim, True, "max")
     e = it.numpy("exp", [it.binop(ast.Sub(), x, m)], {})
@@ -157,6 +236,8 @@ def softmax(it, x, dim):
 
 
 def log_softmax(it, x, dim):
+    if isinstance(x, NegInf):
+        raise NotTranslatable("log_softmax of -inf values is not supported")
     x = it.to_arr(x)
     z = it.binop(ast.Sub(), x, it.reduce(x, dim, True, "max"))
     s = it.reduce(it.to_arr(it.numpy("exp", [z], {})), dim, True, "sum")
@@ -217,6 +298,111 @@ def batch_norm(it, mod, x):
     return batch_norm_train(it, mod, x)
 
 
+def clip_grad_norm(it, params, max_norm, norm_type=2.0, error_if_nonfinite=False):
+    """torch.nn.utils.clip_grad_norm_: the gradients' total 2-norm, each gradient
+    scaled by min(1, max_norm / (norm + 1e-6)), as torch does."""
+    from .numpy_loops import Sym
+    if float(norm_type) != 2.0:
+        raise NotTranslatable("clip_grad_norm_: only the 2-norm is supported")
+    if _torch().is_tensor(params):
+        params = [params]
+    grads = []
+    for p in list(params):
+        g = it.grads.get(it.adopt(p).name)
+        if g is not None:
+            grads.append(g)
+    if not grads:
+        return 0.0
+    total = None
+    for g in grads:
+        s = it.reduce(it.to_arr(it.binop(ast.Mult(), g, g)), None, False, "sum")
+        total = s if total is None else it.binop(ast.Add(), total, s)
+    norm = it.rename(it.numpy("sqrt", [it.rename(total, "gn2")], {}), "gnorm")
+    coef = it.binop(ast.Div(), float(max_norm), it.binop(ast.Add(), norm, 1e-6))
+    coef = it.rename(it.elementwise(lambda c: ast.Call(func=ast.Name(id="min", ctx=ast.Load()),
+                                                       args=[c, ast.Constant(1.0)], keywords=[]),
+                                    coef, op=("min",)), "clip")
+    for g in grads:
+        it.copy_into(g, it.binop(ast.Mult(), g, coef))
+    return norm
+
+
+def embedding(it, idx, weight):
+    w = it.to_arr(weight)
+    return it.fancy(w, [idx], False)
+
+
+def layer_norm(it, x, shape, weight=None, bias=None, eps=1e-5):
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    x = it.to_arr(x)
+    nd = len(x.shape)
+    axes = tuple(range(nd - len(shape), nd))
+    mean = it.reduce(x, axes, True, "mean")
+    d = it.binop(ast.Sub(), x, mean)
+    var = it.reduce(it.to_arr(it.binop(ast.Mult(), d, d)), axes, True, "mean")
+    inv = it.to_arr(it.binop(ast.Div(), 1.0, it.numpy("sqrt", [it.binop(ast.Add(), var, float(eps))],
+                                                      {})))
+    y = it.binop(ast.Mult(), d, inv)
+    if weight is not None:
+        y = it.binop(ast.Mult(), y, weight)
+    if bias is not None:
+        y = it.binop(ast.Add(), y, bias)
+    return y
+
+
+def gelu(it, x, approximate="none"):
+    """GELU as a table of the function (with its derivative, for autograd)."""
+    from .numpy_fe import TABLES_KEY
+    name = GELU_TANH if approximate == "tanh" else GELU
+    it.ns[name] = _GELU_FUNCTIONS[name]
+    it.ns[name + "_grad"] = _GELU_FUNCTIONS[name + "_grad"]
+    it.ns.setdefault(TABLES_KEY, set()).update({name, name + "_grad"})
+    return it.elementwise(lambda v: ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=[v],
+                                             keywords=[]), x, op=("table", name))
+
+
+GELU = "__py2ver_gelu"
+GELU_TANH = "__py2ver_gelu_tanh"
+
+
+def _erf(x: Any) -> Any:
+    import numpy as np
+    if isinstance(x, np.ndarray):
+        return np.vectorize(math.erf, otypes=[float])(x)
+    return math.erf(x)
+
+
+def _gelu(x):
+    return 0.5 * x * (1.0 + _erf(x / math.sqrt(2.0)))
+
+
+def _gelu_grad(x):
+    import numpy as np
+    e = np.exp if not isinstance(x, (int, float)) else math.exp
+    return 0.5 * (1.0 + _erf(x / math.sqrt(2.0))) + x * e(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _gelu_tanh(x):
+    import numpy as np
+    t = np.tanh if not isinstance(x, (int, float)) else math.tanh
+    return 0.5 * x * (1.0 + t(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
+
+
+def _gelu_tanh_grad(x):
+    import numpy as np
+    t = np.tanh if not isinstance(x, (int, float)) else math.tanh
+    c = math.sqrt(2.0 / math.pi)
+    u = c * (x + 0.044715 * x * x * x)
+    th = t(u)
+    return 0.5 * (1.0 + th) + 0.5 * x * (1.0 - th * th) * c * (1.0 + 3 * 0.044715 * x * x)
+
+
+for _f in (_gelu, _gelu_grad, _gelu_tanh, _gelu_tanh_grad):
+    _f.__py2ver_vectorized__ = True          # (takes numpy arrays: vectorize.py may call it so)
+_GELU_FUNCTIONS = {GELU: _gelu, GELU + "_grad": _gelu_grad,
+                   GELU_TANH: _gelu_tanh, GELU_TANH + "_grad": _gelu_tanh_grad}
+
+
 # ==================================================================== calls
 
 _ACTIVATIONS = {"Tanh": "tanh", "Sigmoid": "sigmoid"}
@@ -254,6 +440,16 @@ def module_call(it, mod, args: List[Any], kwargs: Dict[str, Any]) -> Any:
             return dropout(it, x, mod.p, mod.training)
         if name == "Identity":
             return x
+        if name == "Embedding":
+            if mod.padding_idx is not None or mod.max_norm is not None:
+                raise NotTranslatable("Embedding(padding_idx / max_norm) is not supported")
+            return embedding(it, x, it.param(mod, "weight"))
+        if name == "LayerNorm":
+            return layer_norm(it, x, mod.normalized_shape, it.param(mod, "weight"),
+                              it.param(mod, "bias") if mod.elementwise_affine else None,
+                              mod.eps)
+        if name == "GELU":
+            return gelu(it, x, mod.approximate)
         if name == "Softmax":
             return softmax(it, x, mod.dim)
         if name == "LogSoftmax":
@@ -271,8 +467,20 @@ def function(it, fn, args: List[Any], kwargs: Dict[str, Any]) -> Any:
 
     def arg(i, key, default=None):
         return args[i] if len(args) > i else kwargs.get(key, default)
+    if name in UTILS:
+        return clip_grad_norm(it, arg(0, "parameters"), arg(1, "max_norm"), arg(2, "norm_type", 2.0),
+                              arg(3, "error_if_nonfinite", False))
     if name in ("relu", "relu_"):
         return relu(it, args[0])
+    if name == "gelu":
+        return gelu(it, args[0], kwargs.get("approximate", "none"))
+    if name == "layer_norm":
+        return layer_norm(it, args[0], arg(1, "normalized_shape"), arg(2, "weight"),
+                          arg(3, "bias"), arg(4, "eps", 1e-5))
+    if name == "embedding":
+        return embedding(it, args[0], arg(1, "weight"))
+    if name == "masked_fill":
+        return masked_fill(it, args[0], arg(1, "mask"), arg(2, "value"))
     if name == "softmax":
         return softmax(it, args[0], arg(1, "dim"))
     if name == "log_softmax":
@@ -346,6 +554,26 @@ def tensor_method(it, a, name: str, args: List[Any], kwargs: Dict[str, Any]) -> 
         return a
     if name == "clone":
         return it.method(it.to_arr(a), "copy", [], {})
+    if name in ("split", "chunk"):
+        dim = _dim(arg(1, "dim", 0), nd)
+        n = a.shape[dim]
+        if name == "chunk":
+            size = -(-n // int(args[0]))
+            sizes = [size] * (n // size) + ([n % size] if n % size else [])
+        elif isinstance(args[0], int):
+            sizes = [args[0]] * (n // args[0]) + ([n % args[0]] if n % args[0] else [])
+        else:
+            sizes = list(args[0])
+        a = it.to_arr(a)
+        out, at = [], 0
+        for k in sizes:
+            shape = list(a.shape)
+            shape[dim] = k
+            out.append(a.view(tuple(shape), a.strides, a.offset + at * a.strides[dim]))
+            at += k
+        return tuple(out)
+    if name == "masked_fill":
+        return masked_fill(it, a, arg(0, "mask"), arg(1, "value"))
     if name == "size":
         d = arg(0, "dim")
         return tuple(a.shape) if d is None else a.shape[_dim(d, nd)]

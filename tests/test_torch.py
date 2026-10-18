@@ -190,3 +190,72 @@ def test_max_pooling_s_gradient_goes_to_the_first_maximum():
         x[:, :, 2:4, 1:4] = torch.randn(4, 1, 2, 3, generator=g)
         batches.append((x, torch.randint(0, 3, (4,), generator=g)))
     numpy_loops.translate(train_epoch, [(m, batches, opt, sched, torch.device("cpu"))])
+
+
+# ----------------------------- a tiny GPT: embeddings, attention, LayerNorm, GELU -----------------------------
+
+def _gpt(seed=0):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
+    import tiny_gpt as G
+    torch.manual_seed(seed)
+    cfg = G.Config(vocab_size=11, block_size=8, n_embd=12, n_head=2, n_layer=2)
+    return G, G.TinyGPT(cfg)
+
+
+def gpt_steps(model, loader, optimizer):
+    """(a training loop of the usual shape, with gradient clipping)"""
+    model.train()
+    total = 0.0
+    for x, y in loader:
+        _, loss = model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total += loss.item()
+    return total
+
+
+def test_a_tiny_gpt_s_forward_pass_is_built_as_written():
+    G, m = _gpt()
+    m.eval()
+    xs = [torch.randint(0, 11, (1, 8)) for _ in range(4)]
+    tr = numpy_loops.translate(m, xs[:2])          # (logits; the loss None: no result)
+    with torch.no_grad():
+        for x in xs:
+            assert np.allclose(tr.func(*tr.adapt(x)), m(x)[0].numpy().ravel(), atol=1e-4)
+
+
+def test_a_tiny_gpt_trains_as_torch_does():
+    G, m = _gpt()
+    decay = [p for p in m.parameters() if p.dim() >= 2]
+    no_decay = [p for p in m.parameters() if p.dim() < 2]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                             {"params": no_decay, "weight_decay": 0.0}], lr=1e-2, betas=(0.9, 0.99))
+    g = torch.Generator().manual_seed(2)
+    batches = [(torch.randint(0, 11, (2, 8), generator=g), torch.randint(0, 11, (2, 8), generator=g))
+               for _ in range(3)]
+    # (checked against torch's training of a copy: dropout, attention, the tied
+    # embedding, clipping, AdamW's two groups)
+    tr = numpy_loops.translate(gpt_steps, [(m, batches, opt)])
+    labels = {label for label, _, _ in tr.memories.values()}
+    assert "Embedding.weight" in labels and "LayerNorm.weight" in labels
+    assert not any(label.startswith("Linear.weight") and "head" in label for label in labels)
+
+
+@pytest.mark.sim
+@pytest.mark.slow
+def test_a_tiny_gpt_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    G, m = _gpt()
+    m.eval()
+    xs = [torch.randint(0, 11, (1, 8)) for _ in range(20)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs, width=16, round=True)
+    model = np.array(p.PY_batch()(xs))
+    with torch.no_grad():
+        want = np.array([m(x)[0].numpy().ravel() for x in xs])
+    assert np.abs(model - want).max() < 0.01
+    assert p.TB_batch()(xs[:2]) == p.PY_batch()(xs[:2])
