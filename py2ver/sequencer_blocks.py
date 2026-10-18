@@ -44,11 +44,28 @@ def _eq(a: ast.expr, k: int) -> ast.expr:
     return ast.Compare(left=a, ops=[ast.Eq()], comparators=[ast.Constant(k)])
 
 
+def _key(v: ast.expr) -> Any:
+    if isinstance(v, ast.Name):
+        return ("n", v.id)
+    if isinstance(v, ast.Constant):
+        return ("c", type(v.value), v.value)
+    return ast.dump(v)
+
+
+def _copy(v: ast.expr) -> ast.expr:
+    if isinstance(v, ast.Name):
+        return ast.Name(id=v.id, ctx=ast.Load())
+    if isinstance(v, ast.Constant):
+        return ast.Constant(v.value)
+    return copy.deepcopy(v)
+
+
 def _sel(values: List[ast.expr], idx: ast.expr) -> ast.expr:
     """values[idx] (a balanced multiplexer), or the value if they're all the same."""
-    if all(ast.dump(v) == ast.dump(values[0]) for v in values):
-        return copy.deepcopy(values[0])
-    return ast.Subscript(value=ast.Tuple(elts=[copy.deepcopy(v) for v in values], ctx=ast.Load()),
+    first = _key(values[0])
+    if all(_key(v) == first for v in values):
+        return _copy(values[0])
+    return ast.Subscript(value=ast.Tuple(elts=[_copy(v) for v in values], ctx=ast.Load()),
                          slice=idx, ctx=ast.Load())
 
 

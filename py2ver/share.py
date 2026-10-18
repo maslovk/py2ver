@@ -482,6 +482,9 @@ def _bits_range(*rs: Tuple[int, int]) -> Tuple[int, int]:
     return -(1 << (w - 1)), (1 << (w - 1)) - 1
 
 
+_TABLE_HULLS: Dict[int, Tuple[ast.Tuple, Tuple[int, int]]] = {}
+
+
 def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
               attr: Dict[str, Dict[str, Any]]) -> Tuple[int, int]:
     """Every value n can take (an interval; exact arithmetic, as the model)."""
@@ -502,7 +505,16 @@ def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
         if isinstance(n.value, ast.Name) and "width" in attr.get(n.value.id, {}):
             return _fmt_range(attr[n.value.id])
         if isinstance(n.value, ast.Tuple):
-            return _hull(*[iv(e) for e in n.value.elts])
+            t = n.value
+            if id(t) not in _TABLE_HULLS or _TABLE_HULLS[id(t)][0] is not t:
+                if all(isinstance(e, ast.Constant) and isinstance(e.value, (int, bool))
+                       for e in t.elts):
+                    vals = [int(e.value) for e in t.elts]
+                    hull = (min(vals), max(vals))
+                else:
+                    hull = _hull(*[iv(e) for e in t.elts])
+                _TABLE_HULLS[id(t)] = (t, hull)       # (a table's range, once: they are long)
+            return _TABLE_HULLS[id(t)][1]
     if isinstance(n, ast.BinOp):
         (a, b), (c, d) = iv(n.left), iv(n.right)
         op = n.op

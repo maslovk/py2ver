@@ -798,7 +798,7 @@ should cover training, or `margin=` leave room for it. `examples/digits_training
 | numpy (float) | 1.863 / 0.838 / 0.419 | 93.3 % | |
 | fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 1,655,826 clocks: 33 ms at 50 MHz |
 
-The bit-exact model trains the three epochs in about 3 minutes; the hardware,
+The bit-exact model trains the three epochs in 23 seconds; the hardware,
 simulated in Verilator, gives the model's losses bit for bit (2 steps). The
 step is mostly its matrix products, a multiply-accumulate a clock (about
 1.4 million); Adam's division and square root are pipelined, an element a
@@ -943,10 +943,10 @@ numbers:
 
 After the 4 steps the weights of `Linear(3136, 128)` are within 0.0004 of
 torch's. A step is 133,119,948 clocks (2.7 s at 50 MHz): 56 million
-multiply-accumulates an image forward and back. It takes a while to build
-(17 minutes: the translation and the formats run the step in Python) and the
-model 100 s a step; its state (the weights, AdamW's moments: 1.4 million
-numbers, 34 Mbit) is for simulation.
+multiply-accumulates an image forward and back. It builds in about 2 minutes
+and the model runs a step in 10 s (see "The models, with numpy" below); its
+state (the weights, AdamW's moments: 1.4 million numbers, 34 Mbit) is for
+simulation.
 
 ### Simulation speed (Icarus, Verilator)
 
@@ -969,6 +969,39 @@ a large one it is Icarus's own evaluation, which only Verilator cuts.
 Python testbenches). A design Verilator can't build runs on Icarus, with a
 warning. `TB_handshake()`, `HW_sim()` and designs with `'reg'`
 signals use cocotb.
+
+#### The models, with numpy
+
+A design built as loops (numpy or PyTorch code, `numpy_loops.py`) is a loop
+program, and four things run it in Python: the check of the translation, the
+run that chooses the formats, `PY_float()` and the bit-exact model
+(`PY_batch()`, `PY_stream()`). They run it with numpy (`vectorize.py`), with
+exactly Python's results:
+
+- a loop whose iterations don't depend on each other runs all of them at
+  once, its variable an array of its values; a loop carrying a value (a sum)
+  runs an iteration at a time, its body over all the iterations of the loops
+  around it (a matrix product: every element's sum a step at a time)
+- a store whose index repeats (col2im adding overlapping windows back) runs
+  in rounds, each element's updates in Python's order; an if is a mask
+- integers are int64, or Python's integers wherever an operation could pass
+  62 bits, so the fixed-point model stays bit-exact (the hardware's
+  simulations agree with it)
+
+| | in Python | with numpy |
+|---|---|---|
+| PyTorch MNIST forward pass: build | 413 s | 13 s |
+| its bit-exact model, an image | 13 s | 1 s |
+| PyTorch MNIST training step (2 images): build | 1000 s | 135 s |
+| its bit-exact model, a step | 100 s | 10 s |
+| numpy CNN training step: build | 205 s | 16 s |
+| its bit-exact model, 2 epochs (88 steps) | 585 s | 127 s |
+| digit network's training, 3 epochs in the model | 3 min | 23 s |
+
+(the builds also lost some slow spots that had nothing to do with Python's
+speed: width analysis of long expressions done once per part, the tables'
+long literals shared instead of copied.) `PY2VER_VECTOR=0` runs them as
+Python.
 
 ### Area and timing (`SYN()`)
 

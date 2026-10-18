@@ -177,8 +177,8 @@ def _allocations(items, rams: Set[str], sq) -> List[Union[Block, Loop]]:
             nxt = items[k + 1] if k + 1 < len(items) else None
             if last_here and isinstance(nxt, Loop) and _writes_all(nxt, name, len(elems)):
                 continue                              # (every element written first)
-            consts = {ast.dump(e) for e in elems}
-            if len(consts) == 1:
+            first = elems[0]
+            if all(e is first for e in elems) or len({ast.dump(e) for e in elems}) == 1:
                 var = sq.fresh("__fill")
                 out.append(Loop(var, list(range(len(elems))), [Block([ast.Assign(
                     targets=[ast.Subscript(value=ast.Name(id=name, ctx=ast.Load()),

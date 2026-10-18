@@ -77,19 +77,27 @@ class Node:
 # Parsing (Verilog operator precedence)
 # --------------------------------------------------------------------
 
+_TOKENS = re.compile(r"(?:" + _TOKEN.pattern + r")*\s*")
+_KINDS = ("sized", "num", "sys", "id", "op")
+
+
 def _tokenize(expr: str) -> List[Tuple[str, str]]:
-    toks: List[Tuple[str, str]] = []
-    pos = 0
     expr = expr.rstrip()
-    while pos < len(expr):
-        m = _TOKEN.match(expr, pos)
-        if not m or m.end() == pos:
-            raise Unsupported(f"cannot tokenize at {expr[pos:pos + 20]!r}")
-        kind = m.lastgroup
-        if kind == "sys":
-            raise Unsupported(f"system function {m.group(kind)}")
-        toks.append((kind, m.group(kind)))
-        pos = m.end()
+    if not _TOKENS.fullmatch(expr):                    # (every character a token's)
+        pos = 0
+        while pos < len(expr):
+            m = _TOKEN.match(expr, pos)
+            if not m or m.end() == pos:
+                raise Unsupported(f"cannot tokenize at {expr[pos:pos + 20]!r}")
+            pos = m.end()
+    toks: List[Tuple[str, str]] = []
+    for groups in _TOKEN.findall(expr):
+        for kind, text in zip(_KINDS, groups):
+            if text:
+                if kind == "sys":
+                    raise Unsupported(f"system function {text}")
+                toks.append((kind, text))
+                break
     return toks
 
 
@@ -188,6 +196,15 @@ def _bits_for(v: int) -> int:
 
 
 def analyze(node: Node, meta) -> Info:
+    """(Once per node: an expression's parts are asked about again and again.)"""
+    info = node.__dict__.get("_info")
+    if info is None:
+        info = _analyze(node, meta)
+        node.__dict__["_info"] = info
+    return info
+
+
+def _analyze(node: Node, meta) -> Info:
     k = node.kind
     if k == "id":
         m = meta(node.name)
@@ -238,9 +255,12 @@ def analyze(node: Node, meta) -> Info:
 
 
 def max_bits(node: Node, meta) -> int:
-    best = analyze(node, meta).bits
-    for kid in node.kids:
-        best = max(best, max_bits(kid, meta))
+    best = node.__dict__.get("_max_bits")
+    if best is None:
+        best = analyze(node, meta).bits
+        for kid in node.kids:
+            best = max(best, max_bits(kid, meta))
+        node.__dict__["_max_bits"] = best
     return best
 
 

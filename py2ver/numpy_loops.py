@@ -1705,6 +1705,10 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
     exec(compile(source, filename, "exec"), ns)
     gen = ns[gen_name]
+    # (run with numpy where it can: the check, the formats' run, the bit-exact model)
+    from . import vectorize
+    gen.__py2ver_loops__ = fdef
+    ns[vectorize.VECTOR_KEY] = True
     attr = {p: {"length": math.prod(shapes[p])} for p in names if shapes[p] != ()}
     memories: Dict[str, Tuple[str, Any, Any]] = {}
     paths = _paths(obj) if obj is not None else {}
@@ -1753,6 +1757,7 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
     tr.generators = {id(gen): _seed(gen) for gen in it.generators.values()}
     tr.paths = tr_paths
     tr.torch = torch_mode
+    tr.fast = vectorize.program(fdef, ns, gen)
     tr.steps = steps
     if loop is not None:
         tr.carried = type(carried_holder).__name__
@@ -1894,7 +1899,7 @@ def _check_loop(tr: Translation, fn: Callable, original: Any, loop, steps: List[
         fn(*args)
     state = {name: list(tr.attr[name]["init"]) for name in tr.memories}
     for s in steps[:2]:
-        tr.func(*tr.adapt(s), *state.values())
+        tr.fast(*tr.adapt(s), *state.values())
     tol = dict(rtol=1e-3, atol=1e-4) if tr.torch else dict(rtol=1e-6, atol=1e-9)
     for name, (label, _, owner) in tr.memories.items():
         if label.endswith("." + RANDOM_STATE) or label.startswith(tr.carried + "."):
@@ -1931,7 +1936,7 @@ def _check_runs(tr, func, samples, memo, state) -> None:
     for s in samples[:2 if tr.memories else 3]:
         args = s if isinstance(s, tuple) else (s,)
         want = _flat(func(*args))
-        got = tr.func(*tr.adapt(args), *state.values())
+        got = tr.fast(*tr.adapt(args), *state.values())
         got = np.ravel(np.asarray([x for g in (got if isinstance(got, tuple) else (got,))
                                    for x in (g if isinstance(g, list) else [g])], dtype=float))
         if want.shape != got.shape or not np.allclose(want, got, **tol):

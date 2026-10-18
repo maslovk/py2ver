@@ -71,6 +71,28 @@ class _Range:
         self.is_float |= isinstance(x, float)
         self.lo, self.hi = min(self.lo, x), max(self.hi, x)
 
+    def add_array(self, v: Any) -> None:
+        """Values from a numpy run (vectorize.py): an array of values, or a whole
+        list (ListValue)."""
+        import numpy as np
+        if type(v).__name__ == "ListValue":
+            v = v.arr
+            self.is_list = True
+            self.length = max(self.length, int(v.size))
+        if not v.size or v.dtype == bool:
+            return
+        if v.dtype == object:
+            for x in v.flat:
+                self._add(x)
+            return
+        if v.dtype.kind == "f":
+            self.is_float = True
+        elif v.dtype.kind not in "iu":
+            return
+        lo, hi = v.min(), v.max()
+        self.lo = min(self.lo, float(lo) if v.dtype.kind == "f" else int(lo))
+        self.hi = max(self.hi, float(hi) if v.dtype.kind == "f" else int(hi))
+
     def merge(self, other: "_Range") -> None:
         self.lo, self.hi = min(self.lo, other.lo), max(self.hi, other.hi)
         self.is_float |= other.is_float
@@ -281,6 +303,10 @@ def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]
             record(name, x)
 
     traced, order, returned, _ = _traced(func, rec, rec_elem)
+    if getattr(func, "__py2ver_loops__", None) is not None:      # (a loop program: numpy)
+        from . import vectorize
+        traced = vectorize.program(func.__py2ver_loops__, func.__globals__, traced, rec,
+                                   tuple(k for k in order if not k.isidentifier()))
     params = list(inspect.signature(func).parameters)
     state = [p for p in params if "next" in attr.get(p, {}) or "memory" in attr.get(p, {})]
     inputs = [p for p in params if p not in state]
@@ -429,6 +455,8 @@ def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]
                 r.lo = value
             if value > r.hi:
                 r.hi = value
+        elif type(value).__name__ in ("ndarray", "ListValue"):    # (from vectorize.py)
+            r.add_array(value)
         else:
             r.add(value)
 

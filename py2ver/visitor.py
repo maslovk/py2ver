@@ -70,6 +70,8 @@ BINOP_TOKENS = {
 # ------------------------------------------------------------
 # AST → IR Visitor
 # ------------------------------------------------------------
+_IDENT = re.compile(r"(?<![\w'$])[A-Za-z_]\w*")      # (names in an expression; not 8'sd5's sd5)
+
 class FunctionVisitor(ast.NodeVisitor):
     def __init__(self, attr: Dict[str, Any], indentsize: int = 2):
         self.attr = normalize_attr(attr)
@@ -591,6 +593,9 @@ class FunctionVisitor(ast.NodeVisitor):
 
     def _fold(self, expr: str):
         """Value of an expression made only of constants (and constant versions), else None."""
+        # (a name that isn't a constant: nothing to fold, without parsing it)
+        if any(name not in self._const_of for name in _IDENT.findall(expr)):
+            return None
         try:
             tree = parse(expr)
         except Unsupported:

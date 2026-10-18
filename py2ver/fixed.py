@@ -53,16 +53,33 @@ ISQRT = "__py2ver_isqrt"
 SQRT_MIN_FRAC = 8       # fraction bits of an exact square root, at least
 
 
+class _SharedTuple(ast.Tuple):
+    """A constant table's tuple literal: shared, never copied (copy.deepcopy gives
+    the node itself; a table of 400,000 entries is long to copy). Its class is
+    named Tuple, so visitors (visit_Tuple) see a tuple."""
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "_SharedTuple":
+        return self
+
+    def __copy__(self) -> "_SharedTuple":
+        return self
+
+
+_SharedTuple.__name__ = "Tuple"
+
+
 @functools.lru_cache(maxsize=256)
 def table_node(values: Tuple[int, ...]) -> ast.Tuple:
     """A constant table as a tuple literal whose nodes already have positions
     (so copy_tree can share it and fix_locations can skip it). One node per
     table: nothing modifies it, so every use shares it."""
     pos = {"lineno": 1, "col_offset": 0, "end_lineno": 1, "end_col_offset": 0}
-    return ast.Tuple(elts=[ast.Constant(v, **pos) for v in values], ctx=ast.Load(), **pos)
+    return _SharedTuple(elts=[ast.Constant(v, **pos) for v in values], ctx=ast.Load(), **pos)
 
 
 def _is_table_node(n: ast.AST) -> bool:
+    if isinstance(n, _SharedTuple):
+        return True
     if type(n) is not ast.Tuple or len(n.elts) < TABLE_MIN:
         return False
     known = getattr(n, "_py2ver_table", None)       # (worked out once per node)
@@ -1040,4 +1057,7 @@ def build_model(tree: ast.Module, attr: Dict[str, Dict[str, Any]],
                __py2ver_wrapl=lambda xs, w, s: [wrap(int(x), w, s) for x in xs])
     env.update(dict(tables.values()))
     exec(compile(module, "<py2ver bit-exact model>", "exec"), env)
+    from . import vectorize
+    if ns.get(vectorize.VECTOR_KEY):                 # (a loop program: run with numpy)
+        return vectorize.program(module.body[0], env, env[fd.name])
     return env[fd.name]
