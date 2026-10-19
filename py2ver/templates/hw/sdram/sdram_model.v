@@ -1,6 +1,9 @@
 // sdram_model.v
 // A behavioral model of the DE0-Nano's SDRAM (IS42S16160B) for simulation:
-// burst length 1, the CAS latency of its mode register, banks with open rows.
+// burst length 1, the CAS latency of its mode register, banks with open rows. A
+// read's data is on the bus as the chip has it: from tAC after the edge CL - 1
+// clocks after the READ to tOH after the next edge (unknown in between, between
+// reads one after the other).
 // It checks the timing a controller must keep (ACTIVE to READ / WRITE, PRECHARGE
 // to ACTIVE, ACTIVE to PRECHARGE, REFRESH to anything, the refresh interval,
 // accesses to a closed bank) and counts the violations in `errors` ($display'ing
@@ -13,7 +16,9 @@ module sdram_model #(
     parameter T_RP    = 1,
     parameter T_RAS   = 3,
     parameter T_RFC   = 4,
-    parameter T_REF_MAX = 400    // most clocks between refreshes (7.8 us at 50 MHz)
+    parameter T_REF_MAX = 400,   // most clocks between refreshes (7.8 us at 50 MHz)
+    parameter T_AC    = 5.4,     // read data valid after the clock edge (ns)
+    parameter T_OH    = 2.7      // and held after the next (ns)
 ) (
     input             clk,       // DRAM_CLK
     input             cke,
@@ -39,7 +44,7 @@ module sdram_model #(
     reg [7:0]  out_valid;
     reg        driving;
     reg [15:0] driven;
-    assign #1 dq = driving ? driven : 16'bz;
+    assign dq = driving ? driven : 16'bz;    // (Verilator: a tristate continuous assign)
 
     task error(input [8*64-1:0] what);
         begin
@@ -67,9 +72,15 @@ module sdram_model #(
 
     wire [3:0] cmd = {cs_n, ras_n, cas_n, we_n};
     always @(posedge clk) begin
-        // (data out: the read issued cl clocks ago)
-        driving <= out_valid[cl - 1];
-        driven <= out_data[cl - 1];
+        // (data out: the read issued cl - 1 clocks ago, from tAC after this edge to
+        //  tOH after the next; Verilator, without delays, from the edge)
+        if (out_valid[cl - 2]) begin
+            driving <= #T_OH 1'b1;
+            driven <= #T_OH 16'bx;
+            driven <= #T_AC out_data[cl - 2];
+        end else begin
+            driving <= #T_OH 1'b0;
+        end
         out_valid <= {out_valid[6:0], 1'b0};
         for (i = 7; i > 0; i = i - 1) out_data[i] <= out_data[i - 1];
         for (i = 0; i < 4; i = i + 1) begin

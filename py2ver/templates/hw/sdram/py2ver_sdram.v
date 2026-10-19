@@ -2,9 +2,10 @@
 // A controller for the DE0-Nano's SDRAM (IS42S16160B: 32 MB, 16-bit, 4 banks of
 // 8192 rows of 512 words), for a design that reads and writes it a word at a
 // time. The SDRAM's clock is the inverse of clk (DRAM_CLK = ~clk): a command
-// registered at a rising edge of clk is sampled half a clock later, and a read's
-// data (CAS latency 2, burst length 1) is captured CL + 1 = 3 clocks after its
-// READ command.
+// registered at a rising edge of clk is sampled half a clock later. A read's data
+// (CAS latency 2, burst length 1) is on the bus from tAC after the SDRAM's next
+// edge to tOH after the one after that: the rising edge of clk CL = 2 clocks
+// after the READ captures it, and it is registered once more (rdata, CL + 1).
 //
 // The request side takes one access a clock: req with we, addr = {bank, row,
 // col} and wdata. ready says the access is issued at this edge; while it is low
@@ -62,6 +63,7 @@ module py2ver_sdram #(
     reg  [3:0]  wr_n [0:3];      // clocks since a WRITE (saturating)
     reg  [3:0]  rd_busy;         // clocks the data bus is still taken by a read
     reg  [READ_LATENCY-1:0] inflight;
+    reg  [15:0] dq_in;           // a read's data, captured CL clocks after its READ
     reg  [15:0] dq_out;
     reg         dq_oe;
 
@@ -91,7 +93,8 @@ module py2ver_sdram #(
         dq_oe <= 1'b0;
         inflight <= {inflight[READ_LATENCY-2:0], 1'b0};
         rvalid <= inflight[READ_LATENCY-1];
-        if (inflight[READ_LATENCY-1]) rdata <= dq;
+        if (inflight[CL-1]) dq_in <= dq;
+        if (inflight[READ_LATENCY-1]) rdata <= dq_in;
         if (rd_busy != 0) rd_busy <= rd_busy - 1'b1;
         for (i = 0; i < 4; i = i + 1) begin
             if (act_n[i] != 4'hf) act_n[i] <= act_n[i] + 1'b1;
@@ -206,6 +209,7 @@ module py2ver_sdram #(
         ba = 0;
         dq_oe = 0;
         dq_out = 0;
+        dq_in = 0;
         rdata = 0;
     end
 endmodule

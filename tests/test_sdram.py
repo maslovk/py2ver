@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,8 +27,7 @@ module tb;
         .clk(clk), .rst(rst), .req(req), .we(we), .addr(addr), .wdata(wdata), .ready(ready),
         .rvalid(rvalid), .rdata(rdata), .init_done(init_done), .sa(sa), .ba(ba), .cs_n(cs_n),
         .ras_n(ras_n), .cas_n(cas_n), .we_n(we_n), .cke(cke), .dqm(dqm), .dq(dq));
-    sdram_model m(.clk(~clk), .cke(cke), .cs_n(cs_n), .ras_n(ras_n), .cas_n(cas_n),
-                  .we_n(we_n), .ba(ba), .sa(sa), .dqm(dqm), .dq(dq));
+    CHIP
 
     reg [15:0] refm [0:16383];        // {bank, row 0..7, col}
     reg [15:0] want_q [0:65535];
@@ -64,7 +64,7 @@ module tb;
         end
         if (n >= NOPS && tail == head && !req) begin
             $display("RESULT bad=%0d reads=%0d model_errors=%0d clocks=%0d", bad, reads,
-                     m.errors, clocks);
+                     ERRORS, clocks);
             $finish;
         end
     end
@@ -76,17 +76,37 @@ endmodule
 """
 
 
-def _run(tmp_path, seq, nops=60000, seed=7):
+PY2VER_CHIP = ("sdram_model m(.clk(~clk), .cke(cke), .cs_n(cs_n), .ras_n(ras_n), .cas_n(cas_n), "
+               ".we_n(we_n), .ba(ba), .sa(sa), .dqm(dqm), .dq(dq));")
+MICRON_CHIP = ("mt48lc16m16a2 m(.Dq(dq), .Addr(sa), .Ba(ba), .Clk(~clk), .Cke(cke), .Cs_n(cs_n), "
+               ".Ras_n(ras_n), .Cas_n(cas_n), .We_n(we_n), .Dqm(dqm));")
+
+
+def _run(tmp_path, seq, nops=60000, seed=7, micron=None):
+    """The controller against py2ver's model of the chip, or (micron: the path of
+    Micron's MT48LC16M16A2 model, the same organization) against Micron's,
+    whose timing errors are its 'ERROR' lines."""
     tb = tmp_path / "tb.v"
     tb.write_text(TB.replace("SEED", str(seed)).replace("NOPS", str(nops))
-                  .replace("SEQ", "1" if seq else "0"))
-    subprocess.run(["iverilog", "-g2012", "-o", str(tmp_path / "sim.vvp"), str(tb),
-                    str(HERE / "py2ver_sdram.v"), str(HERE / "sdram_model.v")], check=True)
+                  .replace("SEQ", "1" if seq else "0")
+                  .replace("CHIP", MICRON_CHIP if micron else PY2VER_CHIP)
+                  .replace("ERRORS", "0" if micron else "m.errors"))
+    if micron:                       # (its includes: the time unit, no defines)
+        (tmp_path / "timescale.v").write_text("`timescale 1ns/1ps\n")
+        (tmp_path / "test-defines.v").write_text("\n")
+    chip = str(micron) if micron else str(HERE / "sdram_model.v")
+    subprocess.run(["iverilog", "-g2012", "-I", str(tmp_path), "-o", str(tmp_path / "sim.vvp"),
+                    str(tb), str(HERE / "py2ver_sdram.v"), chip], check=True)
     out = subprocess.run(["vvp", "-n", str(tmp_path / "sim.vvp")], capture_output=True,
                          text=True, check=True).stdout
     line = next(x for x in out.splitlines() if x.startswith("RESULT"))
     assert "timeout" not in line, out[-2000:]
-    return dict(kv.split("=") for kv in line.split()[1:])
+    r = dict(kv.split("=") for kv in line.split()[1:])
+    if micron:
+        errors = [x for x in out.splitlines() if "ERROR" in x]
+        r["model_errors"] = str(len(errors))
+        assert not errors, "\n".join(errors[:5])
+    return r
 
 
 @pytest.mark.sim
@@ -106,6 +126,19 @@ def test_accesses_within_a_row_run_one_a_clock(tmp_path):
     assert int(r["clocks"]) < 60000 * 4 / 3 * 1.35
 
 
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+@pytest.mark.skipif(not os.environ.get("PY2VER_MICRON_MODEL"),
+                    reason="PY2VER_MICRON_MODEL: the path of Micron's mt48lc16m16a2.v")
+@pytest.mark.parametrize("seq", [False, True])
+def test_the_controller_against_microns_model(tmp_path, seq):
+    """Micron's model of a chip organized as the DE0-Nano's (MT48LC16M16A2, not in
+    the repository: its own license): its timing checks, and the read data on
+    the bus when the chip has it."""
+    r = _run(tmp_path, seq=seq, micron=Path(os.environ["PY2VER_MICRON_MODEL"]))
+    assert int(r["bad"]) == 0 and int(r["reads"]) > (0 if seq else 30000)
+
+
 # ----------------------------- a sequenced design with its lists in the SDRAM -----------------------------
 
 _W = tuple((k * 37) % 101 - 50 for k in range(128))
@@ -123,13 +156,16 @@ def _with_a_list(x):
 
 @pytest.mark.sim
 @pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
-def test_a_design_with_its_list_and_table_in_the_sdram(monkeypatch, tmp_path):
+@pytest.mark.parametrize("sim", ["icarus", "verilator"])
+def test_a_design_with_its_list_and_table_in_the_sdram(monkeypatch, tmp_path, sim):
     import contextlib
     import io
     import random
     from py2ver import Py2ver
+    if sim == "verilator" and not shutil.which("verilator"):
+        pytest.skip("Verilator not found")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    monkeypatch.setenv("PY2VER_SIM", sim)
     with contextlib.redirect_stdout(io.StringIO()):
         p = Py2ver(_with_a_list, {"x": {"signed": 1, "width": 8, "length": 16}}, sequential=True,
                    sdram=0)                                  # (everything in the SDRAM)
@@ -141,6 +177,8 @@ def test_a_design_with_its_list_and_table_in_the_sdram(monkeypatch, tmp_path):
     # (written and read back through the controller, the design stopped while the
     # SDRAM opens rows and refreshes: the same results as the model)
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+    # (by the simulator asked for: Verilator builds the chip's model too)
+    assert not list((tmp_path / "native_build").glob("verilator_failed_*"))
 
 
 def _input_in_the_sdram(x):

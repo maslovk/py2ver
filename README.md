@@ -1397,6 +1397,11 @@ QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   #
   them compiling its Verilog).
 - `quartus`: a real Quartus compile, skipped unless Quartus is found.
 
+The SDRAM controller is tested against py2ver's model of the chip, and also
+against Micron's MT48LC16M16A2 model (organized as the DE0-Nano's chip; not in
+the repository) when `PY2VER_MICRON_MODEL` gives the path of its
+`mt48lc16m16a2.v`.
+
 Every test builds in its own temporary directory, so they can run in parallel.
 `tests/test_combinations.py` builds a set of designs (state, lists, complex
 values, tables, block RAM, helpers, keyword names) with each option
