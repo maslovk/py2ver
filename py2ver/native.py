@@ -309,7 +309,7 @@ def _run(cmd: List[str], cwd: Path) -> None:
 
 def build(p, mode: Dict[str, Any], simulator: str, workdir: Path) -> Path:
     """The compiled simulation (cached by design and testbench); returns its directory."""
-    core = (p.hdl_dir / "main.v").read_text(encoding="utf-8")
+    core = p.verilog
     tb = testbench(p, mode)
     d = workdir / f"{simulator}_{_key(core, tb, simulator)}"
     exe = d / ("sim.vvp" if simulator == "icarus" else "obj/Vpy2ver_tb")
@@ -348,10 +348,10 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
     mode = mode_of(p)
     if mode is None:
         raise ValueError("This design needs the cocotb testbench")
+    p.write_hdl()                               # (its tables' files, read by the simulation)
     workdir = p.outdir / "native_build"
     if simulator == "verilator":
-        core = (p.hdl_dir / "main.v").read_text(encoding="utf-8")
-        failed = workdir / f"verilator_failed_{_key(core, testbench(p, mode))}"
+        failed = workdir / f"verilator_failed_{_key(p.verilog, testbench(p, mode))}"
         if failed.exists():
             simulator = "icarus"
         else:
@@ -418,7 +418,7 @@ def choose_simulator(p, clocks: int) -> str:
     sim = os.environ.get("PY2VER_SIM", "").strip().lower()
     if sim:
         return sim
-    lines = (p.hdl_dir / "main.v").read_text(encoding="utf-8").count("\n")
+    lines = p.verilog.count("\n")
     if clocks * lines >= LONG_RUN and shutil.which("verilator"):
         return "verilator"
     return "icarus"

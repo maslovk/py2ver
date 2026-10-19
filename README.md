@@ -62,7 +62,9 @@ print(foo_hw(3, 1))        # synthesizes, programs the board, runs over UART
 ```
 
 Generated files (`hdl/`, `sim_build/`, `tb.py`, `results/`, `hw/`, `syn/`) are written
-to the current working directory.
+to the current working directory. With `write=False` nothing is written until a
+simulation or a project needs it: the Verilog is in `p.verilog` (every file for
+`hdl/` in `p.hdl_files`), and `p.write_hdl()` writes it.
 
 ### Attributes
 

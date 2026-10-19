@@ -251,7 +251,7 @@ class Py2ver:
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
                  multipliers: int | None = None, rate: float | None = None,
                  clock: float = DEFAULT_CLK_FREQ, sequential: bool = False,
-                 sdram: Any = None) -> None:
+                 sdram: Any = None, write: bool = True) -> None:
         """
         func: the function, as written (a method, numpy code, a torch module
         for its forward(), or a function looping over batches: one step of
@@ -283,8 +283,16 @@ class Py2ver:
         (default 50 MHz): fold / unroll / multipliers (for a sequenced design,
         its lanes) are chosen to fit, as small as possible, and the choice is
         printed (see choose.py).
+        write: write the Verilog to hdl/ in the current directory now; with
+        write=False nothing is written until a simulation, a project or
+        write_hdl() needs it, and the Verilog is in self.verilog (every file
+        for hdl/ in self.hdl_files).
         """
         log.debug("Initializing Py2ver (func=%s)", getattr(func, "__name__", func))
+        # The files for hdl/ (name -> text), written by write_hdl()
+        self.outdir = Path(os.getcwd())
+        self.hdl_dir = self.outdir / "hdl"
+        self.hdl_files: Dict[str, str] = {}
         # numpy / methods: translated into a scalar function first (see numpy_fe.py)
         self._adapt: Callable[[Any], tuple] | None = None
         self._numpy = None
@@ -529,18 +537,12 @@ class Py2ver:
         verilog_text = renderer.render_module(ir, self.attr,
                                               self.SDRAM_PORTS if sdram_pins else (),
                                               source=(func.__name__, *self._source))
-
-        self.outdir = Path(os.getcwd())
-        self.hdl_dir = self.outdir / "hdl"
-        self.hdl_dir.mkdir(exist_ok=True)
-
-        hdl_path = self.hdl_dir / "main.v"
         if sdram_pins:
             # (the SDRAM's controller in the file)
             verilog_text += "\n" + (template_dir / "hw" / "sdram" / "py2ver_sdram.v").read_text(
                 encoding="utf-8")
-        hdl_path.write_text(verilog_text, encoding="utf-8")
-        log.info("Generated HDL written to %s", hdl_path)
+        self.verilog = verilog_text
+        self.hdl_files["main.v"] = verilog_text
 
         # ---------------------- Jinja env & syn_data -----------------------
         self.env = Environment(
@@ -586,10 +588,32 @@ class Py2ver:
         self._stages: Dict[str, Any] | None = None
         if stages:
             self._build_stages(stage_options or {}, const_bits, template_dir)
+        if write:
+            self.write_hdl()
 
     # --------------------------------------------------------------------
     # Helpers
     # --------------------------------------------------------------------
+
+    def write_hdl(self) -> Path:
+        """This design's Verilog (hdl_files) in hdl/, written again before each
+        simulation or project (another design may have written there since);
+        the directory."""
+        self.hdl_dir.mkdir(exist_ok=True)
+        for name, text in self.hdl_files.items():
+            path = self.hdl_dir / name
+            if not path.exists() or path.read_text(encoding="utf-8") != text:
+                path.write_text(text, encoding="utf-8")
+        log.info("Generated HDL written to %s", self.hdl_dir / "main.v")
+        return self.hdl_dir
+
+    def _copy_hdl(self, project_dir: Path, core: str) -> None:
+        """main.v into a project as core, with its tables' files ($readmemh's)."""
+        hdl = self.write_hdl()
+        shutil.copy(hdl / "main.v", project_dir / core)
+        for name in self.hdl_files:
+            if name.endswith(".hex"):
+                shutil.copy(hdl / name, project_dir / name)
 
     @property
     def _hw_root(self) -> Path:
@@ -744,7 +768,8 @@ class Py2ver:
             assigns=assigns,
             has_clk=True,
             items=ext_items + list(ir.items) + self._phase_items() + self._ram_items()
-                  + self._rom_items(roms, attr) + self._rf_items(rfs, attr),
+                  + self._rom_items(roms, attr, self.hdl_dir, self.hdl_files)
+                  + self._rf_items(rfs, attr),
         )
 
     # The SDRAM's pins (the DE0-Nano's names, lower case), as a module with sdram= has them
@@ -949,10 +974,12 @@ class Py2ver:
                         has_clk=ir.has_clk, items=list(ir.items) + items)
 
     @staticmethod
-    def _rom_items(roms: Dict[str, Dict[str, Any]], attr: Dict[str, Dict[str, Any]]) -> List[str]:
+    def _rom_items(roms: Dict[str, Dict[str, Any]], attr: Dict[str, Dict[str, Any]],
+                   hdl_dir: Path, files: Dict[str, str]) -> List[str]:
         """Function tables in block RAM: q is the entry the index addressed a clock
         before. Two ports reading the same table share one array (a dual-port ROM:
-        the same block RAM)."""
+        the same block RAM). A large table's contents go in files (name -> text),
+        read from hdl_dir."""
         items: List[str] = []
         groups: Dict[Any, List[str]] = {}
         for q, rom in roms.items():
@@ -973,12 +1000,9 @@ class Py2ver:
                 if len(entries) > ROM_FILE_MIN:
                     # (a large table from a file next to main.v: simulators and Quartus
                     # read it, instead of an assignment an entry to compile)
-                    hdl = Path(os.getcwd()) / "hdl"
-                    hdl.mkdir(exist_ok=True)
-                    path = hdl / f"{arr}.hex"
+                    path = hdl_dir / f"{arr}.hex"
                     digits = (w + 3) // 4
-                    path.write_text("".join(f"{int(v) & mask:0{digits}x}\n" for v in entries),
-                                    encoding="utf-8")
+                    files[path.name] = "".join(f"{int(v) & mask:0{digits}x}\n" for v in entries)
                     items.append(f'initial $readmemh("{path.as_posix()}", {arr});')
                 else:
                     items.append("initial begin")
@@ -1573,9 +1597,7 @@ class Py2ver:
                 .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
 
         # Copy generated core HDL
-        shutil.copy(self.hdl_dir / "main.v", project_dir / f"{project_name}.v")
-        for hexfile in self.hdl_dir.glob("*.hex"):                 # ($readmemh's tables)
-            shutil.copy(hexfile, project_dir / hexfile.name)
+        self._copy_hdl(project_dir, f"{project_name}.v")
 
         log.info("Quartus project created at %s", project_dir)
 
@@ -1680,11 +1702,12 @@ class Py2ver:
         return {"in": sin, "out": sout, "m": lengths_in.pop() if sin else 1,
                 "l": lengths_out.pop() if sout else 1}
 
-    def stream_wrapper(self) -> Path:
+    def stream_wrapper(self, write: bool = True) -> Path:
         """
-        Write hdl/<name>_stream.v: the module behind a valid/ready interface
-        (clk, rst, s_valid/s_ready/s_<input>, m_valid/m_ready/m_<output>).
-        Lists marked 'serial' take or give one element per transfer.
+        Write hdl/<name>_stream.v (with write=False: only into hdl_files): the
+        module behind a valid/ready interface (clk, rst, s_valid/s_ready/s_<input>,
+        m_valid/m_ready/m_<output>). Lists marked 'serial' take or give one
+        element per transfer.
         """
         mode = self._stream_mode()
 
@@ -1741,8 +1764,10 @@ class Py2ver:
                 "plain_out": [{"port": n, "range": rng(n)} for n in plain_out],
             })
         path = self.hdl_dir / f"{self.t_name}_stream.v"
-        path.write_text(text, encoding="utf-8")
-        log.info("Stream wrapper (%s) written to %s", mode, path)
+        self.hdl_files[path.name] = text
+        if write:
+            self.write_hdl()
+            log.info("Stream wrapper (%s) written to %s", mode, path)
         return path
 
     def _transfers(self, vecs: List[Tuple[int, ...]]) -> Tuple[List[Tuple[int, ...]], List[str]]:
@@ -1965,9 +1990,7 @@ class Py2ver:
             ("hw/syn/wrapper.txt", f"{wrapper}.v"),
         ):
             self.get_template(tpl).stream(ctx).dump(str(project_dir / name))
-        shutil.copy(self.hdl_dir / "main.v", project_dir / f"{self.t_name}.v")
-        for hexfile in self.hdl_dir.glob("*.hex"):                 # ($readmemh's tables)
-            shutil.copy(hexfile, project_dir / hexfile.name)
+        self._copy_hdl(project_dir, f"{self.t_name}.v")
         if sdram:
             self._syn_sdram(project_dir, wrapper)
 
@@ -2481,6 +2504,7 @@ class Py2ver:
             except OSError as e:
                 log.warning("Failed to remove sim_build: %s", e)
 
+        self.write_hdl()
         _drop_bytecode(self.outdir, "tb")
         write_tb()
 
@@ -2522,7 +2546,6 @@ class Py2ver:
         from . import stages as stg
         plan, info = stg.plan(self.func, self._py_attr)
         stg.make_functions(self.func, plan)
-        fused = (self.hdl_dir / "main.v").read_text(encoding="utf-8")
         files: List[Path] = []
         for st in plan:
             sattr = stg.stage_attr(st, plan, info, self._py_attr, self._complex_names,
@@ -2531,16 +2554,19 @@ class Py2ver:
             # A block stage has as many clocks per call as samples per block
             fold, unroll = stg.auto_fold(st, sattr, info["length"], opts, const_bits)
             st.design = Py2ver(st.func, sattr, template_dir=template_dir, const_bits=const_bits,
-                               fold=fold, unroll=unroll, pipeline=int(opts.get("pipeline", 0)))
+                               fold=fold, unroll=unroll, pipeline=int(opts.get("pipeline", 0)),
+                               write=False)
+            # (the stage's core as <stage>.v, its wrapper and tables, beside the fused main.v)
             core = self.hdl_dir / f"{st.name}.v"
-            shutil.copy(self.hdl_dir / "main.v", core)
-            files += [core, st.design.stream_wrapper()]
+            wrapper = st.design.stream_wrapper(write=False)
+            self.hdl_files.update((n, t) for n, t in st.design.hdl_files.items() if n != "main.v")
+            self.hdl_files[core.name] = st.design.verilog
+            files += [core, wrapper]
             log.info("Stage %d (%s, %s): %d clock(s) per call", st.index, st.callee, st.kind,
                      getattr(st.design, "ram_phases", 1))
-        (self.hdl_dir / "main.v").write_text(fused, encoding="utf-8")   # the fused core again
         text, ports = stg.top_module(self.t_name, plan, info)
         top = self.hdl_dir / f"{self.t_name}_stages.v"
-        top.write_text(text, encoding="utf-8")
+        self.hdl_files[top.name] = text
         files.append(top)
         # The chain's results as PY_stream() gives them: (fused port, top port, transfer)
         appended = {lst: var for st in plan for lst, var in st.appends.items()}
@@ -2623,6 +2649,7 @@ class Py2ver:
         results_path = self.outdir / RESULTS_PATH
         if results_path.exists():
             results_path.unlink()
+        self.write_hdl()
         _drop_bytecode(self.outdir, "tb_handshake")
         (self.outdir / "tb_handshake.py").write_text(self.get_template("tb_handshake.txt").render({
             "name": f"{self.t_name}_stages",
@@ -2696,6 +2723,7 @@ class Py2ver:
         for tpl, name in (("hw/syn/qsf.txt", f"{wrapper}.qsf"), ("hw/syn/sdc.txt", f"{wrapper}.sdc"),
                           ("hw/syn/wrapper.txt", f"{wrapper}.v")):
             self.get_template(tpl).stream(ctx).dump(str(project_dir / name))
+        self.write_hdl()
         for f in self._stages["files"]:
             shutil.copy(f, project_dir / f.name)
         return self._run_quartus(quartus_sh, project_dir, wrapper, top, syn_attr)
