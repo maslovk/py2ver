@@ -495,18 +495,18 @@ machine runs the program a step at a time, for designs far too big to unroll
   product of two lists in the SDRAM: a multiply-accumulate every 2 clocks).
   The simulations include a model of the chip, loaded with the tables: the
   PyTorch MNIST network with `sdram=True` keeps 16 Mbit in the SDRAM and takes
-  39,015,936 clocks an image (0.78 s at 50 MHz; 19.7 million all in block
+  39,444,210 clocks an image (0.79 s at 50 MHz; 19.8 million all in block
   RAM), simulated in Verilator as its bit-exact model. An input list of 64
   values or more is in the SDRAM too (no ports: each sample's values are
   written there before it runs), and so is a returned list of 64 values or
   more (no ports either: read back after each sample, in its place among the
   outputs). A list of values up to 32 bits wide takes two words each (two
   accesses). `SYN()` gives the SDRAM's pins their
-  DE0-Nano places and timing: the MNIST network fits the EP4CE22, 7,002
-  logic elements (31 %), 297 kbit of block RAM (49 %), 16 multipliers, 56 MHz
+  DE0-Nano places and timing: the MNIST network fits the EP4CE22, 7,663
+  logic elements (34 %), 297 kbit of block RAM (49 %), 16 multipliers, 58 MHz
   (timing met at 50 MHz). `HW()` and `HW_sim()` load the SDRAM over the
   UART (see "On the board" below); the whole board project for MNIST fits
-  too: 7,447 logic elements (33 %), 297 kbit, 56 pins, timing met at 50 MHz.
+  too: 8,096 logic elements (36 %), 297 kbit, 56 pins, timing met at 50 MHz.
 
 The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
 and register widths come from following the program with intervals, so the
@@ -770,15 +770,15 @@ DE0-Nano's EP4CE22:
 | | test accuracy | logic elements | block RAM | 9-bit multipliers | Fmax | per image |
 |---|---|---|---|---|---|---|
 | numpy (float) | 98.6 % | | | | | |
-| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3084 (14 %) | 270 kbit (44 %) | 6 | 76 MHz | 18,173 clocks: 0.36 ms at 50 MHz |
-| 2 lanes (`multipliers=2`) | the same | 3109 (14 %) | 273 kbit (45 %) | 12 | 71 MHz | 9,661 clocks: 0.19 ms at 50 MHz |
-| 4 lanes | the same | 3171 (14 %) | 279 kbit (46 %) | 24 | 67 MHz | 5,405 clocks: 0.11 ms at 50 MHz |
-| 8 lanes | the same | 3310 (15 %) | 287 kbit (47 %) | 48 | 61 MHz | 3,277 clocks: 0.07 ms at 50 MHz |
+| hardware, 16 bits | 98.9 % (same digit as numpy for 99.7 %) | 3217 (14 %) | 270 kbit (44 %) | 6 | 74 MHz | 18,377 clocks: 0.37 ms at 50 MHz |
+| 2 lanes (`multipliers=2`) | the same | 3321 (15 %) | 273 kbit (45 %) | 12 | 71 MHz | 9,865 clocks: 0.20 ms at 50 MHz |
+| 4 lanes | the same | 3528 (16 %) | 279 kbit (46 %) | 24 | 68 MHz | 5,609 clocks: 0.11 ms at 50 MHz |
+| 8 lanes | the same | 3964 (18 %) | 287 kbit (47 %) | 48 | 62 MHz | 3,481 clocks: 0.07 ms at 50 MHz |
 
 The weight tables are banked, so lanes cost multipliers, not weight memory
 (the few extra kbit are the activations, a copy per lane's read port). 16
-lanes take 2,213 clocks but reach 48 MHz: a sum is carried through all the
-lanes in a clock, rounded at each, so its additions can't be regrouped.
+lanes take 2,417 clocks and reach 54 MHz, the least: a sum is carried through
+all the lanes in a clock, rounded at each, so its additions can't be regrouped.
 
 #### Training: the object's arrays as state
 
@@ -827,14 +827,14 @@ should cover training, or `margin=` leave room for it. `examples/digits_training
 | | loss, epochs 1 / 2 / 3 | test accuracy | per step (32 images) |
 |---|---|---|---|
 | numpy (float) | 1.863 / 0.838 / 0.419 | 93.3 % | |
-| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 1,655,826 clocks: 33 ms at 50 MHz |
+| fixed point, 24 bits (`margin=2`) | 1.865 / 0.840 / 0.418 | 93.1 % | 1,688,064 clocks: 34 ms at 50 MHz |
 
 The bit-exact model trains the three epochs in 23 seconds; the hardware,
 simulated in Verilator, gives the model's losses bit for bit (2 steps). The
 step is mostly its matrix products, a multiply-accumulate a clock (about
 1.4 million); Adam's division and square root are pipelined, an element a
 clock, for the two large weight matrices. With `multipliers=4` the products
-run four a clock: 631,778 clocks a step (13 ms at 50 MHz).
+run four a clock: 664,016 clocks a step (13 ms at 50 MHz).
 
 The state is 1.2 Mbit at 24 bits, twice the DE0-Nano's block RAM, so this
 one is for simulation. The batch's 2,048 inputs are ports: a list argument
@@ -862,8 +862,8 @@ training step are built as they are:
 | | test accuracy | logic elements | block RAM | 9-bit multipliers | Fmax | per image |
 |---|---|---|---|---|---|---|
 | numpy (float) | 98.3 % | | | | | |
-| hardware, 16 bits | 98.3 % (same digit as numpy for 100 %) | 4521 (20 %) | 351 kbit (58 %) | 8 | 73 MHz | 108,774 clocks: 2.2 ms at 50 MHz |
-| 2 lanes (`multipliers=2`) | the same | 4896 (22 %) | 380 kbit (63 %) | 14 | 68 MHz | 67,494 clocks: 1.35 ms at 50 MHz |
+| hardware, 16 bits | 98.3 % (same digit as numpy for 100 %) | 4648 (21 %) | 355 kbit (58 %) | 8 | 77 MHz | 110,641 clocks: 2.2 ms at 50 MHz |
+| 2 lanes (`multipliers=2`) | the same | 5132 (23 %) | 380 kbit (63 %) | 14 | 70 MHz | 69,361 clocks: 1.39 ms at 50 MHz |
 
 On 4 lanes the activations read by the lanes (the patches) are copied per
 lane, which takes more block RAMs (74) than the EP4CE22 has (66).
@@ -876,7 +876,7 @@ numpy's, so the losses agree on average rather than step by step:
 | | loss, epochs 1 / 2 | test accuracy | per step (32 images) |
 |---|---|---|---|
 | numpy (float) | 2.398 / 1.845 | 78.1 % | |
-| fixed point, 24 bits | 2.362 / 1.805 | 78.6 % | 10,163,735 clocks: 203 ms at 50 MHz |
+| fixed point, 24 bits | 2.362 / 1.805 | 78.6 % | 10,360,533 clocks: 207 ms at 50 MHz |
 
 A step is 8.5 million multiply-accumulates (the convolutions' products
 forward, for the filters' gradients and back), most of its clocks. Verilator
@@ -970,7 +970,7 @@ its trained forward pass (16 bits, rounded; the model of one epoch):
 | | test images | scores | per image |
 |---|---|---|---|
 | torch (float) | 20 of 20 | | |
-| fixed point, 16 bits | 20 of 20, the same digits as torch | within 0.034 of torch's | 19,719,168 clocks: 0.39 s at 50 MHz |
+| fixed point, 16 bits | 20 of 20, the same digits as torch | within 0.034 of torch's | 19,798,182 clocks: 0.40 s at 50 MHz |
 
 Verilator simulates an image in 33 s, the same as the model's. The weights
 (7.5 Mbit) are ROMs: a table longer than 4,096 entries is written to a file
@@ -989,7 +989,7 @@ numbers:
 | fixed point, 24 bits | 2.7784 | 2.2950 | 2.0960 | 2.2553 |
 
 After the 4 steps the weights of `Linear(3136, 128)` are within 0.0004 of
-torch's. A step is 133,119,948 clocks (2.7 s at 50 MHz): 56 million
+torch's. A step is 135,357,363 clocks (2.7 s at 50 MHz): 56 million
 multiply-accumulates an image forward and back. It builds in about 2 minutes
 and the model runs a step in 10 s (see "The models, with numpy" below); its
 state (the weights, AdamW's moments: 1.4 million numbers, 34 Mbit) is for
