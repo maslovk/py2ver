@@ -330,6 +330,52 @@ def test_a_mini_llama_s_forward_pass_is_built_as_written():
             assert np.allclose(tr.func(*tr.adapt(x)), m(x)[0].numpy().ravel(), atol=1e-4)
 
 
+class Repeated(nn.Module):
+    """A parameter read through a view of stride 0 (GQA's keys repeated)."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(1, 2, 3))
+
+    def forward(self, x):
+        return self.w.repeat_interleave(3, dim=1) * x
+
+
+def sgd_steps(model, loader, optimizer):
+    total = 0.0
+    for x, y in loader:
+        loss = (model(x) * y).sum()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total += loss.item()
+    return total
+
+
+def test_a_repeated_view_s_gradient_is_the_sum_of_its_copies():
+    torch.manual_seed(1)
+    m = Repeated()
+    opt = torch.optim.SGD(m.parameters(), lr=0.1)
+    batches = [(torch.randn(1, 6, 3), torch.randn(1, 6, 3)) for _ in range(3)]
+    numpy_loops.translate(sgd_steps, [(m, batches, opt)])     # (checked against torch's steps)
+
+
+def test_a_mini_llama_trains_as_torch_does():
+    m = _llama()
+    decay = [p for p in m.parameters() if p.dim() >= 2]
+    no_decay = [p for p in m.parameters() if p.dim() < 2]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                             {"params": no_decay, "weight_decay": 0.0}], lr=1e-2, betas=(0.9, 0.95))
+    g = torch.Generator().manual_seed(2)
+    batches = [(torch.randint(0, 13, (2, 8), generator=g), torch.randint(0, 13, (2, 8), generator=g))
+               for _ in range(3)]
+    # (checked against torch's training of a copy: dropout, attention's dropout_p
+    # included, the repeated keys and values, the tied embedding, clipping, AdamW)
+    tr = numpy_loops.translate(gpt_steps, [(m, batches, opt)])
+    labels = {label for label, _, _ in tr.memories.values()}
+    assert "Embedding.weight" in labels and "RMSNorm.weight" in labels
+
+
 @pytest.mark.sim
 @pytest.mark.slow
 def test_a_mini_llama_in_hardware(monkeypatch, tmp_path):

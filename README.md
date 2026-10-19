@@ -1052,8 +1052,11 @@ saves (4 blocks, 192 wide, 6 query and 2 key/value heads, a 128-token context:
 | per window | 257,324,550 clocks: 5.1 s at 50 MHz |
 | per window, `--sdram` (for the board) | 587,678,106 clocks: 11.8 s at 50 MHz |
 
-It builds in about 70 s. The small mini Llama of the tests is simulated
-(Verilog), the same as its model. (Not run in Quartus or on a board.)
+It builds in about 70 s. `tests/test_torch.py` trains a small one with a loop
+function of the usual shape (dropout, attention's `dropout_p` included, the
+repeated keys and values, the tied embedding, gradient clipping, AdamW with two
+groups), checked against torch, and simulates one (Verilog), the same as its
+model. (Not run in Quartus or on a board.)
 
 ### Simulation speed (Icarus, Verilator)
 

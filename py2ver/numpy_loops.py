@@ -1990,6 +1990,10 @@ class _drawing:
         if torch_gen in draws:                    # (torch's dropout: these numbers)
             import torch.nn.functional as F
             self.saved.append((F.__dict__, "dropout", _dropout(draws[torch_gen]), F.dropout))
+            # (attention's dropout_p too: its reference, with that dropout)
+            self.saved.append((F.__dict__, "scaled_dot_product_attention",
+                               _attention(_dropout(draws[torch_gen])),
+                               F.scaled_dot_product_attention))
         for d, k, new, _ in self.saved:
             d[k] = new
         return self
@@ -2010,6 +2014,27 @@ def _dropout(draws: "_Draws") -> Callable:
         u = torch.tensor(draws.random(tuple(input.shape)), dtype=input.dtype)
         return input * ((u > p).to(input.dtype) * (1.0 / (1.0 - p)))
     return dropout
+
+
+def _attention(dropout: Callable) -> Callable:
+    """torch.nn.functional.scaled_dot_product_attention as its documentation's
+    reference computes it (as torch_ops builds it), its dropout `dropout`."""
+    import math
+    import torch
+
+    def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+                                     is_causal=False, scale=None, enable_gqa=False):
+        if attn_mask is not None or enable_gqa:
+            raise NotTranslatable("scaled_dot_product_attention: attn_mask / enable_gqa are not "
+                                  "supported")
+        L, S = query.size(-2), key.size(-2)
+        w = query @ key.transpose(-2, -1) * (scale if scale is not None
+                                             else 1.0 / math.sqrt(query.size(-1)))
+        if is_causal:
+            w = w.masked_fill(~torch.ones(L, S, dtype=torch.bool).tril(), float("-inf"))
+        w = dropout(torch.softmax(w, dim=-1), dropout_p, True)
+        return w @ value
+    return scaled_dot_product_attention
 
 
 def _flat(result: Any) -> Any:

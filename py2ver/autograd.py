@@ -11,7 +11,8 @@ backward() goes through them in reverse and writes the gradient code:
   - a list's gradient is a list of its length: a view's contribution (a
     transpose, a window of a convolution, a broadcast) is added at the view's
     positions, element by element, so overlapping windows add up as they do
-    in col2im
+    in col2im; along a dimension of stride 0 (an element repeated, as by
+    repeat_interleave) the contributions are summed first
   - an operand broadcast in an operation gets the sum of its contributions
     over the broadcast dimensions
   - elementwise: the derivative of each operation (relu's, as torch's, is 0
@@ -102,6 +103,16 @@ class _Backward:
         if k[0] == "list":
             gl = self.grad_list(k[1])
             vs, st, off = self.geometry(v)
+            # (a dimension of stride 0 - a broadcast view, repeat_interleave's -
+            #  holds one element: it gets the sum of the contributions along it,
+            #  added once, not each written over the last)
+            zero = tuple(d for d, (n, s) in enumerate(zip(vs, st)) if s == 0 and n > 1)
+            if zero:
+                if isinstance(contrib, (int, float)):
+                    contrib = contrib * math.prod(vs[d] for d in zero)
+                else:
+                    contrib = it.reduce(it.to_arr(contrib), zero, True, "sum")
+                vs = tuple(1 if d in zero else n for d, n in enumerate(vs))
             gv = self.Arr(gl.name, vs, st, off)
             it.copy_into(gv, it.binop(ast.Add(), gv, contrib))
         elif k[0] == "lazy":
