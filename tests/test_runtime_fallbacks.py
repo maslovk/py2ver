@@ -1,6 +1,7 @@
 import pytest
 from pathlib import Path
 
+import py2ver.board as py2ver_board
 import py2ver.core as py2ver_mod
 from py2ver import Py2ver
 
@@ -69,7 +70,7 @@ def _hw_ready(monkeypatch, tmp_path, **syn_attr):
         "d": {"signed": 1, "width": 9, "type": "wire"},
     }
     p = Py2ver(rt_add_sub, attr)
-    monkeypatch.setattr(py2ver_mod, "serial", None)
+    monkeypatch.setattr(py2ver_board, "serial", None)
     monkeypatch.setattr(p, "_hw_ok", True)
     monkeypatch.setattr(p, "syn_attr", dict(syn_attr))
     monkeypatch.setattr(p, "tb_fun", lambda *_args: (123, 456))

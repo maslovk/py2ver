@@ -292,7 +292,7 @@ def run_float(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]
     sample, flattened like the ports; names in order of first assignment;
     returned names). record(name, value) sees every assigned value.
     """
-    from .core import _flatten_outputs
+    from .reference import _flatten_outputs
     last: Dict[str, Any] = {}
 
     def rec(name: str, value: Any) -> None:
@@ -383,7 +383,7 @@ def model_outputs(fe: Any, samples: List[Any]) -> Tuple[List[str], List[Tuple[fl
     state fed back and memories kept, like PY_batch / PY_stream but without
     building the hardware. Returns (output names, values per sample).
     """
-    from .core import expand_args
+    from .reference import expand_args
     model, attr = fe.model, fe.attr
     params = list(inspect.signature(model).parameters)
     ret = next(s for s in reversed(fe.tree.body[0].body) if isinstance(s, ast.Return))
