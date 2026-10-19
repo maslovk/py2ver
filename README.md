@@ -905,20 +905,28 @@ train.PY_stream()(batches)                                   # (total_loss, corr
 - calling a module: `nn.Sequential` runs its children; `Conv2d` (im2col, as
   above, then one matrix product), `BatchNorm1d/2d`, `MaxPool2d`, `Linear`,
   `Embedding` (a gather of its rows), `LayerNorm` (each row's mean and
-  variance), `GELU` (a table), `ReLU`, `Flatten`, `Dropout`, `Identity`,
-  `Softmax`, `LogSoftmax`, `Tanh` are built from the translator's operations;
+  variance), `GELU` and `SiLU` (tables), `ReLU`, `Flatten`, `Dropout`,
+  `Identity`, `Softmax`, `LogSoftmax`, `Tanh` are built from the translator's
+  operations;
   a module of your own runs its `forward()` as written. Parameters and buffers
   are tables, or state when a training step changes them; a parameter two
   modules share (weight tying) is one table
-- `torch` / `torch.nn.functional` functions (`relu`, `gelu`, `softmax`,
-  `log_softmax`, `cross_entropy`, `layer_norm`, `embedding`, `conv2d`,
-  `linear`, `max_pool2d`, `dropout`, `flatten`, `cat`, `argmax`, `exp`, `log`,
-  ...) and tensor methods with torch's meanings (`view`, `reshape`, `flatten`,
-  `transpose(d0, d1)`, `permute`, `unsqueeze`, `squeeze`, `split`, `chunk`,
+- `torch` / `torch.nn.functional` functions (`relu`, `gelu`, `silu`,
+  `softmax`, `log_softmax`, `cross_entropy`, `layer_norm`, `embedding`,
+  `conv2d`, `linear`, `max_pool2d`, `dropout`, `flatten`, `cat`, `stack`,
+  `argmax`, `exp`, `log`, `rsqrt`, `pow`, ...) and tensor methods with torch's
+  meanings (`view`, `reshape`, `flatten`, `transpose(d0, d1)`, `permute`,
+  `unsqueeze`, `squeeze`, `split`, `chunk`, `repeat_interleave` (a view),
   `masked_fill`, `size()`, `max(dim)` giving values and indices, `sum` /
-  `mean` / `argmax` with `dim` and `keepdim`, `item()`, `to()`); `@` broadcasts
-  its leading dimensions (attention's heads), and a reshape that only splits or
-  merges contiguous dimensions stays a view
+  `mean` / `argmax` with `dim` and `keepdim`, `pow`, `item()`, `to()`,
+  `type_as()`); `@` broadcasts its leading dimensions (attention's heads), a
+  reshape that only splits or merges contiguous dimensions stays a view, and
+  `x[:, [-1], :]` (a list of indices) is a slice when they are evenly spaced
+- `F.scaled_dot_product_attention` as torch's reference computes it (the
+  scale `1 / sqrt(E)` unless given; `is_causal=True` its lower-triangular
+  mask, as `masked_fill(-inf)` below); `examples/mini_llama_hardware.py`
+  builds a Llama-style model (RMSNorm, RoPE, grouped-query attention, SwiGLU)
+  this way
 - `masked_fill(mask, -inf)` with a constant mask (causal attention), then a
   softmax: the mask stays a mask, the softmax's exponentials multiplied by it,
   so the masked weights are 0 as with torch's -inf, with no infinities in
@@ -1026,6 +1034,26 @@ controller) fits the EP4CE22 and meets 50 MHz: 12,549 logic elements (56 %),
 5,228 registers, 272 kbit of block RAM (45 %), 69 of 132 9-bit multipliers.
 The small GPT of the tests is simulated (Verilog), with and without the
 SDRAM, the same as its model. (Not yet run on a real board.)
+
+`examples/mini_llama.py` is a step up, built like Llama, unchanged: a byte-level
+BPE tokenizer (1,024 tokens), RMSNorm, rotary position embeddings (RoPE),
+grouped-query attention through `F.scaled_dot_product_attention`, SwiGLU, the
+output layer tied to the embedding, a KV cache and top-p sampling for
+generation. `examples/mini_llama_hardware.py` builds its forward pass (no KV
+cache: the next token's scores for a window) for the cpu preset `mini_llama.py`
+saves (4 blocks, 192 wide, 6 query and 2 key/value heads, a 128-token context:
+1.8 million parameters; 300 steps of training; 16 bits, rounded, `margin=2`,
+16,384-entry exp and SiLU tables, formats from 12 windows of the text):
+
+| | 6 other windows of 128 tokens |
+|---|---|
+| scores against torch's | within 0.106 |
+| the likeliest next token | torch's in all 6 |
+| per window | 257,324,550 clocks: 5.1 s at 50 MHz |
+| per window, `--sdram` (for the board) | 587,678,106 clocks: 11.8 s at 50 MHz |
+
+It builds in about 70 s. The small mini Llama of the tests is simulated
+(Verilog), the same as its model. (Not run in Quartus or on a board.)
 
 ### Simulation speed (Icarus, Verilator)
 

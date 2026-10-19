@@ -261,3 +261,85 @@ def test_a_tiny_gpt_in_hardware(monkeypatch, tmp_path):
         want = np.array([m(x)[0].numpy().ravel() for x in xs])
     assert np.abs(model - want).max() < 0.01
     assert p.TB_batch()(xs[:2]) == p.PY_batch()(xs[:2])
+
+
+# ----------------------------- a mini Llama: RMSNorm, RoPE, GQA, SwiGLU -----------------------------
+
+class LlamaOps(nn.Module):
+    """The operations a Llama adds, as torch means them."""
+
+    def __init__(self):
+        super().__init__()
+        self.act = nn.SiLU()
+
+    def forward(self, x, cache=None):                     # x: (1, 2, 4, 6)
+        n = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)          # RMSNorm
+        r = torch.stack((x[..., 0::2], -x[..., 1::2]), dim=-1).flatten(-2)   # RoPE's pairs
+        k = x.repeat_interleave(2, dim=1)                                    # GQA: (1, 4, 4, 6)
+        q = torch.cat([x, x * 0.5], dim=1)
+        causal = F.scaled_dot_product_attention(q, k, k, is_causal=True)
+        full = F.scaled_dot_product_attention(q, k, k, scale=0.3)
+        last = x[:, :, [-1], :]                                              # (a slice)
+        picked = x[:, :, [3, 0], :]                                          # (a gather)
+        start = cache[0] if cache and cache[0] else 0                        # (Python's and)
+        assert start == 0, "no cache"
+        return (n.type_as(x), r, F.silu(x) + self.act(x), torch.pow(x, 3), x.pow(0.5 * 2),
+                causal, full, last, picked)
+
+
+def test_a_llama_s_operations_are_torch_s():
+    torch.manual_seed(5)
+    m = LlamaOps()
+    xs = [torch.randn(1, 2, 4, 6) for _ in range(4)]
+    tr = numpy_loops.translate(m, xs[:2])
+    with torch.no_grad():
+        for x in xs:
+            got = np.concatenate([np.ravel(v) for v in tr.func(*tr.adapt(x))])
+            want = np.concatenate([t.numpy().ravel() for t in m(x)])
+            assert got.shape == want.shape and np.allclose(got, want, atol=1e-4)
+
+
+def test_an_assert_is_checked_when_translating():
+    class Checked(nn.Module):
+        def forward(self, x):
+            assert x.shape[-1] == 3, "three wide"
+            return x * 2
+    numpy_loops.translate(Checked(), [torch.randn(1, 3)])
+    with pytest.raises(AssertionError, match="three wide"):
+        numpy_loops.translate(Checked(), [torch.randn(1, 4)])
+
+
+def _llama(seed=0):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
+    import mini_llama as L
+    torch.manual_seed(seed)
+    cfg = L.Config(vocab_size=13, block_size=8, n_embd=16, n_head=4, n_kv_head=2, n_layer=2)
+    m = L.MiniLlama(cfg)
+    m.eval()
+    return m
+
+
+def test_a_mini_llama_s_forward_pass_is_built_as_written():
+    m = _llama()
+    xs = [torch.randint(0, 13, (1, 8)) for _ in range(4)]
+    tr = numpy_loops.translate(m, xs[:2])          # (the last position's scores)
+    with torch.no_grad():
+        for x in xs:
+            assert np.allclose(tr.func(*tr.adapt(x)), m(x)[0].numpy().ravel(), atol=1e-4)
+
+
+@pytest.mark.sim
+@pytest.mark.slow
+def test_a_mini_llama_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    m = _llama()
+    xs = [torch.randint(0, 13, (1, 8)) for _ in range(20)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs, width=16, round=True, margin=2)
+    model = np.array(p.PY_batch()(xs))
+    with torch.no_grad():
+        want = np.array([m(x)[0].numpy().ravel() for x in xs])
+    assert np.abs(model - want).max() < 0.01
+    assert p.TB_batch()(xs[:2]) == p.PY_batch()(xs[:2])

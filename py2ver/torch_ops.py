@@ -22,6 +22,7 @@ giving values and indices, dim / keepdim):
       LayerNorm       the mean and the variance of each row (its last
                       dimensions), the row normalized, scaled and shifted
       GELU            a table of the function (erf's, or tanh's approximation)
+      SiLU            a table, as GELU (SwiGLU's gate)
       Linear, ReLU, Flatten, Dropout (eval: nothing; training: a mask from
       the generator in hardware), Identity, Softmax, LogSoftmax, Tanh, Sigmoid
   - matrix products broadcast their leading dimensions (attention's heads)
@@ -30,7 +31,10 @@ giving values and indices, dim / keepdim):
     it, so the masked entries are 0, as torch's, without infinities
   - torch / torch.nn.functional functions: the same operations (relu,
     softmax, log_softmax, cross_entropy, conv2d, linear, max_pool2d, dropout,
-    flatten, cat, argmax, exp, log, tanh, sigmoid, sqrt, ...)
+    flatten, cat, stack, argmax, exp, log, tanh, sigmoid, sqrt, rsqrt, pow,
+    silu, ...); scaled_dot_product_attention as torch's reference (q k^T times
+    the scale, the causal mask a constant as masked_fill's, softmax, times v);
+    repeat_interleave a view (a dimension of stride 0, merged)
   - parameters and buffers are arrays like numpy attributes: tables, or state
     when changed (a training step)
 
@@ -361,6 +365,94 @@ def gelu(it, x, approximate="none"):
                                              keywords=[]), x, op=("table", name))
 
 
+def silu(it, x):
+    """SiLU (x * sigmoid(x), SwiGLU's gate) as a table of the function, as GELU."""
+    from .numpy_fe import TABLES_KEY
+    it.ns[SILU] = _silu
+    it.ns[SILU + "_grad"] = _silu_grad
+    it.ns.setdefault(TABLES_KEY, set()).update({SILU, SILU + "_grad"})
+    return it.elementwise(lambda v: ast.Call(func=ast.Name(id=SILU, ctx=ast.Load()), args=[v],
+                                             keywords=[]), x, op=("table", SILU))
+
+
+def rsqrt(it, x):
+    return it.binop(ast.Div(), 1.0, it.numpy("sqrt", [x], {}))
+
+
+def power(it, x, exponent):
+    """x ** exponent: a whole power as products, 0.5 / -0.5 as sqrt / rsqrt."""
+    if not isinstance(exponent, (int, float)) or isinstance(exponent, bool):
+        raise NotTranslatable("pow: only a number as the exponent is supported")
+    if exponent in (0.5, -0.5):
+        return it.numpy("sqrt", [x], {}) if exponent > 0 else rsqrt(it, x)
+    if not (isinstance(exponent, int) or float(exponent).is_integer()) or int(exponent) < 1:
+        raise NotTranslatable(f"pow({exponent!r}): only a whole power, 0.5 or -0.5 is supported")
+    out = x
+    for _ in range(int(exponent) - 1):
+        out = it.binop(ast.Mult(), out, x)
+    return out
+
+
+def stack(it, tensors, dim=0):
+    """Each tensor with a new dimension dim, then concatenated along it."""
+    arrs = [it.to_arr(t) for t in tensors]
+    nd = len(arrs[0].shape) + 1
+    return it.numpy("concatenate", [[unsqueeze(a, dim % nd) for a in arrs]], {"axis": dim % nd})
+
+
+def repeat_interleave(it, a, repeats, dim=None):
+    """Each element along dim `repeats` times in a row (a view: a new dimension
+    of stride 0 after dim, then merged with it)."""
+    if not isinstance(repeats, int) or dim is None:
+        raise NotTranslatable("repeat_interleave: only a whole number of repeats along a dim")
+    a = it.to_arr(a)
+    nd = len(a.shape)
+    d = _dim(dim, nd)
+    v = a.view(a.shape[:d + 1] + (repeats,) + a.shape[d + 1:],
+               a.strides[:d + 1] + (0,) + a.strides[d + 1:])
+    return flatten(it, v, d, d + 1)
+
+
+def scaled_dot_product_attention(it, q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
+                                 scale=None, enable_gqa=False):
+    """softmax(q k^T * scale) v, as torch's reference: the scale 1 / sqrt(E) unless
+    given; is_causal: the mask torch makes (ones(L, S).tril()), a constant, as
+    masked_fill(-inf)'s."""
+    np = it.np
+    if attn_mask is not None or enable_gqa:
+        raise NotTranslatable("scaled_dot_product_attention: attn_mask / enable_gqa are not "
+                              "supported")
+    q, k = it.to_arr(q), it.to_arr(k)
+    nd = len(k.shape)
+    L, S, E = q.shape[-2], k.shape[-2], q.shape[-1]
+    axes = list(range(nd))
+    axes[-2], axes[-1] = axes[-1], axes[-2]
+    w = it.binop(ast.Mult(), it.matmul(q, transpose(k, axes)),
+                 float(scale) if scale is not None else 1.0 / math.sqrt(E))
+    if is_causal:
+        keep = np.broadcast_to(np.tril(np.ones((L, S))), tuple(w.shape)).copy()
+        w = NegInf(w, keep)
+    w = softmax(it, w, -1)
+    w = dropout(it, w, dropout_p, True)
+    return it.matmul(w, v)
+
+
+def _silu(x):
+    import numpy as np
+    e = np.exp if not isinstance(x, (int, float)) else math.exp
+    return x / (1.0 + e(-x))
+
+
+def _silu_grad(x):
+    import numpy as np
+    e = np.exp if not isinstance(x, (int, float)) else math.exp
+    s = 1.0 / (1.0 + e(-x))
+    return s * (1.0 + x * (1.0 - s))
+
+
+_silu.__py2ver_vectorized__ = True
+_silu_grad.__py2ver_vectorized__ = True
+SILU = "__py2ver_silu"
 GELU = "__py2ver_gelu"
 GELU_TANH = "__py2ver_gelu_tanh"
 
@@ -450,6 +542,8 @@ def module_call(it, mod, args: List[Any], kwargs: Dict[str, Any]) -> Any:
                               mod.eps)
         if name == "GELU":
             return gelu(it, x, mod.approximate)
+        if name == "SiLU":
+            return silu(it, x)
         if name == "Softmax":
             return softmax(it, x, mod.dim)
         if name == "LogSoftmax":
@@ -474,6 +568,21 @@ def function(it, fn, args: List[Any], kwargs: Dict[str, Any]) -> Any:
         return relu(it, args[0])
     if name == "gelu":
         return gelu(it, args[0], kwargs.get("approximate", "none"))
+    if name == "silu":
+        return silu(it, args[0])
+    if name == "rsqrt":
+        return rsqrt(it, args[0])
+    if name == "pow":
+        return power(it, args[0], arg(1, "exponent"))
+    if name == "stack":
+        return stack(it, list(arg(0, "tensors")), arg(1, "dim", 0))
+    if name == "repeat_interleave":
+        return repeat_interleave(it, args[0], arg(1, "repeats"), arg(2, "dim"))
+    if name == "scaled_dot_product_attention":
+        return scaled_dot_product_attention(
+            it, args[0], arg(1, "key"), arg(2, "value"), arg(3, "attn_mask"),
+            arg(4, "dropout_p", 0.0), arg(5, "is_causal", False), kwargs.get("scale"),
+            kwargs.get("enable_gqa", False))
     if name == "layer_norm":
         return layer_norm(it, args[0], arg(1, "normalized_shape"), arg(2, "weight"),
                           arg(3, "bias"), arg(4, "eps", 1e-5))
@@ -550,8 +659,15 @@ def tensor_method(it, a, name: str, args: List[Any], kwargs: Dict[str, Any]) -> 
         return unsqueeze(it.to_arr(a), arg(0, "dim"))
     if name == "squeeze":
         return squeeze(it.to_arr(a), arg(0, "dim"))
-    if name in ("to", "cpu", "cuda", "float", "detach", "contiguous", "requires_grad_"):
+    if name in ("to", "cpu", "cuda", "float", "detach", "contiguous", "requires_grad_",
+                "type_as"):
         return a
+    if name == "pow":
+        return power(it, it.to_arr(a), arg(0, "exponent"))
+    if name == "rsqrt":
+        return rsqrt(it, it.to_arr(a))
+    if name == "repeat_interleave":
+        return repeat_interleave(it, a, arg(0, "repeats"), arg(1, "dim"))
     if name == "clone":
         return it.method(it.to_arr(a), "copy", [], {})
     if name in ("split", "chunk"):

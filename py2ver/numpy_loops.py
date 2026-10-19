@@ -761,6 +761,14 @@ class _Interp:
                 raise NotTranslatable(f"An if on a value computed in hardware (line {s.lineno})")
             self.block(s.body if test else s.orelse, frame, g)
             return
+        if isinstance(s, ast.Assert):                  # (checked as Python checks it)
+            test = self.expr(s.test, frame, g)
+            if isinstance(test, (Arr, Sym)):
+                raise NotTranslatable(f"An assert on a value computed in hardware (line {s.lineno})")
+            if not test:
+                raise AssertionError(self.expr(s.msg, frame, g) if s.msg is not None else
+                                     ast.unparse(s.test))
+            return
         raise NotTranslatable(f"Unsupported statement (line {s.lineno}): {ast.unparse(s)}")
 
     def store(self, t: ast.expr, value: Any, frame, g) -> None:
@@ -955,10 +963,15 @@ class _Interp:
                     ast.In: lambda x, y: x in y, ast.NotIn: lambda x, y: x not in y,
                     **_CMPS}[type(op)](a, b)
         if isinstance(n, ast.BoolOp):
-            vals = [self.expr(v, frame, g) for v in n.values]
-            if any(isinstance(v, (Arr, Sym)) for v in vals):
-                raise NotTranslatable(f"and / or on values computed in hardware: {ast.unparse(n)}")
-            return all(vals) if isinstance(n.op, ast.And) else any(vals)
+            # (as Python: in order, the value that decides it - `caches and caches[0]`)
+            for item in n.values:
+                v = self.expr(item, frame, g)
+                if isinstance(v, (Arr, Sym)):
+                    raise NotTranslatable(f"and / or on values computed in hardware: "
+                                          f"{ast.unparse(n)}")
+                if (not v) if isinstance(n.op, ast.And) else v:
+                    return v
+            return v
         if isinstance(n, ast.IfExp):
             test = self.expr(n.test, frame, g)
             if isinstance(test, (Arr, Sym)):
@@ -1029,6 +1042,29 @@ class _Interp:
     def index(self, a: Arr, sl: ast.expr, frame, g, store: bool = False) -> Any:
         parts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
         vals = [self.expr(p, frame, g) for p in parts]
+        lists = [k for k, v in enumerate(vals) if isinstance(v, list)
+                 and v and all(isinstance(i, int) and not isinstance(i, bool) for i in v)]
+        if len(lists) == 1 and not any(self.is_index_array(v) for v in vals):
+            # (a list of indices among slices: evenly spaced, a slice keeping its
+            #  dimension, x[:, [-1], :]; else, read, its elements' slices concatenated)
+            k = lists[0]
+            if Ellipsis in vals[:k]:                  # (the dimension it indexes)
+                dim = len(a.shape) - sum(1 for v in vals[k:] if v is not None)
+            else:
+                dim = sum(1 for v in vals[:k] if v is not None)
+            if not 0 <= dim < len(a.shape):
+                raise NotTranslatable(f"Too many indices: {ast.unparse(sl)}")
+            idx = [i % a.shape[dim] for i in vals[k]]
+            step = idx[1] - idx[0] if len(idx) > 1 else 1
+            if step > 0 and idx == list(range(idx[0], idx[0] + step * len(idx), step)):
+                vals[k] = slice(idx[0], idx[0] + step * (len(idx) - 1) + 1, step)
+            elif store:                               # (written: as numpy's integer array)
+                vals[k] = self.np.asarray(idx, dtype=self.np.int64)
+            else:
+                shape = a.shape[:dim] + (1,) + a.shape[dim + 1:]
+                pieces = [a.view(shape, a.strides, a.offset + i * a.strides[dim]) for i in idx]
+                a = self.to_arr(self.numpy("concatenate", [pieces], {"axis": dim}))
+                vals[k] = slice(None)
         if any(self.is_index_array(v) for v in vals):
             return self.fancy(a, vals, store)
         if any(v is Ellipsis for v in vals):          # (... : the dimensions not named)
