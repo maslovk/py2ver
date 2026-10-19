@@ -1402,3 +1402,14 @@ Every test builds in its own temporary directory, so they can run in parallel.
 values, tables, block RAM, helpers, keyword names) with each option
 (pipelining, folding, automatic formats, serial ports, stages, annotations)
 and checks every result against the references.
+
+A change to how the Verilog is written (the same hardware, other text) is
+checked with `tests/icarus.py`: `assert_same_bits` runs pairs of expressions
+on random inputs in Icarus and says which differ, and `assert_same_modules`
+runs two modules with the same ports side by side, from reset if they are
+clocked:
+
+```python
+p = Py2ver(f, attr, write=False)
+assert_same_modules(tmp_path, before, p.verilog, "f", inputs, outputs)   # mark it sim
+```

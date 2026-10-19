@@ -2,14 +2,14 @@
 table: a function for numbers, a reg and its always block for signals."""
 import random
 import re
-import shutil
-import subprocess
 
 import pytest
 
 from py2ver import DEFAULT_TEMPLATE_DIR
 from py2ver.ast_ir import Assignment, ModuleIR, Port
 from py2ver.renderer import Renderer
+
+from icarus import assert_same_bits
 
 _INPUTS = {"i8s": (8, True), "i5u": (5, False), "i3u": (3, False),
            "a": (8, True), "b": (8, False), "c": (16, True), "d": (3, False)}
@@ -75,8 +75,6 @@ def _element(rng):
 def test_case_tables_compute_the_same_in_icarus(tmp_path):
     """Icarus computes each rendered module output as the selection tree it
     came from, in contexts whose width and sign extend the table's value."""
-    if shutil.which("iverilog") is None or shutil.which("vvp") is None:
-        pytest.skip("Icarus Verilog tools are not installed")
     rng = random.Random(3)
     contexts = ["{T}", "{T} + (c)", "{T} * (b)", "(a) - {T}", "{T} >>> 2", "{T} / 3",
                 "{T} < (a)", "$signed({T}) + (d)", "{T} ^ (c)", "(b) ? {T} : (a)"]
@@ -93,23 +91,8 @@ def test_case_tables_compute_the_same_in_icarus(tmp_path):
         outputs[f"o{k}"] = (rng.choice([1, 8, 24, 40]), rng.random() < 0.5)
     v = _render(assigns, outputs)
     assert "function" in v and "always @*" in v
-
-    def decl(n, w, s):
-        return f"{'signed ' if s else ''}[{w - 1}:0] {n}"
-    tb = ["module tb;"]
-    tb += [f"  reg {decl(n, w, s)};" for n, (w, s) in _INPUTS.items()]
-    tb += [f"  wire {decl(n, w, s)};" for n, (w, s) in outputs.items()]
-    tb += [f"  wire {decl('r' + n[1:], w, s)} = {r};" for (n, r), (w, s) in
-           zip(assigns, outputs.values())]
-    tb.append("  lk dut(" + ", ".join(f".{n}({n})" for n in [*_INPUTS, *outputs]) + ");")
-    tb += ["  integer t;", "  initial begin", "    for (t = 0; t < 3000; t = t + 1) begin",
-           "      " + " ".join(f"{n} = $random;" for n in _INPUTS) + " #1;"]
-    tb += [f'      if (o{k} !== r{k}) $display("MISMATCH {k} %b %b", o{k}, r{k});'
-           for k in range(len(assigns))]
-    tb += ['    end', '    $display("DONE");', "  end", "endmodule"]
-    (tmp_path / "lk.v").write_text(v + "\n" + "\n".join(tb) + "\n")
-    subprocess.run(["iverilog", "-g2012", "-o", "t.vvp", "lk.v"], cwd=tmp_path, check=True)
-    out = subprocess.run(["vvp", "t.vvp"], cwd=tmp_path, capture_output=True, text=True).stdout
-    assert "DONE" in out
-    bad = [line for line in out.splitlines() if line.startswith("MISMATCH")]
-    assert not bad, "\n".join(f"{line}\n  {assigns[int(line.split()[1])]}" for line in bad[:5])
+    # (each output of the rendered module against its tree, computed in the testbench)
+    body = [f"wire {'signed ' if s else ''}[{w - 1}:0] {n};" for n, (w, s) in outputs.items()]
+    body.append("lk dut(" + ", ".join(f".{n}({n})" for n in [*_INPUTS, *outputs]) + ");")
+    pairs = [(w, s, r, n) for (n, r), (w, s) in zip(assigns, outputs.values())]
+    assert_same_bits(tmp_path, _INPUTS, pairs, sources=v, body=body, samples=3000)

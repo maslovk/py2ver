@@ -1,12 +1,12 @@
 import random
-import shutil
-import subprocess
 
 import pytest
 from hypothesis import given, settings, strategies as st
 
 from py2ver import vprint
 from py2ver.vprint import parse, tidy, wrapped
+
+from icarus import assert_same_bits
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -110,27 +110,10 @@ def test_printed_expression_parses_back_the_same(seed, col, width):
 def test_tidied_expressions_compute_the_same_in_icarus(tmp_path):
     """Icarus computes every tidied expression as the original: the printer's
     precedence is Verilog's."""
-    if shutil.which("iverilog") is None or shutil.which("vvp") is None:
-        pytest.skip("Icarus Verilog tools are not installed")
     rng = random.Random(1)
-    exprs = []
-    while len(exprs) < 300:
+    pairs = []
+    while len(pairs) < 300:
         full = _full(_tree(rng, 4))
         if tidy(full) != full or "(" not in full:
-            exprs.append((full, tidy(full)))
-    decl = "".join(f"  reg {'signed ' if s else ''}[{w - 1}:0] {n};\n"
-                   for n, (w, s) in _INPUTS.items())
-    body = "".join(f"  wire [31:0] f{k} = {f};\n  wire [31:0] t{k} = {t};\n"
-                   for k, (f, t) in enumerate(exprs))
-    checks = "".join(f'      if (f{k} !== t{k}) $display("MISMATCH {k} %b %b", f{k}, t{k});\n'
-                     for k in range(len(exprs)))
-    (tmp_path / "t.v").write_text(
-        f"module t;\n{decl}{body}  integer i;\n  initial begin\n"
-        f"    for (i = 0; i < 64; i = i + 1) begin\n"
-        f"      a = $random; b = $random; c = $random; d = $random; #1;\n{checks}"
-        f"    end\n    $display(\"DONE\");\n  end\nendmodule\n")
-    subprocess.run(["iverilog", "-g2012", "-o", "t.vvp", "t.v"], cwd=tmp_path, check=True)
-    out = subprocess.run(["vvp", "t.vvp"], cwd=tmp_path, capture_output=True, text=True).stdout
-    assert "DONE" in out
-    bad = [line for line in out.splitlines() if line.startswith("MISMATCH")]
-    assert not bad, "\n".join(f"{line}\n  {exprs[int(line.split()[1])]}" for line in bad[:5])
+            pairs.append((32, False, full, tidy(full)))
+    assert_same_bits(tmp_path, _INPUTS, pairs, samples=64)
