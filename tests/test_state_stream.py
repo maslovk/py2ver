@@ -1,3 +1,4 @@
+import re
 import shutil
 
 import pytest
@@ -160,10 +161,10 @@ def test_state_lowering_ports_and_verilog(monkeypatch, tmp_path):
     assert p.tb_latency_cycles == 0
 
     verilog = (tmp_path / "hdl" / "main.v").read_text(encoding="utf-8")
-    assert "input rst;" in verilog
-    assert "reg signed [15:0] y_prev;" in verilog
-    assert "y_prev <= rst ? 16'sd0 : (ce ? y : $signed(y_prev));" in verilog
-    assert "input ce;" in verilog
+    assert re.search(r"input +rst,", verilog)
+    assert re.search(r"reg +signed \[15:0\] y_prev;", verilog)
+    assert "if (rst) y_prev <= 16'sd0;\n  else if (ce) y_prev <= y;" in verilog
+    assert re.search(r"input +ce,", verilog)
 
 
 def test_stream_empty_does_not_simulate(monkeypatch, tmp_path):

@@ -1,5 +1,0 @@
-{% if width > 1 -%}
-wire{% if signed %} signed{% endif %} [{{ width-1 }}:0] {{ name }}{{ dimensions }};
-{% else -%}
-wire{% if signed %} signed{% endif %} {{ name }}{{ dimensions }};
-{% endif %}

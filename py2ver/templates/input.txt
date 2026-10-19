@@ -1,5 +1,0 @@
-{% if width > 1 -%}
-input{% if signed %} signed{% endif %} [{{ width - 1 }}:0] {{ name }}{% if dimensions %} {{ dimensions }}{% endif %};
-{% else -%}
-input{% if signed %} signed{% endif %} {{ name }}{% if dimensions %} {{ dimensions }}{% endif %};
-{% endif %}

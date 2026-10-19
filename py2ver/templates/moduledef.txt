@@ -1,14 +1,15 @@
 `timescale 1ns/1ps
 
-module {{ modulename }}{% if paramlist != '' %} #
-(
+module {{ modulename }}{% if paramlist != '' %} #(
 {{ paramlist }}
-)
-{%- endif %}
-(
+){% endif %} (
 {{ portlist }}
 );
 
-{% for item in items %}{{ item }}
+{% for item in items %}
+{{ item }}
+{% if not loop.last %}
+
+{% endif %}
 {% endfor %}
 endmodule

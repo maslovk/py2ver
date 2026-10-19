@@ -1,3 +1,4 @@
+import re
 import os
 import random
 import shutil
@@ -90,8 +91,8 @@ def test_core_has_valid_ports_and_gated_state(monkeypatch, tmp_path):
     verilog = (tmp_path / "hdl" / "main.v").read_text(encoding="utf-8")
 
     assert p.input_args_list == ["x"] and p.output_args_list == ["z", "acc2"]
-    assert "input vin;" in verilog and "output vout;" in verilog
-    assert "acc <= rst ? 20'sd0 : ((ce && __v1) ?" in verilog   # loop in stage 1
+    assert re.search(r"input +vin,", verilog) and re.search(r"output +vout\b", verilog)
+    assert "if (rst) acc <= 20'sd0;\n  else if (ce && __v1) acc <=" in verilog   # loop in stage 1
 
 
 def test_pipeline_with_ram_is_rejected(monkeypatch, tmp_path):

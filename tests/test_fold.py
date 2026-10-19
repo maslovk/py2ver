@@ -80,7 +80,7 @@ _rng = random.Random(0)
 
 def _multiplies(p):
     text = (p.outdir / "hdl" / "main.v").read_text()
-    return len(re.findall(r"\) \* \((?!\d+\))", text))      # not by a literal number
+    return len(re.findall(r" \* (?!\(?-?\d+\b)", text))      # not by a literal number
 
 
 def test_folding_shares_the_loop_body(monkeypatch, tmp_path):

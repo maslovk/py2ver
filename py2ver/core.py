@@ -520,19 +520,18 @@ class Py2ver:
 
         # ------------------------ Generate core HDL ------------------------
         renderer = Renderer(template_dir)
-        # pass full attr (with SSA temps) into renderer
-        verilog_text = renderer.render_module(ir, self.attr)
+        sdram_pins = bool(self._fold and self._fold.get("sdram"))
+        # pass full attr (with SSA temps) into renderer; with sdram=, the SDRAM's pins
+        verilog_text = renderer.render_module(ir, self.attr,
+                                              self.SDRAM_PORTS if sdram_pins else ())
 
         self.outdir = Path(os.getcwd())
         self.hdl_dir = self.outdir / "hdl"
         self.hdl_dir.mkdir(exist_ok=True)
 
         hdl_path = self.hdl_dir / "main.v"
-        if self._fold and self._fold.get("sdram"):
-            # (the SDRAM's pins in the module's ports; its controller in the file)
-            head = f"module {ir.name}(\n"
-            names = "".join(f"{n},\n" for _, _, n in self.SDRAM_PORTS)
-            verilog_text = verilog_text.replace(head, head + names, 1)
+        if sdram_pins:
+            # (the SDRAM's controller in the file)
             verilog_text += "\n" + (template_dir / "hw" / "sdram" / "py2ver_sdram.v").read_text(
                 encoding="utf-8")
         hdl_path.write_text(verilog_text, encoding="utf-8")
@@ -761,9 +760,7 @@ class Py2ver:
         ce is ce_in, held low while an access waits (a row opened, a refresh) and
         until the SDRAM is set up. adv: the design advanced this clock."""
         L = int(sdram["latency"])
-        decl = [f"{d} {'[' + str(w - 1) + ':0] ' if w > 1 else ''}{n};"
-                for d, w, n in Py2ver.SDRAM_PORTS]
-        return decl + [
+        return [
             "// The SDRAM: the lists and tables that don't fit the block RAM (sdram=)",
             "wire __ext_ready, __ext_rvalid, __ext_init;",
             "wire [15:0] __ext_rdata;",
