@@ -930,7 +930,8 @@ class Py2ver:
             arrays[key] = (arr, len(items))
             if "signals" in rom:                  # (a long list argument's ports)
                 sigs = list(rom["signals"])
-                items += [f"// A list argument: {len(sigs)} x {w} bits, read by {name}",
+                items += [f"// A list argument read by index: {len(sigs)} x {w} bits, "
+                          f"read by {name}",
                           f"wire {sig}[{w - 1}:0] {arr} [0:{(1 << ab) - 1}];"]
                 items += [f"assign {arr}[{k}] = {v};" for k, v in enumerate(sigs)]
                 items += [f"assign {arr}[{k}] = {w}'d0;" for k in range(len(sigs), 1 << ab)]
