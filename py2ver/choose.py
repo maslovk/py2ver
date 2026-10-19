@@ -125,9 +125,9 @@ def choose(tree: ast.Module, attr: Dict[str, Any], budget: int) -> Choice:
     hi = max(1, products)
     # Fewest multipliers that fit: doubling, then halving the gap
     while True:
-        _, info = share(tree, attr, k)
-        if info["phases"] <= budget:
-            best = (k, info["phases"])
+        _, sched = share(tree, attr, k)
+        if sched.phases <= budget:
+            best = (k, sched.phases)
             break
         if k >= hi:
             break
@@ -135,13 +135,13 @@ def choose(tree: ast.Module, attr: Dict[str, Any], budget: int) -> Choice:
     if best is None:
         return Choice("unrolled", 1, budget,
                       why=f"a multiplier for each of the {products} products: shared, the "
-                          f"chain of dependent steps needs at least {info['phases']} clocks")
+                          f"chain of dependent steps needs at least {sched.phases} clocks")
     lo = k // 2 + 1 if k > 1 else 1
     while lo < best[0]:
         mid = (lo + best[0]) // 2
-        _, info = share(tree, attr, mid)
-        if info["phases"] <= budget:
-            best = (mid, info["phases"])
+        _, sched = share(tree, attr, mid)
+        if sched.phases <= budget:
+            best = (mid, sched.phases)
         else:
             lo = mid + 1
     if best[1] <= 1:
@@ -161,7 +161,7 @@ def choose_lanes(tree: ast.Module, attr: Dict[str, Any], ns: Dict[str, Any],
     from .sequencer import sequence
     best = None
     for lanes in range(1, MAX_LANES + 1):
-        clocks = sequence(tree, attr, ns, lanes=lanes)[1]["phases"]
+        clocks = sequence(tree, attr, ns, lanes=lanes)[1].phases
         if best is not None and clocks >= best[1]:
             continue                              # (no loop splits into this many)
         best = (lanes, clocks)

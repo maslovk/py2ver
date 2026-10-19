@@ -31,6 +31,8 @@ import ast
 import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .schedule import Schedule
+
 
 def _assigned(stmts: List[ast.stmt]) -> Set[str]:
     out: Set[str] = set()
@@ -125,13 +127,11 @@ def _list_writes(stmts: List[ast.stmt]) -> Set[str]:
 
 def fold_loop(tree: ast.Module, loop: Any, unroll: int,
               widths: Dict[str, Dict[str, Any]],
-              lists: Dict[str, int]) -> Tuple[ast.Module, Dict[str, Any]]:
+              lists: Dict[str, int]) -> Tuple[ast.Module, Schedule]:
     """
     Rewrite the module's first function with the loop folded. `widths` is
     the translator's attr for the unfolded function (to size registers) and
-    `lists` its list lengths.
-    Returns (tree, info): info has 'phases', 'phase' (the phase port name),
-    'regs' ({register: next value}) and 'attr' (formats of the new signals).
+    `lists` its list lengths. Returns (tree, its schedule).
     """
     tree = copy.deepcopy(tree)
     fd = tree.body[0]
@@ -235,5 +235,5 @@ def fold_loop(tree: ast.Module, loop: Any, unroll: int,
             ports.update({f"{reg}_{i}": f"{nxt}_{i}" for i in range(lists[c])})
         else:
             ports[reg] = nxt
-    return tree, {"phases": phases, "phase": phase, "loop": k, "regs": ports,
-                  "params": {phase} | {reg for reg, _ in regs.values()}, "attr": attr}
+    return tree, Schedule("folded", phases, phase=phase, loop=k, regs=ports,
+                          params={phase} | {reg for reg, _ in regs.values()}, attr=attr)

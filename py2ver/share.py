@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .fixed import FIT_LIST, wrap
+from .schedule import Schedule
 
 ROM_MIN = 64              # a constant table with at least this many entries goes into block RAM
 DEFAULT_PERIOD_NS = 12.0  # the clock period the chaining aims for
@@ -647,7 +648,8 @@ def _free_delay(o: Op, w: int) -> float:
 # ==================================================================== scheduling
 
 @dataclass
-class Schedule:
+class _Timing:
+    """When and where each operation runs (the design's Schedule is built from it)."""
     phase: Dict[str, int]                 # op -> clock it runs in (a ROM: its read)
     ready: Dict[str, int]                 # op -> clock its value is there
     unit: Dict[str, Tuple[str, int]]      # mul / rom op -> (unit class, index)
@@ -665,7 +667,7 @@ def _mac_parts(node: ast.expr) -> Tuple[Optional[ast.expr], ast.expr, ast.expr, 
     return node.left, prod.left, prod.right, isinstance(node.op, ast.Sub)
 
 
-def _schedule(ops: List[Op], widths, rng, attr, multipliers: int, period: float) -> Schedule:
+def _schedule(ops: List[Op], widths, rng, attr, multipliers: int, period: float) -> _Timing:
     by = {o.name: o for o in ops}
     users: Dict[str, List[str]] = {o.name: [] for o in ops}
     for o in ops:
@@ -802,7 +804,7 @@ def _schedule(ops: List[Op], widths, rng, attr, multipliers: int, period: float)
         if p > 4 * len(ops) + 8:
             raise RuntimeError("share: scheduling made no progress")
     last = max([ready[n] for n in ready] + [0])
-    return Schedule(phase, ready, unit, last + 1, dims, inv, swap)
+    return _Timing(phase, ready, unit, last + 1, dims, inv, swap)
 
 
 def _simplify(ops: List[Op], outputs) -> None:
@@ -1059,13 +1061,13 @@ def _live(ops: List[Op], outputs) -> List[Op]:
 
 
 def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
-          period: float = DEFAULT_PERIOD_NS) -> Tuple[ast.Module, Dict[str, Any]]:
+          period: float = DEFAULT_PERIOD_NS) -> Tuple[ast.Module, Schedule]:
     """
     Schedule the module's first function (lowered, straight-line) on
     `multipliers` shared multipliers and one block-RAM port per table.
-    Returns (tree, info) in fold.py's form ('phases', 'phase', 'regs',
-    'params', 'attr'), plus 'roms': {data register: {'index', 'entries',
-    'width', 'signed'}}; info['phases'] == 1 means nothing to share.
+    Returns (tree, its schedule), with its tables (roms: {data register:
+    {'index', 'entries', 'width', 'signed'}}) and register files; phases == 1
+    means nothing to share.
     """
     multipliers = int(multipliers)
     if multipliers < 1:
@@ -1086,9 +1088,8 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
     by = {o.name: o for o in ops}
     sched = _schedule(ops, widths, rng, attr, multipliers, float(period))
     P = sched.phases
-    info: Dict[str, Any] = {"phases": P, "loop": "(shared)", "mul_widths": sched.mul_widths}
     if P <= 1:
-        return tree, info
+        return tree, Schedule("shared", P, mul_widths=sched.mul_widths)
 
     used = set(conv.used)
     phase = _fresh("fphase", used)
@@ -1254,7 +1255,6 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
             source[n] = unit_out[u]
     unit_regs: Dict[str, str] = {}            # registers loaded every clock -> their input
     last_reg: Dict[Tuple[str, int], str] = {}
-    mux_inputs = [0]                          # multiplexer input bits (for the log)
     for u in sorted(last_needed):             # a unit's previous result
         last_reg[u] = _fresh(f"{unit_out[u]}_last", used)
         now = unit_out[u]
@@ -1292,7 +1292,6 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
         _select([ast.Name(id=x, ctx=ast.Load()) for x in wsrc], wpick, phase, stmts,
                 names["wdata"], used)
         fmt = _fmt_of(_hull(*[rng[v] for v in plan]))
-        mux_inputs[0] += (len(wsrc) - 1) * fmt["width"]
         new_attr[q] = dict(fmt, type="wire")
         new_attr[names["wdata"]] = dict(fmt, type="wire")
         rfs[q] = dict(fmt, depth=depth, address_bits=ab,
@@ -1340,7 +1339,6 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
                 _select(srcs, pick, phase, stmts, f"{out}_{side}", used)
                 fmt = dict(_fmt_of(_hull(*[_interval(parts[n][side], rng, attr)
                                            for n in members])), type="wire")
-                mux_inputs[0] += (len(srcs) - 1) * fmt["width"]
                 new_attr[f"{out}_{side}"] = fmt
                 if side != "c":
                     reg = _fresh(f"{out}_r{side}", used)
@@ -1429,21 +1427,11 @@ def share(tree: ast.Module, attr: Dict[str, Dict[str, Any]], multipliers: int,
     new_fd.args.args = (list(new_fd.args.args) + [ast.arg(arg=phase)]
                         + [ast.arg(arg=r) for r in regs] + [ast.arg(arg=q) for q in params_extra])
     new_tree = ast.fix_missing_locations(ast.Module(body=[new_fd], type_ignores=[]))
-    info.update({
-        "phase": phase,
-        "regs": regs,
-        "roms": roms,
-        "rfs": rfs,
-        "extra_params": list(params_extra),
-        "extra_returns": list(returns_extra),
-        "params": {phase} | set(regs) | set(params_extra),
-        "attr": new_attr,
-        "register_bits": sum(new_attr[r]["width"] for r in regs),
-        "registers": {slot_reg[k][0]: list(sl["members"]) for k, sl in enumerate(slots)},
-        "multipliers_used": len([u for u in units if u[0] == "mul"]),
-        "mux_input_bits": mux_inputs[0],
-    })
-    return new_tree, info
+    return new_tree, Schedule(
+        "shared", P, phase=phase, regs=regs, params={phase} | set(regs) | set(params_extra),
+        attr=new_attr, roms=roms, rfs=rfs, extra_params=list(params_extra),
+        extra_returns=list(returns_extra), register_bits=sum(new_attr[r]["width"] for r in regs),
+        mul_widths=sched.mul_widths)
 
 
 def _desugared(fd: ast.FunctionDef) -> ast.FunctionDef:
@@ -1464,27 +1452,27 @@ def _fill(pick: List[int], used_phases: List[int]) -> None:
             pick[p] = prev
 
 
-def simulate(info: Dict[str, Any], model, args: Tuple[Any, ...], state: Tuple[Any, ...] = ()):
+def simulate(sched: Schedule, model, args: Tuple[Any, ...], state: Tuple[Any, ...] = ()):
     """
     Run a shared design's bit-exact model clock by clock (for tests): args are
     the function's own arguments; returns its outputs after the last clock.
     ROMs and register files are modelled as the hardware has them.
     """
-    regs = {r: info.get("reg_init", {}).get(r, 0) for r in info["regs"]}
-    extra = {q: 0 for q in info["extra_params"]}
-    mems = {q: list(rf.get("init") or [0] * rf["depth"]) for q, rf in info["rfs"].items()}
-    n_regs, n_ret = len(regs), len(info["extra_returns"])
+    regs = {r: sched.reg_init.get(r, 0) for r in sched.regs}
+    extra = {q: 0 for q in sched.extra_params}
+    mems = {q: list(rf.get("init") or [0] * rf["depth"]) for q, rf in sched.rfs.items()}
+    n_regs, n_ret = len(regs), len(sched.extra_returns)
     out = None
-    for p in range(info["phases"]):
+    for p in range(sched.phases):
         res = model(*args, p, *regs.values(), *extra.values())
         res = list(res) if isinstance(res, tuple) else [res]
         k = len(res) - n_regs - n_ret
         out, nxt = res[:k], res[k:k + n_regs]
-        rets = dict(zip(info["extra_returns"], res[k + n_regs:]))
+        rets = dict(zip(sched.extra_returns, res[k + n_regs:]))
         regs = dict(zip(regs, nxt))
-        for q, rom in info["roms"].items():
+        for q, rom in sched.roms.items():
             extra[q] = rom["entries"][int(rets[rom["index"]])]
-        for q, rf in info["rfs"].items():
+        for q, rf in sched.rfs.items():
             mem = mems[q]
             extra[q] = mem[int(rets[rf["raddr"]]) % rf["depth"]]      # (the old contents)
             if rets[rf["we"]]:

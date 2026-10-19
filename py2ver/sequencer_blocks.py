@@ -17,6 +17,7 @@ import ast
 import copy
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .schedule import Schedule
 from .share import _fmt_of, _hull
 
 
@@ -628,7 +629,7 @@ class BlockCode:
 
 def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
                  DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories=(), ext=None):
-    """The per-clock function (share.py's form) and its info."""
+    """The per-clock function (share.py's form) and its schedule."""
     from .sequencer import Loop, _walk_items
     fd = sq.fd
     n = len(blocks)
@@ -1016,14 +1017,12 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     tree = ast.fix_missing_locations(ast.Module(body=[new_fd], type_ignores=[]))
     for r in reg_names:                               # (next-value formats as the registers)
         new_attr.setdefault(regs[r], dict(new_attr[r]))
-    info = {"phases": phases, "phase": phase, "loop": "(sequenced)", "regs": regs,
-            "roms": roms, "rfs": rfs, "extra_params": extra_params,
-            "extra_returns": extra_returns, "params": {phase} | set(reg_names) | set(extra_params),
-            "attr": new_attr, "register_bits": sum(int(new_attr[r]["width"]) for r in reg_names),
-            "blocks": n, "mul_widths": [], "memories": mem_info, "reg_init": reg_init,
-            "sdram": sdram_info,
-            "pipelined": sum(1 for k in codes if codes[k].pipe is not None)}
-    return tree, info
+    return tree, Schedule(
+        "sequenced", phases, phase=phase, regs=regs,
+        params={phase} | set(reg_names) | set(extra_params), attr=new_attr, reg_init=reg_init,
+        roms=roms, rfs=rfs, extra_params=extra_params, extra_returns=extra_returns,
+        register_bits=sum(int(new_attr[r]["width"]) for r in reg_names), memories=mem_info,
+        sdram=sdram_info, blocks=n, pipelined=sum(1 for k in codes if codes[k].pipe is not None))
 
 
 def _wrap(n: int, w: int, signed: bool) -> int:

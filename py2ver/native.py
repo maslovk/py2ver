@@ -63,10 +63,15 @@ endmodule
 """
 
 
+def _sdram(p) -> Optional[Dict[str, Any]]:
+    """The design's SDRAM (its lists and tables), or None."""
+    return p.schedule.sdram if p.schedule else None
+
+
 def mode_of(p) -> Optional[Dict[str, Any]]:
     """How the testbench steps this design, or None if cocotb must (latency 'reg'
     signals)."""
-    stateful = bool(p.state_map or p.rams or p._fold)
+    stateful = bool(p.state_map or p.rams or p.schedule)
     if stateful:
         return {"kind": "stream", "phases": int(getattr(p, "ram_phases", 1)),
                 "latency": p.pipeline_stages if p._has_vin else 0, "vin": p._has_vin}
@@ -103,7 +108,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         conns.append(f".{name}(cur[{lo + w - 1}:{lo}])")
     conns += [f".{name}(o_{name})" for name, _ in outs]
     conns += [f".{c}({c})" for c in ("clk", "rst", "ce", "vin") if c in ports]
-    sdram = (getattr(p, "_fold", None) or {}).get("sdram")
+    sdram = _sdram(p)
     if "ce_in" in ports:
         conns.append(".ce_in(ce)")
     if sdram:
@@ -274,7 +279,7 @@ def _runs(addrs: List[int]) -> List[Tuple[int, int, int]]:
 
 def sdram_images(p) -> List[Tuple[int, List[int]]]:
     """(base address, 16-bit words) of each SDRAM list or table with values to start from."""
-    sdram = (getattr(p, "_fold", None) or {}).get("sdram") or {}
+    sdram = _sdram(p) or {}
     out = []
     for kind in ("tables", "lists"):
         for key, info in sdram.get(kind, {}).items():
@@ -322,7 +327,7 @@ def build(p, mode: Dict[str, Any], simulator: str, workdir: Path) -> Path:
     (tmp / "main.v").write_text(core, encoding="utf-8")
     (tmp / "tb.v").write_text(tb, encoding="utf-8")
     extra = []
-    if (getattr(p, "_fold", None) or {}).get("sdram"):
+    if _sdram(p):
         model = Path(__file__).parent / "templates" / "hw" / "sdram" / "sdram_model.v"
         (tmp / "sdram_model.v").write_text(model.read_text(encoding="utf-8"), encoding="utf-8")
         extra = ["sdram_model.v"]

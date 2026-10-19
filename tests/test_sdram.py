@@ -133,7 +133,7 @@ def test_a_design_with_its_list_and_table_in_the_sdram(monkeypatch, tmp_path):
     with contextlib.redirect_stdout(io.StringIO()):
         p = Py2ver(_with_a_list, {"x": {"signed": 1, "width": 8, "length": 16}}, sequential=True,
                    sdram=0)                                  # (everything in the SDRAM)
-    sd = p._fold["sdram"]
+    sd = p.schedule.sdram
     assert list(sd["lists"]) == ["h"] and len(sd["tables"]) == 1
     assert "dram_dq" in (tmp_path / "hdl" / "main.v").read_text()
     r = random.Random(3)
@@ -199,7 +199,7 @@ def test_a_list_of_values_wider_than_a_word_takes_two(monkeypatch, tmp_path):
         p = Py2ver(_wide_list, {"x": {"signed": 1, "width": 8, "length": 16}},
                    sequential=True, sdram=0)
     # (h's values are 22 bits: two words each, read and written in turn)
-    h = p._fold["sdram"]["lists"]["h"]
+    h = p.schedule.sdram["lists"]["h"]
     assert h["meta"]["width"] > 16 and h["words"] == 2
     r = random.Random(1)
     vectors = [([r.randint(-128, 127) for _ in range(16)],) for _ in range(3)]

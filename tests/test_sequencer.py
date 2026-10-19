@@ -78,8 +78,8 @@ def _vec():
 def test_the_machine_computes_what_python_does(f):
     fe = front_end(f, X16)
     tree, info = sequence(fe.tree, fe.attr, _namespace(f))
-    assert info["phases"] > 1
-    model = build_model(tree, dict(fe.attr, **info["attr"]), _namespace(f))
+    assert info.phases > 1
+    model = build_model(tree, dict(fe.attr, **info.attr), _namespace(f))
     for _ in range(40):
         x = _vec()
         want = f(x)
@@ -92,7 +92,7 @@ def test_the_machine_computes_what_python_does(f):
 def test_long_lists_and_tables_go_to_block_ram():
     fe = front_end(ram, X16)
     _, info = sequence(fe.tree, fe.attr, _namespace(ram))
-    assert len(info["rfs"]) == 4 and len(info["roms"]) == 1    # h, filled: two reads each
+    assert len(info.rfs) == 4 and len(info.roms) == 1    # h, filled: two reads each
 
 
 @pytest.mark.sim
@@ -142,17 +142,17 @@ def test_pipelined_loops_compute_what_python_does(f):
     fe = front_end(f, X16)
     tree, info = sequence(fe.tree, fe.attr, _namespace(f))
     _, plain = sequence(fe.tree, fe.attr, _namespace(f), pipelined=False)
-    model = build_model(tree, dict(fe.attr, **info["attr"]), _namespace(f))
+    model = build_model(tree, dict(fe.attr, **info.attr), _namespace(f))
     for _ in range(20):
         x = _vec()
         got = simulate(info, model, (x,))
         assert got == f(x)
     expected = {mlp: 1, in_place: 3, running: 0}[f]
-    assert info["pipelined"] == expected
+    assert info.pipelined == expected
     if expected:
-        assert info["phases"] < 0.7 * plain["phases"]
+        assert info.phases < 0.7 * plain.phases
     else:
-        assert info["phases"] == plain["phases"]
+        assert info.phases == plain.phases
 
 
 @pytest.mark.sim
@@ -180,7 +180,7 @@ def test_a_deep_pipeline_in_hardware(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     fe = front_end(deep, X16)
     _, info = sequence(fe.tree, fe.attr, _namespace(deep))
-    assert info["pipelined"] == 2
+    assert info.pipelined == 2
     p = Py2ver(deep, X16, sequential=True)
     vectors = [(_vec(),) for _ in range(6)]
     assert p.PY_batch()(vectors) == [(deep(*v),) for v in vectors]
@@ -210,8 +210,8 @@ def test_loops_with_division_and_square_roots_are_pipelined_step_by_step():
     ns = dict(_namespace(roots), int_=int)                 # (int, renamed from the keyword)
     tree, info = sequence(fe.tree, fe.attr, ns)
     _, plain = sequence(fe.tree, fe.attr, ns, pipelined=False)
-    assert info["pipelined"] == 2 and info["phases"] < plain["phases"] / 10
-    model = build_model(tree, dict(fe.attr, **info["attr"]), ns)
+    assert info.pipelined == 2 and info.phases < plain.phases / 10
+    model = build_model(tree, dict(fe.attr, **info.attr), ns)
     reference = build_model(fe.tree, fe.attr, ns)          # (the loops as written)
     for _ in range(20):
         x = _vec()
@@ -234,13 +234,13 @@ def test_lanes_run_iterations_side_by_side():
     clocks = {}
     for lanes in (1, 2, 3, 4):
         tree, info = sequence(fe.tree, fe.attr, ns, lanes=lanes)
-        clocks[lanes] = info["phases"]
-        model = build_model(tree, dict(fe.attr, **info["attr"]), ns)
+        clocks[lanes] = info.phases
+        model = build_model(tree, dict(fe.attr, **info.attr), ns)
         for _ in range(10):
             x = _vec()
             assert simulate(info, model, (x,)) == mlp(x)
         if lanes in (2, 3):     # (W banked: each lane a ROM of the rows it reads, W once in all)
-            assert sum(len(r["entries"]) for r in info["roms"].values()) == len(W)
+            assert sum(len(r["entries"]) for r in info.roms.values()) == len(W)
     # 16 products a sum: 2 lanes halve it, 3 run as 2 (16 doesn't split in 3)
     assert clocks[1] > clocks[2] == clocks[3] > clocks[4]
 
@@ -272,8 +272,8 @@ def test_tables_are_banked_where_the_lanes_read_their_own_entries(f, copies):
     for lanes in (2, 4):     # (on 4, banks of 32 entries: logic, as any short table)
         tree, info = sequence(fe.tree, fe.attr, ns, lanes=lanes)
         if lanes == 2:
-            assert sum(len(r["entries"]) for r in info["roms"].values()) == copies * len(W)
-        model = build_model(tree, dict(fe.attr, **info["attr"]), ns)
+            assert sum(len(r["entries"]) for r in info.roms.values()) == copies * len(W)
+        model = build_model(tree, dict(fe.attr, **info.attr), ns)
         for _ in range(10):
             x = _vec()
             assert simulate(info, model, (x,)) == f(x)

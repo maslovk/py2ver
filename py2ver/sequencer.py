@@ -49,6 +49,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+from .schedule import Schedule
 from .share import _fmt_of, _fmt_range, _hull, _interval, NotShareable
 
 RAM_MIN = 32              # a list this long or longer is a block RAM
@@ -616,11 +617,11 @@ class _Seq:
 
 def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, Any],
              pipelined: bool = True, lanes: int = 1,
-             sdram: Any = None) -> Tuple[ast.Module, Dict[str, Any]]:
+             sdram: Any = None) -> Tuple[ast.Module, Schedule]:
     """
     Build the module's first function (lowered integer code with for-range
-    loops) as a state machine; returns (tree, info) in share.py's form, or
-    info['phases'] == 1 if it has no loops to sequence. pipelined: innermost
+    loops) as a state machine; returns (tree, its schedule), phases == 1 if it
+    has no loops to sequence. pipelined: innermost
     loops start an iteration every clock where they can (see pipeline_block).
     lanes: multiply-accumulate loops run that many iterations at a time (see
     _unrolled).
@@ -634,7 +635,7 @@ def sequence(tree: ast.Module, attr: Dict[str, Dict[str, Any]], ns: Dict[str, An
     st = _Structure(sq.lists)
     program = st.seq(fd.body)
     if not any(isinstance(it, Loop) for it in program):
-        return tree, {"phases": 1}
+        return tree, Schedule("sequenced", 1)
     return _build(sq, program, attr, ns, pipelined, lanes, sdram)
 
 

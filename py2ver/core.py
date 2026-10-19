@@ -51,6 +51,7 @@ from .auto import auto_fixed
 from .hwtypes import _namespace, normalize_attr, read_annotations
 from .cplx import split_complex
 from .fold import fold_loop
+from .schedule import Schedule
 from .share import ROM_MIN, share
 
 ROM_FILE_MIN = 4096         # a table longer than this is read from a file ($readmemh)
@@ -237,6 +238,27 @@ def expand_args(call_inputs: List[str], cplx_params: set, args: Tuple[Any, ...])
     return tuple(out) + tuple(args[len(call_inputs):])
 
 
+# Options that can't be given together, checked in this order: (option, the
+# options it rules out, the error). (Those that depend on the design - block RAM,
+# 'reg' signals - are checked once the translation finds them.)
+_EXCLUSIVE = (
+    ("rate", ("multipliers", "fold"), ValueError,
+     "rate= chooses fold / multipliers itself; give rate= or those"),
+    ("sequential", ("pipeline", "fold"), NotImplementedError,
+     "sequential=True can't be combined with fold= or pipeline="),
+    ("multipliers", ("pipeline", "fold"), NotImplementedError,
+     "multipliers= can't be combined with fold= or pipeline="),
+    ("fold", ("pipeline",), NotImplementedError, "fold can't be combined with pipeline yet"),
+)
+
+
+def _check_options(given: Dict[str, bool]) -> None:
+    """given: option -> whether it was given."""
+    for option, others, error, message in _EXCLUSIVE:
+        if given[option] and any(given[o] for o in others):
+            raise error(message)
+
+
 class Py2ver:
     """Main pipeline for Python → Verilog + optional testbench + Quartus + UART HW I/O."""
 
@@ -321,6 +343,10 @@ class Py2ver:
                     for k in dict.fromkeys([*tr.attr, *user])}
             samples = [tr.adapt(x) for x in (getattr(tr, "steps", None) or samples)]
             func = tr.func
+        # (after numpy code's translation, which may sequence it)
+        _check_options({"rate": rate is not None, "fold": fold is not None and fold is not False,
+                        "multipliers": bool(multipliers), "pipeline": bool(pipeline),
+                        "sequential": bool(sequential)})
         if samples is not None:
             attr = auto_fixed(func, samples, attr, width=width or 16, max_error=max_error,
                               round=round, saturate=saturate, margin=margin,
@@ -344,8 +370,9 @@ class Py2ver:
         self._shapes = fe.shapes             # lists of lists: (rows, ...) per argument
         self._source = fe.source
         self._complex_names = fe.complex_names
-        # Folding: the loop's body runs once per clock (phase) instead of unrolled
-        self._fold: Dict[str, Any] | None = None
+        # Several clocks a sample (a folded loop, shared multipliers or a state
+        # machine): how the rewritten function runs, clock by clock (see schedule.py)
+        self.schedule: Schedule | None = None
         # Memories a sequenced design keeps between samples: name -> {length, width,
         # signed, init (raw)}; and their contents after the last PY_stream()
         self._seq_mems: Dict[str, Dict[str, Any]] = {}
@@ -353,8 +380,6 @@ class Py2ver:
         # rate=: the smallest structure that keeps up (fold, multipliers= or unrolled)
         self.choice = None
         if rate is not None:
-            if multipliers or (fold is not None and fold is not False):
-                raise ValueError("rate= chooses fold / multipliers itself; give rate= or those")
             budget = int(clock // rate)
             if budget < 1:
                 raise ValueError(f"{rate:g} samples/s is more than one sample per clock at "
@@ -370,48 +395,31 @@ class Py2ver:
             print(f"py2ver: {rate:g} samples/s at {clock / 1e6:g} MHz leaves {budget} "
                   f"clock{'s' if budget != 1 else ''} per sample: {self.choice}")
         if sequential:
-            if pipeline or (fold is not None and fold is not False):
-                raise NotImplementedError("sequential=True can't be combined with fold= or "
-                                          "pipeline=")
             from .sequencer import sequence
             # (multipliers=: lanes for the multiply-accumulate loops)
-            seq_tree, info = sequence(tree, attr, _namespace(func), lanes=int(multipliers or 1),
-                                      sdram=sdram)
-            if info["phases"] > 1:
-                tree, self._fold = seq_tree, info
-                attr = dict(attr, **info["attr"])
-                self._seq_mems = info["memories"]
-                log.info("Sequenced: %d blocks, %d clocks per sample, %d register file(s), "
-                         "%d ROM(s), %d register bits", info["blocks"], info["phases"],
-                         len(info["rfs"]), len(info["roms"]), info["register_bits"])
+            scheduled = sequence(tree, attr, _namespace(func), lanes=int(multipliers or 1),
+                                 sdram=sdram)
         elif multipliers:
-            if pipeline or (fold is not None and fold is not False):
-                raise NotImplementedError("multipliers= can't be combined with fold= or pipeline=")
-            shared, info = share(tree, attr, multipliers)
-            if info["phases"] > 1:
-                tree, self._fold = shared, info
-                attr = dict(attr, **info["attr"])
-                log.info("Shared: %d clocks per sample, multipliers %s, %d table(s) in block "
-                         "RAM, %d register bits", info["phases"], info["mul_widths"],
-                         len(info["roms"]), info["register_bits"])
+            scheduled = share(tree, attr, multipliers)
         elif fold is not None and fold is not False:
-            if pipeline:
-                raise NotImplementedError("fold can't be combined with pipeline yet")
             unfolded = FunctionVisitor(attr)
             unfolded.visit(copy.deepcopy(tree))
             loop = fe.hw_name.get(fold, fold) if isinstance(fold, str) else fold
             try:
-                folded, info = fold_loop(tree, loop, unroll, unfolded.attr, dict(unfolded._lists))
+                scheduled = fold_loop(tree, loop, unroll, unfolded.attr, dict(unfolded._lists))
             except ValueError as e:
                 if loop is not True or "No top-level" not in str(e):
                     raise
                 log.info("fold=True: no loop to fold")   # (fold=True: if there is one)
-                info = {"phases": 1}
-            if info["phases"] > 1:                 # (all iterations in one clock: nothing to fold)
-                tree, self._fold = folded, info
-                attr = dict(attr, **info["attr"])
-                log.info("Folded loop '%s': %d clocks per sample, %d register(s)",
-                         info["loop"], info["phases"], len(info["regs"]))
+                scheduled = None
+        else:
+            scheduled = None
+        # (one clock a sample after all, e.g. every iteration in one clock: as it was)
+        if scheduled is not None and scheduled[1].phases > 1:
+            tree, self.schedule = scheduled
+            attr = dict(attr, **self.schedule.attr)
+            self._seq_mems = self.schedule.memories
+            log.info("%s", self.schedule)
         f_visitor = FunctionVisitor(attr)
         # Large constant tables are ROMs: in block RAM in a pipelined design without
         # state, else arrays read asynchronously (both readable by any simulator)
@@ -428,7 +436,7 @@ class Py2ver:
         # loaded from that output every clock and reset to 'init' (default 0).
         self.func = func
         # Parameters as ports: (param, [ports] for a list argument, or None)
-        fold_params = self._fold["params"] if self._fold else set()
+        fold_params = self.schedule.params if self.schedule else set()
         self.arg_groups = [g for g in f_visitor.arg_groups if g[0] not in fold_params]
         self.state_map, self.state_init, self.state_params = self._parse_state(
             attr, dict(self.arg_groups)
@@ -465,11 +473,11 @@ class Py2ver:
                 [builtins.round(d, 2) for d in self._pipe.stage_delay],   # ('round' is a parameter)
                 f", state loop in stage {self._pipe.loop_stage}" if self.state_map else "",
             )
-        if self._fold and (self.rams or ir.has_clk):
+        if self.schedule and (self.rams or ir.has_clk):
             raise NotImplementedError("fold can't be combined with block RAM or 'reg' signals yet")
         pre_inputs = list(ir.inputs)
         self._ext_inputs: Dict[str, int] = {}     # (sdram=: an input's port -> its SDRAM address)
-        if self.state_map or self.rams or self._fold:
+        if self.state_map or self.rams or self.schedule:
             ir = self._lower_state(ir, f_visitor.attr)
         ir = self._rom_arrays(ir, f_visitor.rom_reads, f_visitor.attr)
         self.ir = ir
@@ -532,7 +540,7 @@ class Py2ver:
 
         # ------------------------ Generate core HDL ------------------------
         renderer = Renderer(template_dir)
-        sdram_pins = bool(self._fold and self._fold.get("sdram"))
+        sdram_pins = self._sdram
         # pass full attr (with SSA temps) into renderer; with sdram=, the SDRAM's pins
         verilog_text = renderer.render_module(ir, self.attr,
                                               self.SDRAM_PORTS if sdram_pins else (),
@@ -567,7 +575,7 @@ class Py2ver:
             "latency": self.tb_latency_cycles,
             "pre_step": getattr(self, "ram_phases", 1) - 1,
             "has_clk": self.has_clk,
-            "has_state": bool(self.state_map or self.rams or self._fold),
+            "has_state": bool(self.state_map or self.rams or self.schedule),
             "has_ce": self._has_ce,
             "has_vin": self._has_vin,
             "outputs_size": self.output_bits,
@@ -688,9 +696,9 @@ class Py2ver:
         # With a block RAM, a sample takes two clocks (read, then compute and
         # write); state commits in the second one.
         self.ram_phases, self._ram_schedule = self._schedule_rams(ir)
-        fold = self._fold or {"phases": 1, "phase": None, "regs": {}}
-        if self._fold:
-            self.ram_phases = fold["phases"]
+        fold = self.schedule or Schedule("none", 1)
+        if self.schedule:
+            self.ram_phases = fold.phases
         commit = f"(ce && {self._phase_is(self.ram_phases - 1)})" if self.ram_phases > 1 else "ce"
         if self._pipe is not None:
             # Only a real sample reaching the loop stage updates the state
@@ -715,23 +723,21 @@ class Py2ver:
 
         # A folded loop: its phase is the phase counter, its carried values are
         # registers loaded every clock
-        if self._fold:
+        if self.schedule:
             # (a state machine only asks whether it is the sample's first clock: a
             # register says so, not a compare of the counter on its paths)
-            assigns.append(Assignment(left=fold["phase"], right="__phase_nz" if self._sequenced
+            assigns.append(Assignment(left=fold.phase, right="__phase_nz" if fold.sequenced
                                       else "__phase"))
-            for reg, nxt in fold["regs"].items():
-                init = fold.get("reg_init", {}).get(reg, 0)
+            for reg, nxt in fold.regs.items():
+                init = fold.reg_init.get(reg, 0)
                 if init:                          # (a memory kept in registers: its 'init')
                     m = attr.get(reg, {})
                     w, sgn = int(m.get("width", 1)), int(m.get("signed", 0)) == 1
                     init = f"{w}'{'s' if sgn else ''}d{init & ((1 << w) - 1)}"
                 assigns.append(Assignment(left=reg, right=f"rst ? {init} : (ce ? {nxt} : {reg})",
                                           is_reg=True))
-        roms = fold.get("roms", {})
-        rfs = fold.get("rfs", {})
-        fold_ports = {fold["phase"], *fold["regs"], *roms, *rfs}
-        sdram = fold.get("sdram")
+        roms, rfs, sdram = fold.roms, fold.rfs, fold.sdram
+        fold_ports = {fold.phase, *fold.regs, *roms, *rfs}
         if sdram:
             fold_ports.add("ext_q")
             # Input lists in the SDRAM: no ports (their values are written there)
@@ -762,7 +768,7 @@ class Py2ver:
             name=ir.name,
             inputs=inputs,
             outputs=[p for p in ir.outputs if p.name not in
-                     set(fold["regs"].values()) | {r["index"] for r in roms.values()}
+                     set(fold.regs.values()) | {r["index"] for r in roms.values()}
                      | {rf[k] for rf in rfs.values() for k in ("raddr", "we", "waddr", "wdata")}
                      | ext_out],
             assigns=assigns,
@@ -897,9 +903,11 @@ class Py2ver:
         P, pb = self.ram_phases, self._phase_bits
         if P <= 1:
             return []
-        what = ("shared multipliers and tables" if self._fold and self._fold.get("roms") is not None
-                else "the folded loop's iterations" if self._fold
-                else "RAM reads, then compute, then writes")
+        kind = self.schedule.kind if self.schedule else "none"
+        what = {"folded": "the folded loop's iterations",
+                "shared": "shared multipliers and tables",
+                "sequenced": "shared multipliers and tables"}.get(
+                    kind, "RAM reads, then compute, then writes")
         return [
             f"// {P} clocks per sample: {what}",
             f"reg [{pb - 1}:0] __phase;",
@@ -918,7 +926,7 @@ class Py2ver:
 
     @property
     def _sequenced(self) -> bool:
-        return bool(self._fold) and self._fold.get("loop") == "(sequenced)"
+        return bool(self.schedule) and self.schedule.sequenced
 
     @staticmethod
     def _rom_arrays(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],
@@ -1206,7 +1214,7 @@ class Py2ver:
             # Stream mode: outputs are combinational in (inputs, state) and are
             # sampled every clock before the state registers update.
             return 0, {n: 0 for n in self.output_args_list}
-        if self._fold:
+        if self.schedule:
             # Several clocks per sample (pre_step), its registers in loops: the
             # results are there a clock after the last
             return 1, {n: 1 for n in self.output_args_list}
@@ -1798,7 +1806,7 @@ class Py2ver:
         vectors = list(vectors)
         if not vectors:
             return []
-        if self.state_map or self.rams or self._fold:
+        if self.state_map or self.rams or self.schedule:
             vecs = self._stream_vectors(vectors)
         else:
             vecs = [self._input_vector(tuple(v)) for v in vectors]
@@ -1944,8 +1952,7 @@ class Py2ver:
         if self.has_clk:
             conns.append("    .clk(clk)")
         conns += [f"    .{p.name}({p.name}_q)" for p in core_in]
-        sdram = bool(self._fold and self._fold.get("sdram"))
-        if sdram:
+        if self._sdram:
             # The SDRAM's pins: real pins (the DE0-Nano's), not registered; adv as an output
             core_out = core_out + [Port(name="adv", width=1, signed=False)]
             port_decls.append("  output reg adv_out")
@@ -1991,7 +1998,7 @@ class Py2ver:
         ):
             self.get_template(tpl).stream(ctx).dump(str(project_dir / name))
         self._copy_hdl(project_dir, f"{self.t_name}.v")
-        if sdram:
+        if self._sdram:
             self._syn_sdram(project_dir, wrapper)
 
         log.info("Synthesis project created at %s", project_dir)
@@ -1999,7 +2006,7 @@ class Py2ver:
 
     @property
     def _sdram(self) -> bool:
-        return bool(self._fold and self._fold.get("sdram"))
+        return bool(self.schedule and self.schedule.sdram)
 
     def _port_inputs(self) -> List[Tuple[str, int]]:
         """(name, width) of the inputs that are ports (not in the SDRAM)."""
@@ -2011,7 +2018,7 @@ class Py2ver:
         """sdram=: a returned list in the SDRAM has no ports; its values take their
         place among the outputs (output_args_list) all the same, in the return's
         order. {port: its SDRAM address}."""
-        sd = (self._fold or {}).get("sdram") or {}
+        sd = (self.schedule.sdram if self.schedule else None) or {}
         returns = sd.get("returns", ())
         if not any(name for name, _ in returns):
             return {}
@@ -2334,7 +2341,7 @@ class Py2ver:
         )
 
     def _stream_vectors(self, samples: List[Any]) -> List[Tuple[int, ...]]:
-        if not (self.state_map or self.rams or self._fold):
+        if not (self.state_map or self.rams or self.schedule):
             raise ValueError("Streams need state ('next' or 'memory' in attr); use TB_batch().")
         # A sample is a tuple of arguments; anything else is the only argument
         return [self._input_vector(s if isinstance(s, tuple) else (s,)) for s in samples]
@@ -2385,7 +2392,7 @@ class Py2ver:
         log.info("TB called with %d vector(s)", len(vectors))
         if not vectors:
             return []
-        if self._fold:              # several clocks per vector: the stream testbench
+        if self.schedule:              # several clocks per vector: the stream testbench
             return self.tb_stream_fun(vectors)
         native_rows = self._simulate_native([self._input_vector(v) for v in vectors])
         if native_rows is not None:
@@ -2615,7 +2622,7 @@ class Py2ver:
     def PY_stages(self) -> Callable[[List[Any]], List[Tuple[Any, ...]]]:
         """PY_stream() of the chain, only the results the stages give (not state)."""
         idx = [self.output_args_list.index(port) for port, _, _ in self._stages["results"]]
-        ref = self.PY_stream() if (self.state_map or self.rams or self._fold) else (
+        ref = self.PY_stream() if (self.state_map or self.rams or self.schedule) else (
             lambda blocks: self.PY_batch()([b if isinstance(b, tuple) else (b,) for b in blocks]))
         return lambda blocks: [tuple(row[i] for i in idx) for row in ref(blocks)]
 

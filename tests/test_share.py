@@ -76,8 +76,8 @@ def test_shared_schedule_computes_what_the_model_does(f, k):
         attr = auto_fixed(f, samples, width=18)
     fe = front_end(f, attr)
     tree, info = share(fe.tree, fe.attr, k)
-    assert info["phases"] > 1
-    model = build_model(tree, dict(fe.attr, **info["attr"]), _namespace(f))
+    assert info.phases > 1
+    model = build_model(tree, dict(fe.attr, **info.attr), _namespace(f))
     for args in samples[:25]:
         raw = _raw_args(fe, args)
         assert simulate(info, model, raw) == fe.model(*raw)
@@ -89,7 +89,7 @@ def test_products_run_on_the_shared_multipliers():
     fe = front_end(dot4, attr)
     for k in (1, 2, 4):
         tree, info = share(fe.tree, fe.attr, k)
-        assert len(info["mul_widths"]) == k
+        assert len(info.mul_widths) == k
         # A sum of products accumulates in the multipliers: no adders of its own
         src = __import__("ast").unparse(tree)
         assert src.count(" * ") == k
@@ -100,7 +100,7 @@ def test_tables_go_to_block_ram():
         attr = auto_fixed(neuron, _samples(neuron), width=18)
     fe = front_end(neuron, attr)
     _, info = share(fe.tree, fe.attr, 2)
-    (rom,) = info["roms"].values()
+    (rom,) = info.roms.values()
     assert len(rom["entries"]) >= 64 and rom["address_bits"] == (len(rom["entries"]) - 1).bit_length()
 
 
@@ -128,7 +128,7 @@ def by_index(xs, i):
 def test_loops_and_ifs_are_unrolled_and_selected():
     fe = front_end(looped, LOOPED)
     tree, info = share(fe.tree, fe.attr, 2)
-    model = build_model(tree, dict(fe.attr, **info["attr"]), _namespace(looped))
+    model = build_model(tree, dict(fe.attr, **info.attr), _namespace(looped))
     for _ in range(40):
         args = ([_rng.randint(-300, 300) for _ in range(4)], _rng.randint(-50, 50))
         assert simulate(info, model, args) == looped(*args)
@@ -148,7 +148,7 @@ def test_a_shared_fir(monkeypatch, tmp_path, k):
     from test_fold import FIR, fir
     monkeypatch.chdir(tmp_path)
     p = Py2ver(fir, FIR, multipliers=k)          # 16 constant taps, an accumulation
-    assert len(p._fold["mul_widths"]) == k and p.ram_phases <= 17 // k + 4
+    assert len(p.schedule.mul_widths) == k and p.ram_phases <= 17 // k + 4
     xs = [_rng.randint(-30000, 30000) for _ in range(10)]
     assert p.TB_stream()(xs) == p.PY_stream()(xs)
 
@@ -168,7 +168,7 @@ def test_values_wait_in_register_files(monkeypatch, tmp_path):
     samples = _samples(poly)
     with contextlib.redirect_stdout(io.StringIO()):
         p = Py2ver(poly, samples=samples, width=18, multipliers=1)
-    assert p._fold["rfs"] and "Register file in block RAM" in (tmp_path / "hdl" / "main.v").read_text()
+    assert p.schedule.rfs and "Register file in block RAM" in (tmp_path / "hdl" / "main.v").read_text()
     assert p.TB_batch()(samples[:12]) == p.PY_batch()(samples[:12])
 
 

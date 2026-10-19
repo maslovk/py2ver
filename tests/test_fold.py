@@ -99,8 +99,8 @@ def test_folding_shares_the_loop_body(monkeypatch, tmp_path):
 def test_fold_picks_the_longest_loop(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     attr = {"xs": dict(I16, length=6)}
-    assert Py2ver(two_loops, attr, fold=True)._fold["loop"] == "j"
-    assert Py2ver(two_loops, attr, fold="i")._fold["phases"] == 2
+    assert Py2ver(two_loops, attr, fold=True).schedule.loop == "j"
+    assert Py2ver(two_loops, attr, fold="i").schedule.phases == 2
 
 
 @pytest.mark.parametrize(
@@ -120,7 +120,7 @@ def test_bad_folds_raise_clearly(monkeypatch, tmp_path, kwargs, match):
 def test_a_folded_loop_can_write_list_elements(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     p = Py2ver(writes_list, {"xs": dict(I16, length=4)}, fold="i")
-    assert p.ram_phases == 4 and len(p._fold["regs"]) == 4     # one register per element
+    assert p.ram_phases == 4 and len(p.schedule.regs) == 4     # one register per element
     assert p.output_args_list == [f"ys_{i}" for i in range(4)]
 
 
