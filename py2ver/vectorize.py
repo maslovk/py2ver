@@ -169,7 +169,11 @@ class _Loop:
         reads, writes = _accesses(body)
         conflict = any(set(reads.get(a, [])) - set(ix) or len(set(ix)) > 1
                        for a, ix in writes.items() if a in reads)
-        self.parallel = self.var is not None and not carried and not conflict
+        # (a list made in it, a new one each turn: a loop run in turn, as repeats.py's
+        # loop over a model's layers)
+        makes = any(isinstance(s, ast.Assign) and _makes_list(s.value)
+                    for x in body for s in ast.walk(x))
+        self.parallel = self.var is not None and not carried and not conflict and not makes
         self.written = set(writes)
         self.assigned = assigned
         # A perfect nest of parallel loops down to straight code: its stores' indices
@@ -880,8 +884,6 @@ def _check_supported(fd: ast.FunctionDef) -> None:
                 exprs = [s.test]
             else:
                 exprs = [s]
-            if in_loop and isinstance(s, ast.Assign) and _makes_list(s.value):
-                raise Unsupported("a list made in a loop")       # (lists are made outside loops)
             for e in exprs:
                 if any(isinstance(n, bad) for n in ast.walk(e)):
                     raise Unsupported("an expression it doesn't know")

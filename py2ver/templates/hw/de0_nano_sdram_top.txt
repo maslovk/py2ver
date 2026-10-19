@@ -8,8 +8,11 @@
 //       segments, least significant byte first): the design runs a sample
 //       ({{ phases }} clocks it advances in: it stops while the SDRAM is
 //       busy), then its outputs ({{ tx_bytes }} bytes) are sent back
+//   'X' a2 a1 a0 n2 n1 n0: n 16-bit words read from the SDRAM from address a,
+//       sent back (high byte first)
 //
-// The tables are written once; a sample's input lists (in the SDRAM) before it.
+// The tables are written once; a sample's input lists (in the SDRAM) before it,
+// its returned lists (in the SDRAM) read after.
 module DE0_Nano(
     input              CLOCK_50,
     input       [1:0]  KEY,
@@ -47,10 +50,11 @@ module DE0_Nano(
 
     // ---------------- the design
     reg ce_run;
-    reg host_req;
+    reg host_req, host_we;
     reg [23:0] host_addr;
     reg [15:0] host_wdata;
-    wire host_ready, adv;
+    wire host_ready, host_rvalid, adv;
+    wire [15:0] host_rdata;
     localparam RXW = {{ rx_bytes * 8 if rx_bytes else 8 }};
     localparam TXW = {{ tx_bytes * 8 if tx_bytes else 8 }};
     reg [RXW-1:0] rx_word;
@@ -65,8 +69,8 @@ module DE0_Nano(
     assign outs = {{ '{' }}{% for p in outputs|reverse %}{% if p.seg > p.width %}{{ p.seg - p.width }}'d0, {% endif %}out_{{ p.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if not outputs %}8'd0{% endif %}{{ '}' }};
     {{ core }} dut(
         .clk(CLOCK_50), .rst(rst), .ce_in(ce_run),
-        .host_req(host_req), .host_addr(host_addr), .host_wdata(host_wdata),
-        .host_ready(host_ready), .adv(adv),
+        .host_req(host_req), .host_we(host_we), .host_addr(host_addr), .host_wdata(host_wdata),
+        .host_ready(host_ready), .host_rvalid(host_rvalid), .host_rdata(host_rdata), .adv(adv),
 {%- for p in inputs %}
         .{{ p.name }}(in_{{ p.name }}),
 {%- endfor %}
@@ -78,9 +82,10 @@ module DE0_Nano(
         .dram_ras_n(DRAM_RAS_N), .dram_we_n(DRAM_WE_N));
 
     // ---------------- the commands
-    localparam S_CMD = 3'd0, S_WHDR = 3'd1, S_WDATA = 3'd2, S_WRITE = 3'd3, S_RIN = 3'd4,
-               S_RUN = 3'd5, S_SEND = 3'd6;
-    reg [2:0]  state;
+    localparam S_CMD = 4'd0, S_WHDR = 4'd1, S_WDATA = 4'd2, S_WRITE = 4'd3, S_RIN = 4'd4,
+               S_RUN = 4'd5, S_SEND = 4'd6, S_READ = 4'd7, S_RWAIT = 4'd8, S_RSEND = 4'd9;
+    reg [3:0]  state;
+    reg        rd;          // ('X': the header's words read, not written)
     reg [2:0]  hdr_n;
     reg [47:0] hdr;
     reg [23:0] words;
@@ -101,15 +106,17 @@ module DE0_Nano(
         end
     end
 
-    assign LED = {state, ce_run, host_req, ack, rx_ferr, ~rst};
+    assign LED = {state[2:0], ce_run, host_req, ack, rx_ferr, ~rst};
 
     always @(posedge CLOCK_50) begin
         tx_start <= 1'b0;
         if (rst) begin
-            state <= S_CMD; ce_run <= 1'b0; host_req <= 1'b0; ack <= 1'b0;
+            state <= S_CMD; ce_run <= 1'b0; host_req <= 1'b0; host_we <= 1'b0; ack <= 1'b0;
         end else case (state)
         S_CMD: if (rx_ready) begin
-            if (rx_byte == 8'h57) begin state <= S_WHDR; hdr_n <= 3'd0; end
+            if (rx_byte == 8'h57 || rx_byte == 8'h58) begin
+                state <= S_WHDR; hdr_n <= 3'd0; rd <= rx_byte == 8'h58;
+            end
             else if (rx_byte == 8'h52) begin
                 nbytes <= 16'd0;
                 state <= {{ 'S_RIN' if rx_bytes else 'S_RUN' }};
@@ -124,8 +131,12 @@ module DE0_Nano(
                 host_addr <= hdr[39:16];
                 words <= {hdr[15:0], rx_byte};
                 hi_byte <= 1'b1;
-                state <= ({hdr[15:0], rx_byte} == 24'd0) ? S_SEND : S_WDATA;
-                ack <= 1'b1;
+                if (rd) begin
+                    state <= ({hdr[15:0], rx_byte} == 24'd0) ? S_CMD : S_READ;
+                end else begin
+                    state <= ({hdr[15:0], rx_byte} == 24'd0) ? S_SEND : S_WDATA;
+                    ack <= 1'b1;
+                end
             end
         end
         S_WDATA: if (rx_ready) begin                   // a word, high byte first
@@ -133,6 +144,7 @@ module DE0_Nano(
             else begin
                 host_wdata <= {word[15:8], rx_byte};
                 host_req <= 1'b1;
+                host_we <= 1'b1;
                 state <= S_WRITE;
             end
         end
@@ -142,6 +154,29 @@ module DE0_Nano(
             words <= words - 24'd1;
             hi_byte <= 1'b1;
             state <= (words == 24'd1) ? S_SEND : S_WDATA;
+        end
+        S_READ: begin                                  // a word read: issued,
+            host_req <= 1'b1;
+            host_we <= 1'b0;
+            if (host_req && host_ready) begin
+                host_req <= 1'b0;
+                state <= S_RWAIT;
+            end
+        end
+        S_RWAIT: if (host_rvalid) begin                // its data back,
+            word <= host_rdata;
+            hi_byte <= 1'b1;
+            state <= S_RSEND;
+        end
+        S_RSEND: if (!tx_wait && !tx_start) begin      // sent, high byte first
+            tx_byte <= hi_byte ? word[15:8] : word[7:0];
+            tx_start <= 1'b1;
+            hi_byte <= 1'b0;
+            if (!hi_byte) begin
+                host_addr <= host_addr + 24'd1;
+                words <= words - 24'd1;
+                state <= (words == 24'd1) ? S_CMD : S_READ;
+            end
         end
         S_RIN: if (rx_ready) begin                     // the sample's port inputs
 {%- if rx_bytes > 1 %}

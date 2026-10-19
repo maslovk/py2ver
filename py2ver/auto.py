@@ -255,6 +255,7 @@ def _traced_code(func: Callable, source: str):
 
 _TABLE_IN = ":in"               # range key of a table function's argument
 WHILE_KEY = "__while__"         # iterations of while loops, as traced
+MAX_WIDER = 16          # a repeated layer's value: at most this many bits wider (repeats.py)
 WEIGHT_TABLES = "__py2ver_weight_tables__"   # (in a namespace) tables that get formats
 _NO_TABLE = {"floor", "ceil"}   # math functions computed exactly
 
@@ -446,8 +447,21 @@ def _profile(func: Callable, samples: List[Any], attr: Dict[str, Dict[str, Any]]
     """Run the float function on the samples (feeding state back like PY_float)
     and return ({name: _Range}, names in order of first assignment, returned names)."""
     ranges: Dict[str, _Range] = {}
+    # (a loop over a model's repeated layers, repeats.py: its values also per turn,
+    # as name@turn)
+    from .repeats import REPEATS_KEY
+    folded = _namespace(func).get(REPEATS_KEY, {})
+    turn_of = {n: v for v, names in folded.items() for n in names}
+    turn: Dict[str, Any] = {}
 
     def record(name: str, value: Any) -> None:
+        if name in folded:
+            turn[name] = int(value)
+        elif name in turn_of and turn_of[name] in turn:
+            keep(f"{name}@{turn[turn_of[name]]}", value)
+        keep(name, value)
+
+    def keep(name: str, value: Any) -> None:
         r = ranges.get(name)
         if r is None:
             r = ranges[name] = _Range()
@@ -608,6 +622,15 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
             ib = max(auto[m][1] for m in members)
             for m in members:
                 auto[m] = (auto[m][0], ib)
+    # A value of a loop over repeated layers (repeats.py): the integer bits of all
+    # of them, the fraction bits of the one with the smallest values (as precise as
+    # each layer's own, written out, would be): this many bits wider
+    wider: Dict[str, int] = {}
+    for name, (r, ib) in auto.items():
+        per = [ranges[k].int_bits() + margin for k in ranges
+               if k.startswith(f"{name}@") and ranges[k].lo <= ranges[k].hi]
+        if per and min(per) < ib:
+            wider[name] = min(ib - min(per), MAX_WIDER)
     bits = {n: int(base.get(n, {}).get("bits", DEFAULT_TABLE_BITS)) for n in auto if n in tables}
 
     def formats(fracs: Dict[str, int]) -> Dict[str, Dict[str, Any]]:
@@ -635,7 +658,7 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
                                                                 params.index(k) if k in params else 0))}
 
     if max_error is None:
-        fracs = {n: width - 1 - ib for n, (_, ib) in auto.items()}
+        fracs = {n: width - 1 - ib + wider.get(n, 0) for n, (_, ib) in auto.items()}
         return formats(fracs)
 
     # max_error: inputs are interface formats, not searched

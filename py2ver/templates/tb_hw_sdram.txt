@@ -7,7 +7,7 @@ from cocotb.triggers import FallingEdge, Timer
 
 # Virtual DE0-Nano with its SDRAM (a model of the chip on the board's pins):
 # the same UART commands as hw_fun() sends: 'W' (words into the SDRAM, acked),
-# 'R' (a sample: its outputs back).
+# 'R' (a sample: its outputs back), 'X' (words read from the SDRAM).
 
 BAUD = {{ baud }}
 BIT_PS = round(1e12 / BAUD)
@@ -66,7 +66,7 @@ async def tb_hw_sdram(dut):
             received.clear()
             for byte in data:
                 await uart_send(dut.GPIO_0_RX, byte)
-            for _ in range({{ wait_bits }}):
+            for _ in range({{ wait_bits }} + 2 * n):
                 if len(received) >= n:
                     break
                 await Timer(BIT_PS * 8, unit="ps")

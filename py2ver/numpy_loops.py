@@ -1790,8 +1790,12 @@ def translate(func: Callable, samples: List[Any]) -> Translation:
             raise NotTranslatable(f"The result {r!r} isn't computed in hardware")
     state_lists = [name for name, _, _, _ in it.state.values()]
     roots = {n for n, _ in outs} | set(state_lists)
-    body = _live(it.code[0], roots) + [ast.Return(value=ret[0] if len(ret) == 1 else
-                                                  ast.Tuple(elts=ret, ctx=ast.Load()))]
+    body = _live(it.code[0], roots)
+    # (identical layers, one after the other: a loop over them)
+    from .repeats import fold_repeats
+    body, merged = fold_repeats(body, ns, set(names))
+    it.tables.update(merged)
+    body += [ast.Return(value=ret[0] if len(ret) == 1 else ast.Tuple(elts=ret, ctx=ast.Load()))]
     gen_name = f"{fn.__name__}_loops"
     params = names + state_lists
     fdef = ast.FunctionDef(name=gen_name, args=ast.arguments(

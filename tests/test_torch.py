@@ -223,6 +223,8 @@ def test_a_tiny_gpt_s_forward_pass_is_built_as_written():
     m.eval()
     xs = [torch.randint(0, 11, (1, 8)) for _ in range(4)]
     tr = numpy_loops.translate(m, xs[:2])          # (logits; the loss None: no result)
+    # (the two blocks' code is one loop over them: their weights one table each)
+    assert "for rep0 in range(2):" in tr.source and "T_Linear_weight_7_all0[rep0 * 432" in tr.source
     with torch.no_grad():
         for x in xs:
             assert np.allclose(tr.func(*tr.adapt(x)), m(x)[0].numpy().ravel(), atol=1e-4)

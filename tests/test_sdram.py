@@ -172,9 +172,82 @@ def test_a_long_input_list_is_written_into_the_sdram(monkeypatch, tmp_path):
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
 
 
+def _wide_list(x):
+    h = [0] * 64
+    for i in range(64):
+        h[i] = x[i % 16] * x[(i * 7) % 16] * (i + 1)
+    s = 0
+    for i in range(64):
+        s = s + h[63 - i] - h[i] // 3
+    t = 0
+    for i in range(64):
+        h[i] = h[i] + i
+        t = t + h[i] * (i % 5)
+    return s, t
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_a_list_of_values_wider_than_a_word_takes_two(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_wide_list, {"x": {"signed": 1, "width": 8, "length": 16}},
+                   sequential=True, sdram=0)
+    # (h's values are 22 bits: two words each, read and written in turn)
+    h = p._fold["sdram"]["lists"]["h"]
+    assert h["meta"]["width"] > 16 and h["words"] == 2
+    r = random.Random(1)
+    vectors = [([r.randint(-128, 127) for _ in range(16)],) for _ in range(3)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+def _returns_a_list(x):
+    h = [0] * 64
+    for i in range(64):
+        h[i] = x[i % 16] * (i + 1)
+    s = 0
+    for i in range(16):
+        s = s + x[i]
+    return s, h
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_a_long_returned_list_is_read_back_from_the_sdram(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_returns_a_list, {"x": {"signed": 1, "width": 8, "length": 16}},
+                   sequential=True, sdram=0)
+    # (h has no ports: each sample's values read from the SDRAM after it, in their
+    # place among the outputs)
+    assert len(p._ext_outputs) == 64 and [q.name for q in p.ir.outputs if q.name == "s"] == ["s"]
+    assert p.output_args_list[:3] == ["s", "h_0", "h_1"]
+    r = random.Random(1)
+    vectors = [([r.randint(-128, 127) for _ in range(16)],) for _ in range(3)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+def _returns_only_a_list(x):
+    h = [0] * 64
+    for i in range(64):
+        h[i] = x[i % 16] - x[(i + 1) % 16]
+    return h
+
+
 @pytest.mark.board
 @pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
-@pytest.mark.parametrize("f, n", [(_with_a_list, 16), (_input_in_the_sdram, 64)])
+@pytest.mark.parametrize("f, n", [(_with_a_list, 16), (_input_in_the_sdram, 64),
+                                  (_returns_a_list, 16), (_returns_only_a_list, 16)])
 def test_the_board_loads_the_sdram_over_its_uart(monkeypatch, tmp_path, f, n):
     # The DE0-Nano's project (UART, the commands, the design, the controller) with
     # a model of the chip on its pins: the tables written with 'W' commands, a

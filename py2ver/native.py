@@ -80,8 +80,10 @@ def mode_of(p) -> Optional[Dict[str, Any]]:
 def testbench(p, mode: Dict[str, Any]) -> str:
     """The Verilog testbench (top py2ver_tb, clocked by its clk input)."""
     ext_in = getattr(p, "_ext_inputs", {})
+    ext_out = getattr(p, "_ext_outputs", {})
     ins = [(n, w) for n, w in zip(p.input_args_list, p.input_args_width_list) if n not in ext_in]
-    outs = list(zip(p.output_args_list, p.output_args_width_list))
+    outs = [(n, w) for n, w in zip(p.output_args_list, p.output_args_width_list)
+            if n not in ext_out]
     iw = max(1, sum(w for _, w in ins))
     ports = {q.name for q in p.ir.inputs}
     lines = ["module py2ver_tb(input clk);",
@@ -120,6 +122,24 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         if ext_in:
             lines.append("  integer fext, e;")
             lines.append("  reg [15:0] word;")
+        if ext_out:
+            # (returned lists in the SDRAM: read from the chip's model at the clock
+            # after a sample, its last write in and the next sample's not yet, a
+            # line a sample)
+            addrs = [ext_out[n] for n in p.output_args_list if n in ext_out]
+            lines += ["  integer fx, ex, dump, ending;",
+                      "  function integer out_addr(input integer e);", "    begin"]
+            for start, base, count in _runs(addrs):
+                lines.append(f"      if (e >= {start} && e < {start + count}) "
+                             f"out_addr = {base} + e - {start};")
+            lines += ["    end", "  endfunction"]
+            dump = ["    if (dump) begin",
+                    "      dump = 0;",
+                    f"      for (ex = 0; ex < {len(addrs)}; ex = ex + 1)",
+                    '        $fwrite(fx, "%h ", __mem.mem[out_addr(ex)]);',
+                    '      $fwrite(fx, "\\n");',
+                    "      if (ending) begin $fclose(fout); $fclose(fx); $finish; end",
+                    "    end"]
     if "vout" in {q.name for q in p.ir.outputs}:
         conns.append(".vout(vout)")
     # (a port a line: Verilator reads at most 20000 tokens a line)
@@ -180,6 +200,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         "  initial begin",
         '    fin = $fopen("vectors.hex", "r");',
         *(['    fext = $fopen("inputs.hex", "r");'] if ext_in else []),
+        *(['    fx = $fopen("outputs_ext.hex", "w"); dump = 0; ending = 0;'] if ext_out else []),
         '    fout = $fopen("outputs.hex", "w");',
         '    if (!$value$plusargs("n=%d", total)) total = 0;',
         "    n = total; k = 0; c = 0; cur = 0; nxt = 0;",
@@ -194,6 +215,8 @@ def testbench(p, mode: Dict[str, Any]) -> str:
     if kind in ("comb", "pipeline"):
         lines.append("    next_vector; cur = nxt;")
     lines += ["  end", "  always @(posedge clk) begin"]
+    if ext_out:
+        lines += dump
     if kind == "comb":
         # A vector per clock; outputs settle in the clock it is applied in
         lines += [f"    {write}",
@@ -225,10 +248,12 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         else:
             # Each sample holds its inputs for P clocks; outputs are read in the last
             # (with the SDRAM: P clocks the design advanced in)
+            done = ("        dump = 1; if (c > total) ending = 1;" if ext_out
+                    else "        if (c > total) begin $fclose(fout); $finish; end")
             lines += [f"      if ({'adv && ' if sdram else ''}k == {P - 1}) begin",
                       f"        {write}",
                       "        k = 0; c = c + 1;",
-                      "        if (c > total) begin $fclose(fout); $finish; end",
+                      done,
                       "        next_vector; cur <= nxt;",
                       f"      end else{' if (adv)' if sdram else ''} k = k + 1;"]
         lines.append("    end")
@@ -370,12 +395,21 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
     else:
         _run(["obj/Vpy2ver_tb", arg], d)
     rows = []
-    names = list(p.output_args_list)
-    for line in out.read_text().split("\n"):
-        if line.strip():
+    ext_out = getattr(p, "_ext_outputs", {})
+    names = [n for n in p.output_args_list if n not in ext_out]
+    for line in out.read_text().split("\n")[:len(vectors)]:
+        if line.strip() or ext_out:              # (no ports left: an empty line a sample)
             vals = line.split()
             rows.append({n: int(v, 16) if "x" not in v.lower() and "z" not in v.lower() else 0
                          for n, v in zip(names, vals)})
+    if ext_out:                                # (the returned lists in the SDRAM)
+        widths = dict(zip(p.output_args_list, p.output_args_width_list))
+        names = [n for n in p.output_args_list if n in ext_out]
+        lines = [x for x in (d / "outputs_ext.hex").read_text().split("\n") if x.strip()]
+        for row, line in zip(rows, lines):
+            for n, v in zip(names, line.split()):
+                ok = "x" not in v.lower() and "z" not in v.lower()
+                row[n] = (int(v, 16) if ok else 0) & ((1 << widths[n]) - 1)
     return rows
 
 

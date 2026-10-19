@@ -8,22 +8,24 @@
 # weights 0), the MLP's GELU a table, and the residual connections sums. The
 # output layer shares the token embedding's matrix (weight tying): one table.
 # The 1.8 million weights are ROMs, the loops a small state machine
-# (sequencer.py); formats are chosen from 12 windows of the text (16 bits,
-# rounded, room for values twice as large: margin=2), the exp and GELU tables
-# 16,384 entries each (attention's scores spread over 50 units).
+# (sequencer.py); the four blocks, the same code with their own weights, are
+# one loop over them (repeats.py). Formats are chosen from 12 windows of the
+# text (16 bits, rounded, room for values twice as large: margin=2), the exp
+# and GELU tables 16,384 entries each (attention's scores spread over 50 units).
 #
 # The model is tiny_gpt.py's saved tiny_gpt.pt (run that script first, e.g.
 # python tiny_gpt.py --steps 300), or, if there is none, the model trained for
 # 300 steps here by its own main(). The weights are 29 Mbit at 16 bits, more
-# than the DE0-Nano's block RAM, so this one is for simulation: the bit-exact
-# model gives the next character's scores for a 128-character window, and
-# writes text with them one character at a time, as TinyGPT.generate does
-# with torch's. (Simulating the hardware itself, --sim, doesn't work yet at
-# this size; the tests simulate a small GPT.)
+# than the DE0-Nano's block RAM: with --sdram they are in its SDRAM (and the
+# window and the scores too), and the design fits the board (p.SYN(...),
+# p.HW(...)). The bit-exact model gives the next character's scores for a
+# 128-character window, and writes text with them one character at a time,
+# as TinyGPT.generate does with torch's.
 #
 #   python examples/tiny_gpt_hardware.py               # build, compare with torch, write 20 characters
 #   python examples/tiny_gpt_hardware.py --chars 200   # more text
-#   python examples/tiny_gpt_hardware.py --sim         # + one window simulated (crashes for now)
+#   python examples/tiny_gpt_hardware.py --sdram       # built for the board (weights in the SDRAM)
+#   python examples/tiny_gpt_hardware.py --sim         # + one window simulated (hours at this size)
 import contextlib
 import io
 import os
@@ -78,7 +80,8 @@ if __name__ == "__main__":
     with contextlib.redirect_stdout(io.StringIO()):
         lanes = arg("--lanes", 1)
         p = Py2ver(model, samples=samples, width=16, round=True, margin=2, multipliers=lanes,
-                   attr={"np.exp": {"bits": 14}, "__py2ver_gelu": {"bits": 14}})
+                   attr={"np.exp": {"bits": 14}, "__py2ver_gelu": {"bits": 14}},
+                   **({"sdram": True} if "--sdram" in sys.argv[1:] else {}))
     print(f"hardware: built in {time.time() - t:.0f} s, {p.ram_phases:,} clocks per window of {T} "
           f"characters ({p.ram_phases / 50e6:.1f} s at 50 MHz)")
 

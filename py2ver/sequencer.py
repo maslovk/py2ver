@@ -250,7 +250,8 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
     within budget bits. Each gets an address range in a bank (the banks taken in
     turn, so a product's two operands keep two rows open), its words
     SDRAM_WIDTH bits: {'lists': {name: info}, 'tables': {entries: info}}, info
-    {'base', 'length', 'meta', 'init' (the values it starts with, or None)}.
+    {'base', 'length', 'meta', 'init' (the values it starts with, or None),
+    'words' (a value's words: 2 for a list of values up to twice as wide)}.
     """
     budget = DE0_NANO_BITS if budget is True else int(budget)
     items = []
@@ -278,43 +279,44 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
     for kind, key, n, meta, init in items:
         if total <= budget:
             break
-        if int(meta["width"]) > SDRAM_WIDTH:
+        words = -(-int(meta["width"]) // SDRAM_WIDTH)
+        if words > 2 or (words > 1 and (kind == "table" or init is not None)):
             raise NotSequenceable(f"{'A table' if kind == 'table' else repr(key)} of "
                                   f"{meta['width']}-bit values can't be in the SDRAM "
                                   f"({SDRAM_WIDTH}-bit words); use width={SDRAM_WIDTH}")
         bank = k % 4
         k += 1
-        if free[bank] + n > SDRAM_BANK_WORDS:
+        if free[bank] + n * words > SDRAM_BANK_WORDS:
             raise NotSequenceable("The lists don't fit the SDRAM")
-        info = {"base": (bank << 22) | free[bank], "length": n, "meta": meta, "init": init}
-        free[bank] += -(-n // 512) * 512                  # (each from a row's start)
+        info = {"base": (bank << 22) | free[bank], "length": n, "meta": meta, "init": init,
+                "words": words}
+        free[bank] += -(-n * words // 512) * 512          # (each from a row's start)
         out["lists" if kind == "list" else "tables"][key] = info
         total -= n * int(meta["width"])
     return out
 
 
-def _external_inputs(ext: Dict[str, Any], inputs: Set[str], fmt, lengths: Dict[str, int]) -> None:
-    """Input lists long enough to be ports by the hundred (INPUT_ARRAY_MIN) go to the
-    SDRAM too: written there before each sample (by the testbench, by the board's
-    loader), read like its other lists."""
-    from .visitor import INPUT_ARRAY_MIN
+def _external_ports(ext: Dict[str, Any], names: Set[str], kind: str, fmt,
+                    lengths: Dict[str, int]) -> None:
+    """Lists that would be ports by the hundred (INPUT_ARRAY_MIN values) go to the
+    SDRAM too: an input's values written there before each sample (by the
+    testbench, by the board's loader) and read like its other lists; a returned
+    list's written there and read back after (kind: 'input' or 'output')."""
     top = [0, 0, 0, 0]
-    for kind in ("lists", "tables"):
-        for info in ext[kind].values():
+    for what in ("lists", "tables"):
+        for info in ext[what].values():
             b = info["base"] >> 22
             top[b] = max(top[b], (info["base"] & (SDRAM_BANK_WORDS - 1))
                          + -(-info["length"] // 512) * 512)
-    for a in sorted(inputs):
-        n = lengths.get(a, 0)
-        if n < INPUT_ARRAY_MIN:
-            continue
+    for a in sorted(names):
+        n = lengths[a]
         meta = fmt(a)
         if int(meta["width"]) > SDRAM_WIDTH:
-            raise NotSequenceable(f"The input {a!r} of {meta['width']}-bit values can't be in "
+            raise NotSequenceable(f"The {kind} {a!r} of {meta['width']}-bit values can't be in "
                                   f"the SDRAM ({SDRAM_WIDTH}-bit words)")
         bank = min(range(4), key=lambda b: top[b])
         ext["lists"][a] = {"base": (bank << 22) | top[bank], "length": n, "meta": meta,
-                           "init": None, "input": True}
+                           "init": None, kind: True}
         top[bank] += -(-n // 512) * 512
 
 
@@ -666,6 +668,14 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         raise NotSequenceable(f"A memory is returned: {sorted(returned & set(memories))}")
     rams = {name for name, n in sq.lists.items()
             if n >= RAM_MIN and name not in inputs and name not in returned}
+    # (sdram=: a long list returned as it is goes to the SDRAM too, no ports: read
+    # back from there after each sample)
+    from .visitor import INPUT_ARRAY_MIN
+    ret_vals = ret.value.elts if isinstance(ret.value, ast.Tuple) else [ret.value]
+    ext_outputs = ({v.id for v in ret_vals if isinstance(v, ast.Name) and v.id not in inputs
+                    and v.id not in memories and sq.lists.get(v.id, 0) >= INPUT_ARRAY_MIN}
+                   if sdram is not None and sdram is not False else set())
+    rams |= ext_outputs
     reg_lists = {name for name in sq.lists if name not in rams and name not in inputs}
     # A list in block RAM made by [c] * n: filled by a loop, unless the loop after
     # it writes every element before anything reads it
@@ -693,10 +703,12 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         return dict(_fmt_of(r), type="wire")
 
     # ----- lists and tables in the SDRAM (sdram=): the largest, until the rest fits
-    ext = (_external(program, rams, fmt, attr, memories, sdram, sq.lists)
+    ext = (_external(program, rams - ext_outputs, fmt, attr, memories, sdram, sq.lists)
            if sdram is not None and sdram is not False else None)
     if ext is not None:
-        _external_inputs(ext, inputs, fmt, sq.lists)
+        _external_ports(ext, {a for a in inputs if sq.lists.get(a, 0) >= INPUT_ARRAY_MIN},
+                        "input", fmt, sq.lists)
+        _external_ports(ext, ext_outputs, "output", fmt, sq.lists)
 
     # ----- the clocks of each block: read levels, then writes
     from .sequencer_blocks import BlockCode
@@ -834,6 +846,26 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
 
     succ = {b.index: after(b) for b in blocks}
     start_state, start_sets = enter(program[0])
+
+    # A block's products (not pipelined: its values are wires) through registers:
+    # they are used a clock after their multipliers (BlockCode.muls), and a
+    # register cuts the path there
+    for code in codes.values():
+        if code.pipe is not None or not code.muls:
+            continue
+        ranges = dict(known)
+        try:
+            for s in code.out:
+                ranges[s.targets[0].id] = _interval(s.value, ranges, attr)
+        except NotShareable:
+            continue
+        held = {m: sq.fresh(f"r_{m}") for m in sorted(code.muls)}
+
+        class _Held(ast.NodeTransformer):
+            def visit_Name(self, x: ast.Name):
+                return ast.Name(id=held[x.id], ctx=x.ctx) if x.id in held else x
+        code.out = [s if s.targets[0].id in held else _Held().visit(s) for s in code.out]
+        code.held = {held[m]: (m, dict(_fmt_of(ranges[m]), type="wire")) for m in held}
 
     # How many times each block runs, and the clocks of a sample
     phases = clocks_per_sample() + 1

@@ -441,9 +441,19 @@ machine runs the program a step at a time, for designs far too big to unroll
 - a block takes a few clocks: block-RAM and ROM reads give their values a
   clock after their address, so they are issued level by level (a read whose
   address needs another read waits for it); then everything is computed, and
-  the registers and the RAMs written (one write per RAM per clock). A division
-  by a variable takes a clock per quotient bit, an exact square root (see
-  below) a clock per two bits of its argument
+  the registers and the RAMs written (one write per RAM per clock). A product
+  of two computed values gets a register after its multiplier (a clock later:
+  two multipliers in a row don't make 50 MHz). A division by a variable takes
+  a clock per quotient bit, an exact square root (see below) a clock per two
+  bits of its argument
+- identical layers one after the other (a Transformer's blocks: the same code,
+  each with its own weights) are one loop over them, the hardware of one
+  layer: each layer's weight tables are one table, read at the layer's part,
+  and the lists the next layer reads (its input) copied at the end of each
+  turn. A value in it gets the integer bits of all the layers and the fraction
+  bits of the one with the smallest values (its formats are chosen per layer:
+  as precise as each written out, a few bits wider). `PY2VER_FOLD=0` keeps
+  the layers written out
 - a list in block RAM made by `[0] * n` is filled by a loop, unless the loop
   after it writes every element before anything reads it
 - an innermost loop whose body is one block is pipelined: an iteration
@@ -479,7 +489,7 @@ machine runs the program a step at a time, for designs far too big to unroll
 - `sdram=True` (or a number of bits) puts the largest lists and tables in the
   DE0-Nano's SDRAM until the rest fits its block RAM: the module gets the
   SDRAM's pins and a controller (`templates/hw/sdram`), one access a clock,
-  a read's data 5 clocks after its address, and its clock enable stops while
+  a read's data 6 clocks after its address, and its clock enable stops while
   the SDRAM opens a row or refreshes. A pipelined loop starts an iteration
   every as many clocks as it makes SDRAM accesses, each on its own clock (a
   product of two lists in the SDRAM: a multiply-accumulate every 2 clocks).
@@ -488,7 +498,10 @@ machine runs the program a step at a time, for designs far too big to unroll
   39,015,936 clocks an image (0.78 s at 50 MHz; 19.7 million all in block
   RAM), simulated in Verilator as its bit-exact model. An input list of 64
   values or more is in the SDRAM too (no ports: each sample's values are
-  written there before it runs). `SYN()` gives the SDRAM's pins their
+  written there before it runs), and so is a returned list of 64 values or
+  more (no ports either: read back after each sample, in its place among the
+  outputs). A list of values up to 32 bits wide takes two words each (two
+  accesses). `SYN()` gives the SDRAM's pins their
   DE0-Nano places and timing: the MNIST network fits the EP4CE22, 7,002
   logic elements (31 %), 297 kbit of block RAM (49 %), 16 multipliers, 56 MHz
   (timing met at 50 MHz). `HW()` and `HW_sim()` load the SDRAM over the
@@ -997,13 +1010,20 @@ checked against torch. `examples/tiny_gpt_hardware.py` builds the model
 |---|---|
 | scores against torch's | within 0.158 (mean 0.011) |
 | the likeliest next character | torch's at 99.5 % of the positions |
-| per window | 269,648,258 clocks: 5.4 s at 50 MHz |
+| per window | 271,157,254 clocks: 5.4 s at 50 MHz |
+| per window, `--sdram` (for the board) | 804,523,929 clocks: 16.1 s at 50 MHz |
 
-It builds in about 4 minutes, and the bit-exact model runs a window in 13 s,
-so the example also writes text with the hardware's scores, a character at a
-time. The small GPT of the tests is simulated (Verilog), the same as its
-model; the full one's simulation (a 7 MB design, 270 million clocks) doesn't
-run yet: it crashes in the simulation step.
+The four blocks are one loop over them (identical layers, see "Sequenced
+loops"), their values a few bits wider than 16 where the layers' ranges
+differ. It builds in about 2 minutes, and the bit-exact model runs a window in
+7 s, so the example also writes text with the hardware's scores, a character
+at a time. With `--sdram` the weights (29 Mbit), the window and the scores are
+in the SDRAM, the activations too (values wider than 16 bits in two words),
+and the DE0-Nano's whole project (UART commands, the design, the SDRAM's
+controller) fits the EP4CE22 and meets 50 MHz: 12,549 logic elements (56 %),
+5,228 registers, 272 kbit of block RAM (45 %), 69 of 132 9-bit multipliers.
+The small GPT of the tests is simulated (Verilog), with and without the
+SDRAM, the same as its model. (Not yet run on a real board.)
 
 ### Simulation speed (Icarus, Verilator)
 
@@ -1115,11 +1135,13 @@ With `sdram=` the board project has a small command set on the UART instead:
 `'W'`, a 3-byte address, a 3-byte count and that many 16-bit words (high byte
 first) writes them into the SDRAM, and the board answers `'W'`; `'R'` and the
 sample's port inputs runs a sample (the design pausing whenever the SDRAM is
-busy) and sends its outputs back. `HW()` writes the tables once, on its first
+busy) and sends its outputs back (a byte at least); `'X'`, an address and a
+count reads that many words back (the returned lists in the SDRAM). `HW()`
+writes the tables once, on its first
 call (the MNIST network's 16 Mbit: about 3 minutes at 115200 baud; this
 board project is built for `UART_BAUD`, so a faster serial adapter helps),
 then for each sample its input lists
-in the SDRAM and `'R'`. `HW_sim()` runs the same bytes against the project
+in the SDRAM, `'R'` and `'X'`. `HW_sim()` runs the same bytes against the project
 with a model of the SDRAM chip on its pins. (Checked in simulation and
 compiled by Quartus; not yet run on a real board.)
 

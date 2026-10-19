@@ -475,6 +475,7 @@ class Py2ver:
         self.output_args_list = [p.name for p in ir.outputs if p.kind != "vout"]
         self.input_args_width_list = [p.width for p in args_in]
         self.output_args_width_list = [p.width for p in ir.outputs if p.kind != "vout"]
+        self._ext_outputs = self._sdram_outputs(f_visitor.attr)
         self._has_vin = any(p.kind == "vin" for p in ir.inputs)
 
         # Fixed-point parameters (meta) and outputs (fraction bits): the API
@@ -687,7 +688,10 @@ class Py2ver:
         # A folded loop: its phase is the phase counter, its carried values are
         # registers loaded every clock
         if self._fold:
-            assigns.append(Assignment(left=fold["phase"], right="__phase"))
+            # (a state machine only asks whether it is the sample's first clock: a
+            # register says so, not a compare of the counter on its paths)
+            assigns.append(Assignment(left=fold["phase"], right="__phase_nz" if self._sequenced
+                                      else "__phase"))
             for reg, nxt in fold["regs"].items():
                 init = fold.get("reg_init", {}).get(reg, 0)
                 if init:                          # (a memory kept in registers: its 'init')
@@ -744,9 +748,10 @@ class Py2ver:
                    ("output", 1, "dram_cke"), ("output", 1, "dram_clk"), ("output", 1, "dram_cs_n"),
                    ("inout", 16, "dram_dq"), ("output", 2, "dram_dqm"), ("output", 1, "dram_ras_n"),
                    ("output", 1, "dram_we_n"), ("output", 1, "adv"),
-                   # (the host's port: writes into the SDRAM while the design is paused)
-                   ("input", 1, "host_req"), ("input", 24, "host_addr"), ("input", 16, "host_wdata"),
-                   ("output", 1, "host_ready")]
+                   # (the host's port: reads and writes while the design is paused)
+                   ("input", 1, "host_req"), ("input", 1, "host_we"), ("input", 24, "host_addr"),
+                   ("input", 16, "host_wdata"), ("output", 1, "host_ready"),
+                   ("output", 1, "host_rvalid"), ("output", 16, "host_rdata")]
 
     @staticmethod
     def _sdram_items(sdram: Dict[str, Any]) -> List[str]:
@@ -766,32 +771,49 @@ class Py2ver:
             "wire ce = ce_in && !__ext_stall;",
             "assign adv = ce;",
             "assign dram_clk = ~clk;",
-            "// (the host writes through it while the design is paused: ce_in low)",
+            "// (the host reads and writes through it while the design is paused: ce_in low)",
             "wire __host = !ce_in;",
             "assign host_ready = __host && __ext_init && __ext_ready;",
-            "py2ver_sdram __sdram(.clk(clk), .rst(rst),",
-            "    .req((__host ? host_req : ext_req) && __ext_init),",
-            "    .we(__host ? 1'b1 : ext_we), .addr(__host ? host_addr : ext_addr),",
+            "wire __req = (__host ? host_req : ext_req) && __ext_init;",
+            "wire __we = __host ? host_we : ext_we;",
+            "py2ver_sdram __sdram(.clk(clk), .rst(rst), .req(__req),",
+            "    .we(__we), .addr(__host ? host_addr : ext_addr),",
             "    .wdata(__host ? host_wdata : ext_wdata), .ready(__ext_ready),",
             "    .rvalid(__ext_rvalid), .rdata(__ext_rdata), .init_done(__ext_init),",
             "    .sa(dram_addr), .ba(dram_ba), .cs_n(dram_cs_n), .ras_n(dram_ras_n),",
             "    .cas_n(dram_cas_n), .we_n(dram_we_n), .cke(dram_cke), .dqm(dram_dqm), .dq(dram_dq));",
-            f"// A read's data, in order, taken {L} advancing clocks after its address",
+            f"// A read's data, in order, on ext_q {L} advancing clocks after its address",
+            "// (a register: taken from the FIFO the clock before)",
+            "// (a read's data for whoever issued it: the design's into the FIFO)",
             "reg [15:0] __ext_fifo [0:7];",
             "reg [2:0] __ext_wp, __ext_rp;",
             f"reg [{L - 1}:0] __ext_due;",
-            "wire [15:0] ext_q = __ext_fifo[__ext_rp];",
+            "reg [15:0] ext_q;",
+            "reg __tag [0:7];",
+            "reg [2:0] __tag_wp, __tag_rp;",
+            "wire __for_host = __tag[__tag_rp];",
+            "assign host_rvalid = __ext_rvalid && __for_host;",
+            "assign host_rdata = __ext_rdata;",
             "always @(posedge clk) begin",
             "  if (rst) begin",
             "    __ext_wp <= 3'd0; __ext_rp <= 3'd0; __ext_due <= 0;",
+            "    __tag_wp <= 3'd0; __tag_rp <= 3'd0;",
             "  end else begin",
-            "    if (__ext_rvalid) begin",
+            "    if (__req && __ext_ready && !__we) begin",
+            "      __tag[__tag_wp] <= __host;",
+            "      __tag_wp <= __tag_wp + 3'd1;",
+            "    end",
+            "    if (__ext_rvalid) __tag_rp <= __tag_rp + 3'd1;",
+            "    if (__ext_rvalid && !__for_host) begin",
             "      __ext_fifo[__ext_wp] <= __ext_rdata;",
             "      __ext_wp <= __ext_wp + 3'd1;",
             "    end",
             "    if (ce) begin",
             f"      __ext_due <= {{__ext_due[{L - 2}:0], ext_req && !ext_we}};",
-            f"      if (__ext_due[{L - 1}]) __ext_rp <= __ext_rp + 3'd1;",
+            f"      if (__ext_due[{L - 2}]) begin",
+            "        ext_q <= __ext_fifo[__ext_rp];",
+            "        __ext_rp <= __ext_rp + 3'd1;",
+            "      end",
             "    end",
             "  end",
             "end",
@@ -858,7 +880,18 @@ class Py2ver:
             f"  if (rst) __phase <= {pb}'d0;",
             f"  else if (ce) __phase <= (__phase == {pb}'d{P - 1}) ? {pb}'d0 : __phase + {pb}'d1;",
             "end",
-        ]
+        ] + ([
+            "// (not the sample's first clock: __phase != 0, a register)",
+            "reg __phase_nz;",
+            "always @(posedge clk) begin",
+            "  if (rst) __phase_nz <= 1'b0;",
+            f"  else if (ce) __phase_nz <= (__phase != {pb}'d{P - 1});",
+            "end",
+        ] if self._sequenced else [])
+
+    @property
+    def _sequenced(self) -> bool:
+        return bool(self._fold) and self._fold.get("loop") == "(sequenced)"
 
     @staticmethod
     def _rom_arrays(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],
@@ -1350,16 +1383,16 @@ class Py2ver:
         steps = self._sdram_steps(self._input_vector(tuple(in_arg)), first)
         try:
             with serial.Serial(port, baudrate=baud, timeout=max(timeout, 30.0)) as ser:
-                reply = b""
+                replies = []
                 for data, n in steps:
                     ser.write(data)
                     ser.flush()
-                    reply = ser.read(n)
-                    if len(reply) != n:
+                    replies.append(ser.read(n))
+                    if len(replies[-1]) != n:
                         return self._hw_unavailable(
-                            f"UART: expected {n} byte(s), got {len(reply)}", *in_arg)
+                            f"UART: expected {n} byte(s), got {len(replies[-1])}", *in_arg)
                 self._sdram_loaded = True
-                return self._unpack_outputs(reply)
+                return self._sdram_results(replies)
         except (OSError, serial.SerialException) as e:
             return self._hw_unavailable(f"UART communication failed ({e})", *in_arg)
 
@@ -1445,11 +1478,11 @@ class Py2ver:
         outs = []
         for vec, steps, reply in zip(vectors, samples, replies):
             want = [n for _, n in steps]
-            acks_ok = all(r == [0x57] for r in reply[:-1])
+            acks_ok = all(r == [0x57] for (d, _), r in zip(steps, reply) if d[0] == 0x57)
             if [len(r) for r in reply] != want or not acks_ok:
                 raise RuntimeError(f"Virtual board replies for {vec}: expected {want} bytes "
-                                   f"('W' acks, then the outputs), got {reply}")
-            outs.append(self._unpack_outputs(bytes(reply[-1])))
+                                   f"('W' acks, the outputs, the returned lists), got {reply}")
+            outs.append(self._sdram_results([bytes(r) for r in reply]))
         return outs
 
     def gen_hw_project(self, baud: int = DEFAULT_BAUD_RATE) -> Path:
@@ -1939,6 +1972,35 @@ class Py2ver:
         return [(n, w) for n, w in zip(self.input_args_list, self.input_args_width_list)
                 if n not in ext]
 
+    def _sdram_outputs(self, attr: Dict[str, Any]) -> Dict[str, int]:
+        """sdram=: a returned list in the SDRAM has no ports; its values take their
+        place among the outputs (output_args_list) all the same, in the return's
+        order. {port: its SDRAM address}."""
+        sd = (self._fold or {}).get("sdram") or {}
+        returns = sd.get("returns", ())
+        if not any(name for name, _ in returns):
+            return {}
+        ext: Dict[str, int] = {}
+        ports = list(zip(self.output_args_list, self.output_args_width_list))
+        merged, at = [], 0
+        for name, count in returns:
+            if name is None:
+                merged += ports[at:at + count]
+                at += count
+                continue
+            info = sd["lists"][name]
+            w, sgn = int(info["meta"]["width"]), int(info["meta"]["signed"])
+            for i in range(count):
+                port = f"{name}_{i}"
+                merged.append((port, w))
+                ext[port] = int(info["base"]) + i
+                attr.setdefault(port, {"signed": sgn, "width": w})
+        if at != len(ports):
+            raise RuntimeError(f"The outputs don't match the return: {at} of {len(ports)} ports")
+        self.output_args_list = [n for n, _ in merged]
+        self.output_args_width_list = [w for _, w in merged]
+        return ext
+
     def _sdram_board(self, baud: int) -> Dict[str, Any]:
         """The SDRAM board top's template context."""
         ins, lo = [], 0
@@ -1946,9 +2008,11 @@ class Py2ver:
             ins.append({"name": n, "width": w, "lo": lo})
             lo += (w + 7) // 8 * 8
         outs = [{"name": n, "width": w, "seg": (w + 7) // 8 * 8}
-                for n, w in zip(self.output_args_list, self.output_args_width_list)]
+                for n, w in zip(self.output_args_list, self.output_args_width_list)
+                if n not in self._ext_outputs]
+        # (a reply to 'R' of a byte at least: the sample done, its lists ready to read)
         return {"core": self.t_name, "inputs": ins, "outputs": outs, "rx_bytes": lo // 8,
-                "tx_bytes": sum(o["seg"] for o in outs) // 8, "phases": int(self.ram_phases),
+                "tx_bytes": max(1, sum(o["seg"] for o in outs) // 8), "phases": int(self.ram_phases),
                 "baud": int(baud)}
 
     def _sdram_steps(self, vec: Tuple[int, ...], first: bool) -> List[Tuple[bytes, int]]:
@@ -1979,7 +2043,35 @@ class Py2ver:
                 acc |= (int(vec[i]) & ((1 << w) - 1)) << off
                 off += (w + 7) // 8 * 8
         steps.append((b"R" + acc.to_bytes(off // 8, "little"), self._sdram_board(0)["tx_bytes"]))
+        for base, count in self._sdram_reads():                 # (the returned lists)
+            steps.append((b"X" + base.to_bytes(3, "big") + count.to_bytes(3, "big"), 2 * count))
         return steps
+
+    def _sdram_reads(self) -> List[Tuple[int, int]]:
+        """(address, words) of the 'X' reads of a sample's returned lists in the SDRAM."""
+        from .native import _runs
+        addrs = [self._ext_outputs[n] for n in self.output_args_list if n in self._ext_outputs]
+        return [(base + at, min(4096, count - at)) for _, base, count in _runs(addrs)
+                for at in range(0, count, 4096)]
+
+    def _sdram_results(self, replies: List[bytes]) -> Tuple[int, ...]:
+        """A sample's outputs from the board's replies to its steps: the ports' from
+        'R' (the UART's segments), the returned lists' from the 'X' reads after it."""
+        nx = len(self._sdram_reads())
+        acc = int.from_bytes(replies[len(replies) - 1 - nx], "little")
+        words = b"".join(replies[len(replies) - nx:])
+        values: Dict[str, int] = {}
+        off = 0
+        ext = [n for n in self.output_args_list if n in self._ext_outputs]
+        for n, w in zip(self.output_args_list, self.output_args_width_list):
+            if n not in self._ext_outputs:
+                values[n] = (acc >> off) & ((1 << w) - 1)
+                off += (w + 7) // 8 * 8
+        widths = dict(zip(self.output_args_list, self.output_args_width_list))
+        for i, n in enumerate(ext):
+            values[n] = int.from_bytes(words[2 * i:2 * i + 2], "big") & ((1 << widths[n]) - 1)
+        return tuple(self.tosigned(values[n], widths[n]) if self.attr.get(n, {}).get("signed") == 1
+                     else values[n] for n in self.output_args_list)
 
     def _syn_sdram(self, project_dir: Path, wrapper: str) -> None:
         """A design with the SDRAM: its pins where the DE0-Nano has them, and the
