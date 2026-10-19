@@ -411,13 +411,15 @@ def exact_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]]) -> Tuple[ModuleIR, D
             log.warning("Leaving '%s = %s' as is: %s", a.left, a.right, e)
             tree = None
         if tree is None:
-            assigns.append(Assignment(a.left, a.right.replace(" // ", " / "), a.is_reg))
+            assigns.append(Assignment(a.left, a.right.replace(" // ", " / "), a.is_reg, a.line))
             continue
         em = _Emitter(a.left, meta)
         rhs = em.value(tree)
         attr.update(em.temp_attr)
+        for t in em.temps:
+            t.line = a.line
         assigns.extend(em.temps)
-        assigns.append(Assignment(a.left, rhs, a.is_reg))
+        assigns.append(Assignment(a.left, rhs, a.is_reg, a.line))
         views |= em.views
 
     view_assigns = []

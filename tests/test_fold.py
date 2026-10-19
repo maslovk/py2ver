@@ -79,7 +79,7 @@ _rng = random.Random(0)
 
 
 def _multiplies(p):
-    text = (p.outdir / "hdl" / "main.v").read_text()
+    text = re.sub(r"//.*", "", (p.outdir / "hdl" / "main.v").read_text())   # (not the comments)
     return len(re.findall(r" \* (?!\(?-?\d+\b)", text))      # not by a literal number
 
 

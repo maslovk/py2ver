@@ -72,6 +72,19 @@ BINOP_TOKENS = {
 # ------------------------------------------------------------
 _IDENT = re.compile(r"(?<![\w'$])[A-Za-z_]\w*")      # (names in an expression; not 8'sd5's sd5)
 
+def _at_line(method):
+    """Assignments made while visiting the statement come from its line."""
+    @functools.wraps(method)
+    def visit(self, node, *args, **kwargs):
+        outer = self._line
+        self._line = getattr(node, "lineno", None) or outer
+        try:
+            return method(self, node, *args, **kwargs)
+        finally:
+            self._line = outer
+    return visit
+
+
 class FunctionVisitor(ast.NodeVisitor):
     def __init__(self, attr: Dict[str, Any], indentsize: int = 2):
         self.attr = normalize_attr(attr)
@@ -112,6 +125,7 @@ class FunctionVisitor(ast.NodeVisitor):
         self._rams: Dict[str, Dict[str, Any]] = {}
         self.ram_ports: Dict[str, Dict[str, str | None]] = {}
         self._tmp_count = 0
+        self._line: int | None = None      # the Python line being translated
         self._ssa: Dict[str, str] = {}
         self._ssa_count: Dict[str, int] = {}
         # Tables of at least rom_min constants become ROM reads: the read's signal ->
@@ -189,7 +203,7 @@ class FunctionVisitor(ast.NodeVisitor):
         value = self._fold(rhs)
         if value is not None and not is_reg:
             self._const_of[name] = value
-        self.assigns.append(Assignment(left=name, right=rhs, is_reg=is_reg))
+        self.assigns.append(Assignment(left=name, right=rhs, is_reg=is_reg, line=self._line))
         return name
 
     def _temp(self, rhs: str) -> str:
@@ -532,6 +546,7 @@ class FunctionVisitor(ast.NodeVisitor):
                                     address_bits=max(1, (n - 1).bit_length()))
         return name
 
+    @_at_line
     def visit_Expr(self, node: ast.Expr):
         if isinstance(node.value, ast.Constant):
             return None                      # docstring / bare constant
@@ -561,6 +576,7 @@ class FunctionVisitor(ast.NodeVisitor):
                 left=first if a.left == var else a.left,
                 right=ident.sub(first, a.right),
                 is_reg=a.is_reg,
+                line=a.line,
             )
         if var in self.attr:
             self.attr[first] = dict(self.attr[var])
@@ -766,6 +782,7 @@ class FunctionVisitor(ast.NodeVisitor):
 
         # body
         for item in node.body:
+            self._line = getattr(item, "lineno", None)       # (a return's outputs: its line)
             # skip docstrings or bare expression statements
             if isinstance(item, ast.Expr):
                 self.visit_Expr(item)
@@ -1084,6 +1101,7 @@ class FunctionVisitor(ast.NodeVisitor):
         raise NotImplementedError("List literals are not supported")
 
     # ---- for-loops ----
+    @_at_line
     def visit_For(self, node: ast.For):
         """
         Unroll `for <var> in range(...)`. Assignments in the body create new
@@ -1142,6 +1160,7 @@ class FunctionVisitor(ast.NodeVisitor):
             self._name_env_stack.pop()
 
     # ---- assignments ----
+    @_at_line
     def _visit_assign(self, node: ast.Assign):
         for tgt in node.targets:
             if isinstance(tgt, ast.Tuple):
@@ -1304,6 +1323,7 @@ class FunctionVisitor(ast.NodeVisitor):
 
         return result_env
 
+    @_at_line
     def _visit_if(self, node: ast.If):
         """
         Lower a restricted if/elif/else (with possible nested ifs) into

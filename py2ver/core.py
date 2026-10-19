@@ -138,6 +138,9 @@ def front_end(func: Callable, attr: Dict[str, Any] | None,
     # The function's own parameters and attr, for running it as written (PY_float)
     fe.py_attr = attr
     fe.py_params = list(inspect.signature(func).parameters)
+    # The source, for comments in the Verilog: its text, first line, file
+    fe.source = (source_foo, getattr(getattr(func, "__code__", None), "co_firstlineno", 1),
+                 inspect.getsourcefile(func) or "")
     def prepare():
         t = inline_helpers(tree, getattr(func, "__globals__", {}))
         # List comprehensions as list literals (their lengths are known now)
@@ -331,6 +334,7 @@ class Py2ver:
         self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
         self._fx_types, self._model = fe.fx_types, fe.model
         self._shapes = fe.shapes             # lists of lists: (rows, ...) per argument
+        self._source = fe.source
         self._complex_names = fe.complex_names
         # Folding: the loop's body runs once per clock (phase) instead of unrolled
         self._fold: Dict[str, Any] | None = None
@@ -523,7 +527,8 @@ class Py2ver:
         sdram_pins = bool(self._fold and self._fold.get("sdram"))
         # pass full attr (with SSA temps) into renderer; with sdram=, the SDRAM's pins
         verilog_text = renderer.render_module(ir, self.attr,
-                                              self.SDRAM_PORTS if sdram_pins else ())
+                                              self.SDRAM_PORTS if sdram_pins else (),
+                                              source=(func.__name__, *self._source))
 
         self.outdir = Path(os.getcwd())
         self.hdl_dir = self.outdir / "hdl"

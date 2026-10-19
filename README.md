@@ -1315,6 +1315,24 @@ comparisons) get exactly-sized intermediate wires (`<name>__t<k>`), and
 unsigned signals are read through signed views (`<name>__s`), so this costs no
 extra hardware. `and`/`or` give 0/1, not Python's operand values.
 
+### Reading the generated Verilog
+
+`hdl/main.v` is laid out to be read: the ports in an ANSI list (`clk`,
+`rst`, `ce` first), declarations aligned in the order the logic assigns them,
+registers updated in `if (rst) ... else if (ce) ...` blocks, and expressions
+with only the parentheses they need. Each Python statement's logic sits under
+a comment quoting it with its line in your file (a helper's logic under its
+call):
+
+```verilog
+// line 30: acc += TAPS[k] * window[k]
+assign acc__v2 = acc__v1__s + 3 * window_0;
+assign acc__v3 = acc__v2 + (-5) * window_1;
+```
+
+A design built with `multipliers=` or `sequential=True` is a schedule rather
+than your statements in order, so it has no such comments.
+
 ### Examples
 
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`

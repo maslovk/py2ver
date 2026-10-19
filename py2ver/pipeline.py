@@ -124,7 +124,7 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
     for y, c in out_c.items():
         attr[c] = _meta(y, attr, ports)
     assigns = [
-        Assignment(out_c.get(a.left, a.left), _rename(a.right, out_c), a.is_reg)
+        Assignment(out_c.get(a.left, a.left), _rename(a.right, out_c), a.is_reg, a.line)
         for a in ir.assigns
     ]
 
@@ -259,7 +259,7 @@ def pipeline_ir(ir: ModuleIR, attr: Dict[str, Dict[str, Any]], stages: int,
                                     int(_meta(idx, attr, ports).get("width", 1)))
             continue
         mapping = {d: _at(d, stage[n]) for d in deps[n] if d not in const}
-        new_assigns.append(Assignment(n, _rename(a.right, mapping), False))
+        new_assigns.append(Assignment(n, _rename(a.right, mapping), False, a.line))
 
     for y, c in out_c.items():
         src = c if c in const else _at(c, stages)

@@ -80,6 +80,11 @@ def regfile_ann(i: U[2], v: U[8], mem: State(Array(U[8], 4), next="mem", init=[1
     return max(mem), mem
 
 
+def _code(path):
+    """The Verilog without its comments (they quote the Python source)."""
+    return "\n".join(line for line in path.read_text().splitlines() if not line.startswith("//"))
+
+
 @pytest.mark.parametrize(
     "annotated, func, attr",
     [(foo_ann, foo_attr, FOO_ATTR), (lpf_ann, lpf_attr, LPF_ATTR), (hist_ann, hist_attr, HIST_ATTR)],
@@ -87,9 +92,9 @@ def regfile_ann(i: U[2], v: U[8], mem: State(Array(U[8], 4), next="mem", init=[1
 def test_annotations_generate_the_same_verilog_as_attr(monkeypatch, tmp_path, annotated, func, attr):
     monkeypatch.chdir(tmp_path)
     Py2ver(func, attr)
-    expected = (tmp_path / "hdl" / "main.v").read_text().replace(func.__name__, "<top>")
+    expected = _code(tmp_path / "hdl" / "main.v").replace(func.__name__, "<top>")
     Py2ver(annotated)
-    got = (tmp_path / "hdl" / "main.v").read_text().replace(annotated.__name__, "<top>")
+    got = _code(tmp_path / "hdl" / "main.v").replace(annotated.__name__, "<top>")
     assert got == expected
 
 

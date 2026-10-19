@@ -119,6 +119,12 @@ class _Inliner:
         out: List[ast.stmt] = []
         for s in stmts:
             pre, s2 = self.stmt(s, locals_)
+            if len(self.stack) == 1:
+                # (a helper's code is at the call's place in the function: its
+                #  line numbers count in the helper's own source)
+                for n in (n for st in pre for n in ast.walk(st)):
+                    if "lineno" in n._attributes:
+                        ast.copy_location(n, s)
             out.extend(pre)
             out.append(s2)
         return out

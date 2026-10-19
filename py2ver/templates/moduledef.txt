@@ -1,5 +1,8 @@
 `timescale 1ns/1ps
 
+{% if header %}
+{{ header }}
+{% endif %}
 module {{ modulename }}{% if paramlist != '' %} #(
 {{ paramlist }}
 ){% endif %} (

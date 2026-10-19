@@ -1,4 +1,5 @@
 # ast_ir.py
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -14,6 +15,7 @@ class Assignment:
     left: str
     right: str
     is_reg: bool = False
+    line: int | None = None     # the line of the Python function it comes from
 
 @dataclass
 class ModuleIR:
