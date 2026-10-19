@@ -309,13 +309,14 @@ def test_an_assert_is_checked_when_translating():
         numpy_loops.translate(Checked(), [torch.randn(1, 4)])
 
 
-def _llama(seed=0):
+def _llama(seed=0, **size):
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
     import mini_llama as L
     torch.manual_seed(seed)
-    cfg = L.Config(vocab_size=13, block_size=8, n_embd=16, n_head=4, n_kv_head=2, n_layer=2)
+    cfg = L.Config(**dict(dict(vocab_size=13, block_size=8, n_embd=16, n_head=4, n_kv_head=2,
+                               n_layer=2), **size))
     m = L.MiniLlama(cfg)
     m.eval()
     return m
@@ -374,6 +375,35 @@ def test_a_mini_llama_trains_as_torch_does():
     tr = numpy_loops.translate(gpt_steps, [(m, batches, opt)])
     labels = {label for label, _, _ in tr.memories.values()}
     assert "Embedding.weight" in labels and "RMSNorm.weight" in labels
+
+
+@pytest.mark.sim
+@pytest.mark.slow
+def test_a_mini_llama_trains_in_fixed_point_and_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    # (smaller than _llama's: a step simulated takes minutes at that size)
+    m = _llama(vocab_size=11, block_size=4, n_embd=8, n_head=2, n_kv_head=1)
+    decay = [p for p in m.parameters() if p.dim() >= 2]
+    no_decay = [p for p in m.parameters() if p.dim() < 2]
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                             {"params": no_decay, "weight_decay": 0.0}], lr=1e-2, betas=(0.9, 0.95))
+    g = torch.Generator().manual_seed(2)
+    batches = [(torch.randint(0, 11, (1, 4), generator=g), torch.randint(0, 11, (1, 4), generator=g))
+               for _ in range(12)]
+    twin = copy.deepcopy((m, opt))
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(gpt_steps, samples=[(m, batches, opt)], width=24, round=True, saturate=True,
+                   margin=2)
+    # (24 bits: the loss of each step and the weights after 12 as torch's float training)
+    totals = [r[0] if isinstance(r, tuple) else r for r in p.PY_stream()(batches)]
+    with p.hardware_random(), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        want = [gpt_steps(twin[0], [b], twin[1]) for b in batches]
+    assert np.abs(np.diff([0.0] + totals) - want).max() < 0.05
+    assert np.abs(np.asarray(p.state_values()[(m.tok_emb, "weight")])
+                  - twin[0].tok_emb.weight.detach().numpy()).max() < 0.05
+    # (a step simulated: the same as the bit-exact model)
+    assert p.TB_stream()(batches[:1]) == p.PY_stream()(batches[:1])
 
 
 @pytest.mark.sim

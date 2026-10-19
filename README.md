@@ -1055,8 +1055,11 @@ saves (4 blocks, 192 wide, 6 query and 2 key/value heads, a 128-token context:
 It builds in about 70 s. `tests/test_torch.py` trains a small one with a loop
 function of the usual shape (dropout, attention's `dropout_p` included, the
 repeated keys and values, the tied embedding, gradient clipping, AdamW with two
-groups), checked against torch, and simulates one (Verilog), the same as its
-model. (Not run in Quartus or on a board.)
+groups), checked against torch; builds that training step in 24-bit fixed
+point (rounded, saturating, `margin=2`: 1.9 million clocks a step), whose loss
+over 12 steps stays within 0.05 of torch's float training and its weights
+too, a step simulated (Verilog) the same as its model; and simulates the
+forward pass, the same as its model. (Not run in Quartus or on a board.)
 
 ### Simulation speed (Icarus, Verilator)
 
@@ -1410,9 +1413,9 @@ marked by what they need, so a quick check after a change doesn't wait for
 everything:
 
 ```
-.venv/bin/python -m pytest -q -n auto -m "not sim and not board"   # no simulator: ~5 s
-.venv/bin/python -m pytest -q -n auto -m "not board and not slow"  # + simulation: ~1 min
-.venv/bin/python -m pytest -q -n auto                              # everything: ~9 min
+.venv/bin/python -m pytest -q -n auto -m "not sim and not board"   # no simulator: ~30 s
+.venv/bin/python -m pytest -q -n auto -m "not board and not slow"  # + simulation: ~2.5 min
+.venv/bin/python -m pytest -q -n auto                              # everything: ~8 min
 .venv/bin/python -m pytest -q -n auto tests/test_share.py          # one feature's tests
 .venv/bin/python -m pytest -q --lf                                 # what failed last time
 QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # + the Quartus tests
