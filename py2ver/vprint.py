@@ -117,7 +117,7 @@ class _Parser:
                 rest.append(self.expr())
             self.take("}")
             return ("cat", rest)
-        if t[0] == "$" and self.peek() == "(":
+        if (t[0] == "$" or t[0].isalpha() or t[0] == "_") and self.peek() == "(":   # (a function)
             self.take()
             args = self.items(")") if self.peek() != ")" else []
             self.take(")")

@@ -28,13 +28,14 @@ from py2ver.vprint import parse, tidy, wrapped
     ("$signed({1'b0, (a)[3 +: 2]})", "$signed({1'b0, a[3 +: 2]})"),
     ("((c) ? ((d) ? (x) : (y)) : (z))", "c ? (d ? x : y) : z"),
     ("(((a) ** (2)) * (b))", "(a ** 2) * b"),
+    ("((table1((i))) * (w))", "table1(i) * w"),
 ])
 def test_tidy(text, expected):
     assert tidy(text) == expected
 
 
 def test_unparsable_text_is_kept():
-    for text in ("a + * b", "x[", "fn(a)", "a /* c */ + b"):
+    for text in ("a + * b", "x[", "fn(a", "a /* c */ + b"):
         assert tidy(text) == text
 
 

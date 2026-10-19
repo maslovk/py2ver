@@ -900,11 +900,13 @@ class Py2ver:
                     attr: Dict[str, Dict[str, Any]]) -> ModuleIR:
         """Table reads still in the assignments (not block RAM) as arrays read by
         their index: compact Verilog, and readable by Verilator (an expression of
-        1024 cases is not). The array is padded to a power of two."""
+        1024 cases is not). The array is padded to a power of two; reads of the
+        same table share one array."""
         reads = {a.left: a for a in ir.assigns if a.left in rom_reads}
         if not reads:
             return ir
         items: List[str] = []
+        arrays: Dict[Any, Tuple[str, int]] = {}  # table -> (array, its comment's place in items)
         for name, a in reads.items():
             rom = rom_reads[name]
             # (the index as the assignment reads it: renamed by pipelining, or a
@@ -919,9 +921,16 @@ class Py2ver:
             arr = f"{name}__table"
             iw = int(attr.get(idx, attr.get(rom["index"], {})).get("width", ab + 1))
             addr = f"{idx}[{ab - 1}:0]" if iw > ab else idx
+            key = (tuple(rom.get("signals", rom.get("entries", ()))), "signals" in rom, w, sig, ab)
+            if key in arrays:
+                arr, at = arrays[key]
+                items[at] += f", {name}"
+                items.append(f"wire {sig}[{w - 1}:0] {name} = {arr}[{addr}];")
+                continue
+            arrays[key] = (arr, len(items))
             if "signals" in rom:                  # (a long list argument's ports)
                 sigs = list(rom["signals"])
-                items += [f"// A list argument read by index: {len(sigs)} x {w} bits",
+                items += [f"// A list argument: {len(sigs)} x {w} bits, read by {name}",
                           f"wire {sig}[{w - 1}:0] {arr} [0:{(1 << ab) - 1}];"]
                 items += [f"assign {arr}[{k}] = {v};" for k, v in enumerate(sigs)]
                 items += [f"assign {arr}[{k}] = {w}'d0;" for k in range(len(sigs), 1 << ab)]
@@ -929,7 +938,7 @@ class Py2ver:
                 continue
             entries = list(rom["entries"])
             entries += [entries[-1]] * ((1 << ab) - len(entries))
-            items += [f"// Table: {len(rom['entries'])} x {w} bits",
+            items += [f"// Table: {len(rom['entries'])} x {w} bits, read by {name}",
                       f"reg {sig}[{w - 1}:0] {arr} [0:{len(entries) - 1}];",
                       "initial begin"]
             items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]

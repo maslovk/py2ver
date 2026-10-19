@@ -1333,6 +1333,17 @@ assign acc__v3 = acc__v2 + (-5) * window_1;
 A design built with `multipliers=` or `sequential=True` is a schedule rather
 than your statements in order, so it has no such comments.
 
+A list read at an index only known in hardware (`TAPS[k]` in a folded loop)
+is a `case` table. A table of numbers is a function, written once however
+many times it is read; a list of signals is a reg set by its own
+`always @*` block:
+
+```verilog
+assign acc__v3__t0 = (acc__v2 << 19) + table1(__t1__s) * window__at1;
+```
+
+A ROM table read in several places is one array.
+
 ### Examples
 
 `examples/` has runnable scripts (basic arithmetic, branches, loops, `reg`
