@@ -31,8 +31,8 @@
 #
 # With --sdram its 422 loop nests are 540 steps of 59 templates (steps.py), its
 # products on a few multipliers, and the board's whole project fits the EP4CE22
-# and meets 50 MHz: 21,624 logic elements (97 %), 54.1 MHz; 394,869,922 clocks a
-# call (7.9 s at 50 MHz).
+# and meets 50 MHz: 20,308 logic elements (91 %), 55.1 MHz; a call 354,568,761
+# clocks, simulated with the SDRAM's stalls 410,793,204 (8.2 s at 50 MHz).
 import contextlib
 import io
 import os

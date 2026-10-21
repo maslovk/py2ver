@@ -82,6 +82,10 @@ def mode_of(p) -> Optional[Dict[str, Any]]:
     return {"kind": "comb"}
 
 
+CLOCKS_OUT = ('fclk = $fopen("clocks.txt", "w"); $fdisplay(fclk, "%0d %0d", clocks_all, '
+              'clocks_adv); $fclose(fclk);')
+
+
 def testbench(p, mode: Dict[str, Any]) -> str:
     """The Verilog testbench (top py2ver_tb, clocked by its clk input)."""
     ext_in = getattr(p, "_ext_inputs", {})
@@ -124,6 +128,10 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         for k, (base, values) in enumerate(sdram_images(p)):
             lines.append(f'    $readmemh("sdram_{k}.hex", __mem.mem, {base}, {base + len(values) - 1});')
         lines.append("  end")
+        # (every clock, and the ones the design advanced in: the SDRAM's stalls, in
+        # clocks.txt at the end)
+        lines += ["  integer clocks_all, clocks_adv, fclk;",
+                  "  initial begin clocks_all = 0; clocks_adv = 0; end"]
         if ext_in:
             lines.append("  integer fext, e;")
             lines.append("  reg [15:0] word;")
@@ -144,7 +152,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
                     f"      for (ex = 0; ex < {len(addrs)}; ex = ex + 1)",
                     '        $fwrite(fx, "%h ", __mem.mem[out_addr(ex)]);',
                     '      $fwrite(fx, "\\n");',
-                    "      if (ending) begin $fclose(fout); $fclose(fx); $finish; end",
+                    f"      if (ending) begin $fclose(fout); $fclose(fx); {CLOCKS_OUT} $finish; end",
                     "    end"]
     if "vout" in {q.name for q in p.ir.outputs}:
         conns.append(".vout(vout)")
@@ -221,6 +229,8 @@ def testbench(p, mode: Dict[str, Any]) -> str:
     if kind in ("comb", "pipeline"):
         lines.append("    next_vector; cur = nxt;")
     lines += ["  end", "  always @(posedge clk) begin"]
+    if sdram:
+        lines.append("    clocks_all = clocks_all + 1; if (adv) clocks_adv = clocks_adv + 1;")
     if ext_out:
         lines += dump
     if kind == "comb":
@@ -255,7 +265,8 @@ def testbench(p, mode: Dict[str, Any]) -> str:
             # Each sample holds its inputs for P clocks; outputs are read in the last
             # (with the SDRAM: P clocks the design advanced in)
             done = ("        dump = 1; if (c > total) ending = 1;" if ext_out
-                    else "        if (c > total) begin $fclose(fout); $finish; end")
+                    else "        if (c > total) begin $fclose(fout); "
+                         f"{CLOCKS_OUT if sdram else ''} $finish; end")
             lines += [f"      if ({'adv && ' if sdram else ''}k == {P - 1}) begin",
                       f"        {write}",
                       "        k = 0; c = c + 1;",
@@ -411,13 +422,20 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
     for k, (base, values) in enumerate(sdram_images(p)):      # (the SDRAM's starting contents)
         (d / f"sdram_{k}.hex").write_text("".join(f"{v:04x}\n" for v in values))
     out = d / "outputs.hex"
-    if out.exists():
-        out.unlink()
+    clocks = d / "clocks.txt"
+    for f in (out, clocks):
+        if f.exists():
+            f.unlink()
     arg = f"+n={len(vectors)}"
     if simulator == "icarus":
         _run(["vvp", "-n", "sim.vvp", arg], d)
     else:
         _run(["obj/Vpy2ver_tb", arg], d)
+    if clocks.exists():                        # (with the SDRAM: its stalls)
+        every, advanced = (int(v) for v in clocks.read_text().split())
+        p.sdram_clocks = (every, advanced)
+        log.info("Simulated with the SDRAM: %d clocks, %d of them the design's (%.1f %% "
+                 "stalled)", every, advanced, 100 * (every - advanced) / max(1, every))
     rows = []
     ext_out = getattr(p, "_ext_outputs", {})
     names = [n for n in p.output_args_list if n not in ext_out]

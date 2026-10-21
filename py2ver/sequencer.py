@@ -70,6 +70,11 @@ def _m9ks(depth: int, width: int) -> int:
     return min(-(-depth // d) * -(-width // w) for d, w in M9K_SHAPES)
 ROM_MIN = 64              # a constant table this long or longer is a ROM
 ROW_MIN = 4096            # sdram=: a list this long or longer has its rows read once (_cached_rows)
+# A big program's loop (one made steps of, steps.py) is pipelined if that saves
+# at least this part of a sample's clocks (PY2VER_PIPE_SAVING; a smaller loop's
+# stages: registers and logic for little. The diffusion U-Net, its 58 loops all
+# pipelined: 185 % of the EP4CE22; at 1.5 %: 91 %, 11 % more clocks)
+PIPE_SAVING = 0.015
 # A loop with dividers / square roots is pipelined (a register stage per step of
 # each) only if that saves at least this part of a sample's clocks
 UNIT_SAVING = 0.05
@@ -97,6 +102,8 @@ class Loop:
     # (range(count): as many times as this scalar's register says, values the
     # most it takes; steps.py)
     count: Optional[str] = None
+    # (a perfect nest from here, counted by slots: its iterations' product's slot)
+    total: Optional[str] = None
 
 
 @dataclass
@@ -344,12 +351,14 @@ def _writes_all(loop: Loop, name: str, n: int, limit: int = 1 << 20) -> bool:
 
 def _external(program, rams: Set[str], fmt, attr, memories, budget,
               lengths: Dict[str, int], forced=(), order=None,
-              align: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+              align: Optional[Dict[str, int]] = None,
+              together: Optional[Dict[Any, Dict[Any, int]]] = None) -> Dict[str, Any]:
     """
     The lists (block RAMs) and tables (ROMs) that go to the SDRAM: the largest,
     one after another, until what stays (the M9K blocks each takes, in bits) is
-    within budget bits. Each gets an address range in a bank (the banks taken in
-    turn, so a product's two operands keep two rows open; shared by lists not
+    within budget bits. Each gets an address range in a bank (the one with the
+    fewest of the lists it's read or written with, together: the blocks they
+    share, so a product's two operands keep two rows open; shared by lists not
     needed at the same time; from a row's start, from a multiple of 2^align[a]
     for a list of align), its words
     SDRAM_WIDTH bits: {'lists': {name: info}, 'tables': {entries: info}}, info
@@ -392,6 +401,7 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
     always = (0, len(order))
     out: Dict[str, Any] = {"lists": {}, "tables": {}}
     placed: List[List[Tuple[int, int, Tuple[int, int]]]] = [[], [], [], []]
+    in_bank: List[List[Any]] = [[], [], [], []]
     k = 0
     for kind, key, n, meta, init in items:
         if total <= budget and key not in forced:
@@ -403,10 +413,13 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
                                   f"({SDRAM_WIDTH}-bit words); use width={2 * SDRAM_WIDTH}")
         live = always if kind == "table" or key in memories else steps.get(key, always)
         size = -(-n * words // 512) * 512                 # (each from a row's start)
-        # (the banks taken in turn, a full one skipped; in a bank the lowest
-        # address clear of the lists live at the same time)
+        # (the bank with the fewest of the lists and tables read or written with it,
+        # each a row of its own open, then the banks in turn, a full one skipped;
+        # in a bank the lowest address clear of the lists live at the same time)
         al = 1 << max(9, (align or {}).get(key, 0)) if kind == "list" else 512
-        for bank in [(k + j) % 4 for j in range(4)]:
+        mine = (together or {}).get(key, {})
+        for bank in sorted(range(4), key=lambda b: (sum(mine.get(o, 0) for o in in_bank[b]),
+                                                    (b - k) % 4)):
             busy = [(s, e) for s, e, (lo, hi) in placed[bank] if lo <= live[1] and live[0] <= hi]
             start = min((p for p in [-(-q // al) * al for q in [0] + [e for _, e in busy]]
                          if all(p + size <= s or e <= p for s, e in busy)))
@@ -416,10 +429,41 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
             raise NotSequenceable("The lists don't fit the SDRAM")
         k += 1
         placed[bank].append((start, start + size, live))
+        in_bank[bank].append(key)
         info = {"base": (bank << 22) | start, "length": n, "meta": meta, "init": init,
                 "words": words}
         out["lists" if kind == "list" else "tables"][key] = info
         total -= cost(n, meta)
+    return out
+
+
+def _together(program, lengths: Dict[str, int],
+              placeholders: Dict[str, Dict[str, Any]]) -> Dict[Any, Dict[Any, int]]:
+    """For each list (a name) or table (its entries), the others read or written in
+    a block with it, and in how many blocks: a template's (steps.py) its steps'
+    lists, each step's together."""
+    out: Dict[Any, Dict[Any, int]] = {}
+    for it in _walk_items(program):
+        if not isinstance(it, Block):
+            continue
+        names: Set[Any] = set()
+        for s in it.stmts:
+            for x in ast.walk(s):
+                if isinstance(x, ast.Subscript) and isinstance(x.value, ast.Name) \
+                        and x.value.id in lengths:
+                    names.add(x.value.id)
+                elif _is_table(x) and len(x.elts) >= ROM_MIN:
+                    names.add(tuple(e.value for e in x.elts))
+        phs = sorted(n for n in names if isinstance(n, str) and n in placeholders)
+        rest = names - set(phs)
+        groups = ([rest | {placeholders[ph]["lists"][m] for ph in phs}
+                   for m in range(len(placeholders[phs[0]]["lists"]))] if phs else [rest])
+        for g in groups:
+            for a in g:
+                for b in g:
+                    if a != b:
+                        out.setdefault(a, {})
+                        out[a][b] = out[a].get(b, 0) + 1
     return out
 
 
@@ -869,7 +913,9 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
     ext = (_external(program, rams - ext_outputs - placeholders - rows, fmt, attr, memories, sdram,
                      sq.lists, forced=steps.forced if steps else (),
                      order=steps.order if steps else None,
-                     align=steps.align if steps else None)
+                     align=steps.align if steps else None,
+                     together=_together(program, sq.lists,
+                                        steps.placeholders if steps else {}))
            if sdram is not None and sdram is not False else None)
     if ext is not None:
         _external_ports(ext, {a for a in inputs if sq.lists.get(a, 0) >= INPUT_ARRAY_MIN},
@@ -919,6 +965,12 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
                 if isinstance(it, Block):
                     total += n * codes[it.index].clocks
                     continue
+                chain = flat_from.get(id(it))
+                if chain is not None:                  # (a nest pipelined as one loop)
+                    c = codes[chain[-1].body[0].index]
+                    k = vals[it.total] if it.total else math.prod(len(x.values) for x in chain)
+                    total += n * ((k - 1) * c.pipe.get("ii", 1) + c.clocks)
+                    continue
                 k = vals[it.count] if it.count else len(it.values)
                 if len(it.body) == 1 and isinstance(it.body[0], Block) \
                         and codes[it.body[0].index].pipe is not None:
@@ -935,6 +987,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
                 per_template[id(proc)] = per_template.get(id(proc), 0) + total - before
         return total
     per_template: Dict[int, int] = {}
+    flat_from: Dict[int, List[Loop]] = {}          # (a pipelined nest's outer loop -> its loops)
 
     # ----- innermost loops of one block: an iteration a clock (see pipeline_block)
     from .sequencer_blocks import pipeline_block
@@ -960,8 +1013,35 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
     for code in codes.values():
         read_ranges(code)
 
+    # A perfect nest of loops (each one's body the next, the last's one block) whose
+    # block reads no list it writes: pipelined as one loop of all its iterations,
+    # its counters a counter of several digits, the innermost first (its start
+    # and end once, not for every run of its inner loop)
+    from .steps import perfect_nest
+    flat: Dict[int, List[Loop]] = {}               # the block -> its nest's loops, the outer first
+    in_flat: Set[int] = set()
+    if pipelined and os.environ.get("PY2VER_NESTS", "1") != "0":
+        for lp in loops:
+            chain = perfect_nest(lp)
+            if not chain or id(lp) in in_flat or (any(x.count for x in chain) and not lp.total):
+                continue
+            block = chain[-1].body[0]
+            code = codes[block.index]
+            if {w.array for w in code.writes} & {s.array for s in code.sites if not s.rom}:
+                continue
+            most = math.prod(len(x.values) for x in chain)
+            if pipeline_block(code, counters[chain[-1].index], most, known, attr,
+                              nest=[counters[x.index] for x in chain[:-1]]):
+                code.pipe["nest"] = [(counters[x.index], x.count or len(x.values)) for x in chain]
+                if lp.total:
+                    code.pipe["count"] = lp.total
+                flat[block.index] = chain
+                flat_from[id(lp)] = chain
+                in_flat |= {id(x) for x in chain}
+
     def one_block(lp: Loop) -> bool:
-        return pipelined and len(lp.body) == 1 and isinstance(lp.body[0], Block)
+        return pipelined and len(lp.body) == 1 and isinstance(lp.body[0], Block) \
+            and id(lp) not in in_flat
     for lp in loops:
         if one_block(lp):
             if pipeline_block(codes[lp.body[0].index], counters[lp.index], len(lp.values), known,
@@ -991,6 +1071,31 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
                 log.info("Loop of block %d kept a step at a time: pipelining it written out "
                          "would save %d of %d clocks a sample (under %.0f %%)", k, saved, before,
                          100 * UNIT_SAVING)
+    # A pipelined loop that saves little of a sample's clocks (under PIPE_SAVING):
+    # a block at a time after all, without its stages' registers and their logic
+    # (a big design's hundred small loops, their two-word values through the
+    # SDRAM's latency: more logic than the device has)
+    least = float(os.environ.get("PY2VER_PIPE_SAVING", PIPE_SAVING if steps is not None else 0))
+    if least > 0:
+        base = clocks_per_sample()
+        for k in sorted(k for k in codes if codes[k].pipe is not None):
+            piped, chain = codes[k], flat.pop(k, None)
+            if chain is not None:
+                del flat_from[id(chain[0])]
+            codes[k] = BlockCode(sq, blocks[k], scopes[k], rams, reg_lists, block_inputs, attr,
+                                 rng, ns, ext=ext)
+            read_ranges(codes[k])
+            saved = clocks_per_sample() - base
+            bits = sum(int(f["width"]) for f in piped.pipe["formats"].values())
+            if saved >= least * base:
+                codes[k] = piped
+                if chain is not None:
+                    flat[k], flat_from[id(chain[0])] = chain, chain
+            else:
+                log.info("Loop of block %d kept a step at a time: pipelined it saves %d of %d "
+                         "clocks a sample (under %.2f %%), for %d bits of registers", k, saved,
+                         base, 100 * least, bits)
+                base += saved
 
     # ----- the control: successor of each block, how often each runs
     n = len(blocks)
@@ -1052,6 +1157,8 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         return choose(test, after(par), (again_state, again_sets))
 
     succ = {b.index: after(b) for b in blocks}
+    for k, chain in flat.items():               # (a nest pipelined as one loop: then past it)
+        succ[k] = after(chain[0])
     if steps is not None:                        # (the step's template: the state it loaded)
         succ[steps.jump.index] = (ast.Name(id=f"r_{steps.entry}", ctx=ast.Load()), {})
     start_state, start_sets = enter(program[0])

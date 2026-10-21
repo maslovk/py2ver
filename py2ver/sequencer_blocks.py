@@ -1016,17 +1016,34 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         value = next_value(per, _name(f"{cnt}_now"))
         for k in range(n):                 # (its pipelined loop: a step a clock, to the last)
             pipe = codes[k].pipe
-            if pipe is not None and pipe["counter"] == cnt:
+            levels = [c for c, _ in pipe.get("nest", ())] if pipe is not None else []
+            if pipe is not None and (pipe["counter"] == cnt or cnt in levels):
                 lp = loop_of[cnt]
-                step = lp.values[1] - lp.values[0]
+                step = lp.values[1] - lp.values[0] if len(lp.values) > 1 else 1
                 ii = pipe.get("ii", 1)
                 test = _and(_eq(_name("st_now"), k), ast.Compare(
                     left=_name("cyc_now"), ops=[ast.Lt()], comparators=[iterations(k, 1)]))
                 if ii > 1:                           # (a step every ii clocks)
                     test = _and(test, _eq(_name(f"cm{ii}_now"), ii - 1))
-                value = ast.IfExp(test=test,
-                    body=ast.BinOp(left=_name(f"{cnt}_now"), op=ast.Add(), right=ast.Constant(step)),
-                    orelse=value)
+                body: ast.expr = ast.BinOp(left=_name(f"{cnt}_now"), op=ast.Add(),
+                                           right=ast.Constant(step))
+                if levels:
+                    # (a nest as one loop: a digit of its counter, to 0 past its last,
+                    # on when every digit inside it is at its last)
+                    def at_last(c: str, count) -> ast.expr:
+                        last = (ast.Constant(count - 1) if isinstance(count, int) else
+                                ast.BinOp(left=_name(count), op=ast.Sub(), right=ast.Constant(1)))
+                        return ast.Compare(left=_name(f"{c}_now"), ops=[ast.Eq()],
+                                           comparators=[last])
+                    j = levels.index(cnt)
+                    body = ast.IfExp(test=at_last(*pipe["nest"][j]), body=ast.Constant(0),
+                                     orelse=body)
+                    inner = [at_last(*pipe["nest"][i]) for i in range(j + 1, len(levels))]
+                    if inner:
+                        on = inner[0] if len(inner) == 1 else ast.BoolOp(op=ast.And(),
+                                                                       values=inner)
+                        body = ast.IfExp(test=on, body=body, orelse=_name(f"{cnt}_now"))
+                value = ast.IfExp(test=test, body=body, orelse=value)
         stmts.append(_assign(f"rn_{cnt}", value))
         regs[f"r_{cnt}"] = f"rn_{cnt}"
 
@@ -1356,7 +1373,7 @@ def _coefficient(e: ast.expr, now: str, varying: Set[str]) -> Optional[int]:
 
 
 def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tuple[int, int]],
-                   attr) -> bool:
+                   attr, nest: List[str] = ()) -> bool:
     """
     Retime an innermost loop's one block to start an iteration every clock: each
     value is computed at its stage (the clock of the iteration it belongs to at
@@ -1370,6 +1387,8 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     where it is written (a later iteration could read before an earlier one
     writes), or a value carried through a RAM read.
     known: ranges of the registers and counters (for the delay registers' widths).
+    nest: the counters of the loops around it in a perfect nest pipelined as one
+    loop (they change during it: carried through the stages as its own).
     """
     from .share import NotShareable, _fmt_of, _fmt_range, _interval
 
@@ -1389,14 +1408,16 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     now = f"{cnt}_now"
     defs = {s.targets[0].id: s.value for s in code.out}
     carried = {v for v in code.read_regs if v in code.env}
-    varying = set(defs) | {s.data for s in code.sites} | {now} | {f"r_{v}" for v in carried}
+    varying = set(defs) | {s.data for s in code.sites} | {now} | {f"r_{v}" for v in carried} \
+        | {f"{c}_now" for c in nest}
     # One write per RAM; a RAM written here is read only where it is written, an
     # element a different one each iteration
     written: Dict[str, _Write] = {}
     for w in code.writes:
-        if w.array in written:
-            return no(f"two writes to {w.array}")
-        written[w.array] = w
+        if w.array in written and not (w.half and written[w.array].half
+                                       and w.index == written[w.array].index):
+            return no(f"two writes to {w.array}")      # (a value's two words: one write)
+        written.setdefault(w.array, w)
     for s in code.sites:
         if not s.rom and s.array in written:
             ra, wa = _expand(defs[s.addr], defs), _expand(defs[written[s.array].addr], defs)

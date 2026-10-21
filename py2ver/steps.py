@@ -366,6 +366,18 @@ def as_steps(program, sq, rams: Set[str], reg_lists: Set[str], fixed: Set[str],
                         if lo > 0 and all(isinstance(v, int) for v in vs):
                             n.left = ast.BinOp(left=n.left, op=type(n.op)(), right=ast.Constant(lo))
                             n.right = ast.Name(id=slot(tuple(v - lo for v in vs)), ctx=ast.Load())
+        # (a perfect nest of loops counted by slots: its iterations' product a slot
+        # too, the nest one loop for the sequencer, its control without a product)
+        for lp in _walk_loops(template):
+            chain = perfect_nest(lp)
+            if chain and any(x.count for x in chain):
+                prods = []
+                for m in range(len(members)):
+                    p_ = 1
+                    for x in chain:
+                        p_ *= aliases[x.count][1][m] if x.count else len(x.values)
+                    prods.append(p_)
+                lp.total = slot(tuple(prods))
         vals: List[List[Any]] = [[] for _ in members]
         for vec, j in sorted(slot_of.items(), key=lambda x: x[1]):
             for m in range(len(members)):
@@ -484,6 +496,25 @@ def _filled(items, names: Set[str], sq):
         if cur:
             out.append(Block(cur))
     return out
+
+
+def _walk_loops(it):
+    from .sequencer import Loop, _walk_items
+    return [x for x in _walk_items([it]) if isinstance(x, Loop)]
+
+
+def perfect_nest(lp) -> Optional[list]:
+    """The loops of a perfect nest from lp down (each loop's body the next loop,
+    the last's one block; counted from 0 a step at a time), two at least; else
+    None."""
+    from .sequencer import Block, Loop
+    chain = []
+    x = lp
+    while isinstance(x, Loop) and len(x.body) == 1 and x.values == list(range(len(x.values))) \
+            and x.values:
+        chain.append(x)
+        x = x.body[0]
+    return chain if len(chain) >= 2 and isinstance(x, Block) else None
 
 
 def _blocks(it):

@@ -499,11 +499,11 @@ def test_a_loop_left_unpipelined_is_said(monkeypatch, caplog):
     import py2ver.share as share
     real = B.pipeline_block
 
-    def pipeline_block(*args):                     # (its products can't be bounded)
+    def pipeline_block(*args, **kwargs):           # (its products can't be bounded)
         saved = share._interval
         share._interval = _unbounded_products(saved)
         try:
-            return real(*args)
+            return real(*args, **kwargs)
         finally:
             share._interval = saved
     monkeypatch.setattr(B, "pipeline_block", pipeline_block)

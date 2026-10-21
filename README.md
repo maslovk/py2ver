@@ -506,7 +506,14 @@ machine runs the program a step at a time, for designs far too big to unroll
   writes a list held in registers, writes one RAM twice, reads a RAM it writes
   anywhere but at the element it writes (a different one each iteration: `m[i]
   = 0.9 * m[i] + g[i]` is fine, `a[i] = a[i - 1] + x[i]` isn't), or carries a
-  value through a RAM read. Which loops weren't pipelined, and why, is logged
+  value through a RAM read (a value's two words in the SDRAM are one write). A
+  perfect nest of loops (each one's body the next loop, the last's one block,
+  counted from 0) is pipelined as one loop of all its iterations, its counters
+  one counter of several digits: its start and end once, not for each run of
+  its inner loop (an im2col copy's 3-long rows: 4 clocks an element, not 12).
+  In a big program (one made steps of, see below) a loop is pipelined only if
+  that saves 1.5 % of a sample's clocks or more (`PY2VER_PIPE_SAVING`): the
+  rest's stages, registers and logic for little. Which loops weren't pipelined, and why, is logged
   (INFO: `-v` in the examples); a product left without its register or a loop
   left unpipelined because py2ver can't bound a value is a WARNING
 - `multipliers=N` runs the multiply-accumulate loops (an innermost loop that
@@ -539,9 +546,13 @@ machine runs the program a step at a time, for designs far too big to unroll
   the j-th). A matrix product's row read again for every column (`cols[i * K
   + k]` for each filter of a convolution) is read once into a block RAM, the
   product then reading the SDRAM for the other operand only (`PY2VER_ROWS=0`:
-  not). The simulations include a model of the chip, loaded with the
+  not). A list or table goes to the bank with the fewest of those read or
+  written in a block with it, so each keeps its row open (a row opened takes 5
+  clocks). The simulations include a model of the chip, and count the clocks
+  it stalls the design (`p.sdram_clocks`: every clock and the design's;
+  logged); the model is loaded with the
   tables: the PyTorch MNIST network with `sdram=True` keeps 16 Mbit in the
-  SDRAM and takes 22,369,901 clocks an image (0.45 s at 50 MHz; 19.8 million
+  SDRAM and takes 21,055,114 clocks an image (0.42 s at 50 MHz; 19.8 million
   all in block RAM), simulated in Verilator as its bit-exact model. An input list of 64
   values or more is in the SDRAM too (no ports: each sample's values are
   written there before it runs), and so is a returned list of 64 values or
@@ -551,11 +562,11 @@ machine runs the program a step at a time, for designs far too big to unroll
   (a layer's activations, done with when a later layer's are written) share
   addresses: a list's from the program's first top-level step using it to
   its last. `SYN()` gives the SDRAM's pins their
-  DE0-Nano places and timing: the MNIST network fits the EP4CE22, 8,611
+  DE0-Nano places and timing: the MNIST network fits the EP4CE22, 8,603
   logic elements (39 %, its ports registered), 193 kbit of block RAM (32 %),
-  16 multipliers, 69.5 MHz (timing met at 50 MHz). `HW()` and `HW_sim()` load
+  16 multipliers, 71.9 MHz (timing met at 50 MHz). `HW()` and `HW_sim()` load
   the SDRAM over the UART (see "On the board" below); the whole board project
-  for MNIST fits too: 9,041 logic elements (41 %), 193 kbit, 56 pins, 75 MHz.
+  for MNIST fits too: 9,033 logic elements (40 %), 193 kbit, 56 pins, 73.6 MHz.
 
 The number of clocks is fixed by the loop bounds (`p.ram_phases` per sample),
 and register widths come from following the program with intervals, so the
@@ -1073,7 +1084,7 @@ checked against torch. `examples/tiny_gpt_hardware.py` builds the model
 | scores against torch's | within 0.158 (mean 0.011) |
 | the likeliest next character | torch's at 99.5 % of the positions |
 | per window | 271,157,254 clocks: 5.4 s at 50 MHz |
-| per window, `--sdram` (for the board) | 341,542,953 clocks: 6.8 s at 50 MHz |
+| per window, `--sdram` (for the board) | 322,866,035 clocks: 6.5 s at 50 MHz |
 
 The four blocks are one loop over them (identical layers, see "Sequenced
 loops"), their values a few bits wider than 16 where the layers' ranges
@@ -1082,8 +1093,8 @@ differ. It builds in about 2 minutes, and the bit-exact model runs a window in
 at a time. With `--sdram` the weights (29 Mbit), the window and the scores are
 in the SDRAM, the activations too (values wider than 16 bits in two words),
 and the DE0-Nano's whole project (UART commands, the design, the SDRAM's
-controller) fits the EP4CE22 and meets 50 MHz (62.4 MHz): 12,968 logic
-elements (58 %), 6,564 registers, 158 kbit of block RAM (26 %), 65 of 132
+controller) fits the EP4CE22 and meets 50 MHz (70.1 MHz): 17,092 logic
+elements (77 %), 10,375 registers, 158 kbit of block RAM (26 %), 63 of 132
 9-bit multipliers.
 The small GPT of the tests is simulated (Verilog), with and without the
 SDRAM, the same as its model. (Not yet run on a real board.)
@@ -1103,12 +1114,12 @@ saves (4 blocks, 192 wide, 6 query and 2 key/value heads, a 128-token context:
 | scores against torch's | within 0.106 |
 | the likeliest next token | torch's in all 6 |
 | per window | 257,324,550 clocks: 5.1 s at 50 MHz |
-| per window, `--sdram` (for the board) | 306,830,583 clocks: 6.1 s at 50 MHz |
+| per window, `--sdram` (for the board) | 294,613,396 clocks: 5.9 s at 50 MHz |
 
 It builds in about 70 s. With `--sdram` the core (`SYN()`: the SDRAM's pins and
-timing, its controller) fits the EP4CE22 and meets 50 MHz (Fmax 63.2 MHz):
-13,572 logic elements' functions, 6,988 registers, 270 kbit of block RAM (44 %),
-58 of 132 9-bit multipliers. `tests/test_torch.py` trains a small one with a loop
+timing, its controller) fits the EP4CE22 and meets 50 MHz (Fmax 65.0 MHz):
+16,789 logic elements' functions, 10,027 registers, 270 kbit of block RAM (44 %),
+48 of 132 9-bit multipliers. `tests/test_torch.py` trains a small one with a loop
 function of the usual shape (dropout, attention's `dropout_p` included, the
 repeated keys and values, the tied embedding, gradient clipping, AdamW with two
 groups), checked against torch; builds that training step in 24-bit fixed
@@ -1143,10 +1154,11 @@ lists made are 540 steps of 59 templates, its products on 15 multipliers (8
 products each at most), each convolution's rows read once (`cols[i * K + k]`
 for every filter: 0.57 of the clocks) and its weights a word each (0.62
 again), and the DE0-Nano's whole project (UART commands, the design, the
-SDRAM's controller) fits the EP4CE22 and meets 50 MHz: 21,624 logic elements
-(97 %), 7,063 registers, 256 kbit of block RAM (42 %), 65 of 132 9-bit
-multipliers, 54.1 MHz; 394,869,922 clocks a call (7.9 s at 50 MHz, the
-SDRAM's stalls besides). Written out, a nest
+SDRAM's controller) fits the EP4CE22 and meets 50 MHz: 20,308 logic elements
+(91 %), 5,989 registers, 256 kbit of block RAM (42 %), 76 of 132 9-bit
+multipliers, 55.1 MHz; 354,568,761 clocks a call, a whole call simulated in
+Verilator (the same as its model) 410,793,204 with the SDRAM's stalls (13.7 %
+of them, rows opened): 8.2 s at 50 MHz. Written out, a nest
 its own logic, it took about 138,000 combinational nodes in Quartus;
 sharing the products took that to 115,000, the steps to 34,000, and the
 SDRAM's port (one address for a value's two words, a block's items of one

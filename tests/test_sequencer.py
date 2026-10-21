@@ -236,6 +236,46 @@ def test_shared_multipliers_in_hardware(monkeypatch, tmp_path):
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
 
 
+def windows(x):
+    cols = [0] * 288
+    for i in range(4):                               # (a perfect nest: one loop of 288)
+        for j in range(8):
+            for di in range(3):
+                for dj in range(3):
+                    cols[i * 72 + j * 9 + di * 3 + dj] = x[(i * 2 + di + j + dj) % 16] - dj
+    s = 0
+    for a in range(16):                              # (and one carrying a sum through it)
+        for b in range(3):
+            s = s + cols[a * 18 + b] * (b + 1)
+    t = cols[5] + cols[287]
+    return s, t
+
+
+def test_a_perfect_nest_is_one_pipelined_loop(monkeypatch):
+    fe = front_end(windows, X16)
+    tree, info = sequence(fe.tree, fe.attr, _namespace(windows))
+    model = build_model(tree, dict(fe.attr, **info.attr), _namespace(windows))
+    for _ in range(20):
+        x = _vec()
+        assert simulate(info, model, (x,)) == windows(x)
+    # (in the SDRAM, its reads 7 clocks: a start and an end a nest, not one each 3
+    # iterations; 0.6 of the clocks)
+    flat = sequence(fe.tree, fe.attr, _namespace(windows), sdram=0)[1].phases
+    monkeypatch.setenv("PY2VER_NESTS", "0")
+    nested = sequence(fe.tree, fe.attr, _namespace(windows), sdram=0)[1].phases
+    assert flat < 0.7 * nested
+
+
+@pytest.mark.sim
+@pytest.mark.parametrize("sdram", [None, 0])
+def test_a_perfect_nest_in_hardware(monkeypatch, tmp_path, sdram):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    p = Py2ver(windows, X16, sequential=True, sdram=sdram)
+    vectors = [(_vec(),) for _ in range(6)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
 import functools                                      # noqa: E402
 from py2ver.fixed import isqrt                        # noqa: E402
 
