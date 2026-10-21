@@ -27,27 +27,40 @@ class MemoriesMixin:
     @staticmethod
     def _sdram_items(sdram: Dict[str, Any]) -> List[str]:
         """The SDRAM's controller and the return path of its reads: the design's
-        reads (ext_req and not ext_we) get their data on ext_q `latency`
-        advancing clocks later, in order, from a FIFO; the design's clock enable
-        ce is ce_in, held low while an access waits (a row opened, a refresh) and
-        until the SDRAM is set up. adv: the design advanced this clock."""
+        access goes to a register first (the controller's request: its address
+        and its row's check from a register, not from the design's logic), the
+        design's clock enable ce is ce_in, held low while that request waits (a
+        row opened, a refresh) and until the SDRAM is set up; its reads (ext_req
+        and not ext_we) get their data on ext_q `latency` advancing clocks later,
+        in order, from a FIFO. adv: the design advanced this clock."""
         L = int(sdram["latency"])
         return [
             "// The SDRAM: the lists and tables that don't fit the block RAM (sdram=)",
             "wire __ext_ready, __ext_rvalid, __ext_init;",
             "wire [15:0] __ext_rdata;",
-            "wire __ext_stall = !__ext_init || (ext_req && !__ext_ready);",
+            "// (the design's access, a clock later: the controller's request)",
+            "reg __p_req = 1'b0, __p_we = 1'b0;",
+            "reg [23:0] __p_addr = 24'd0;",
+            "reg [15:0] __p_wdata = 16'd0;",
+            "wire __ext_stall = !__ext_init || (__p_req && !__ext_ready);",
             "wire ce = ce_in && !__ext_stall;",
             "assign adv = ce;",
             "assign dram_clk = ~clk;",
-            "// (the host reads and writes through it while the design is paused: ce_in low)",
-            "wire __host = !ce_in;",
+            "always @(posedge clk) begin",
+            "  if (rst) __p_req <= 1'b0;",
+            "  else if (ce) begin",
+            "    __p_req <= ext_req; __p_we <= ext_we; __p_addr <= ext_addr; __p_wdata <= ext_wdata;",
+            "  end else if (__p_req && __ext_ready) __p_req <= 1'b0;   // (done while paused)",
+            "end",
+            "// (the host reads and writes through it while the design is paused: ce_in low,",
+            "// once the design's last access is done)",
+            "wire __host = !ce_in && !__p_req;",
             "assign host_ready = __host && __ext_init && __ext_ready;",
-            "wire __req = (__host ? host_req : ext_req) && __ext_init;",
-            "wire __we = __host ? host_we : ext_we;",
+            "wire __req = (__host ? host_req : __p_req) && __ext_init;",
+            "wire __we = __host ? host_we : __p_we;",
             "py2ver_sdram __sdram(.clk(clk), .rst(rst), .req(__req),",
-            "    .we(__we), .addr(__host ? host_addr : ext_addr),",
-            "    .wdata(__host ? host_wdata : ext_wdata), .ready(__ext_ready),",
+            "    .we(__we), .addr(__host ? host_addr : __p_addr),",
+            "    .wdata(__host ? host_wdata : __p_wdata), .ready(__ext_ready),",
             "    .rvalid(__ext_rvalid), .rdata(__ext_rdata), .init_done(__ext_init),",
             "    .sa(dram_addr), .ba(dram_ba), .cs_n(dram_cs_n), .ras_n(dram_ras_n),",
             "    .cas_n(dram_cas_n), .we_n(dram_we_n), .cke(dram_cke), .dqm(dram_dqm), .dq(dram_dq));",

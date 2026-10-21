@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import copy
 import logging
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schedule import Schedule
@@ -73,8 +74,10 @@ def _sel(values: List[ast.expr], idx: ast.expr) -> ast.expr:
                          slice=idx, ctx=ast.Load())
 
 
-EXT_LATENCY = 6          # a read of the SDRAM: its data this many clocks after its address
+EXT_LATENCY = 7          # a read of the SDRAM: its data this many clocks after its address
+EXT_HELD = EXT_LATENCY + 1   # (outside a pipelined loop: from a register a clock later)
 CHAIN_BLOCKS = 32         # a port shared by more blocks: chosen by a search on the state
+DSP_ELEMENTS = 132        # the EP4CE22's 9-bit multipliers: products past them share (share_products)
 
 
 class _Site:
@@ -134,6 +137,8 @@ class BlockCode:
         self.bumped: Set[str] = set()
         self.muls: Set[str] = set()          # (bumped: a register after the multiplier)
         self.held: Dict[str, Tuple[str, Dict[str, Any]]] = {}   # register -> (value, format)
+        # (a product on a shared multiplier: its register -> (the unit, the clock it loads))
+        self.shared_held: Dict[str, Tuple[str, int]] = {}
         # Lists and tables in the SDRAM: one access a clock (its port), data
         # EXT_LATENCY clocks after the address
         self.ext_lists = (ext or {}).get("lists", {})
@@ -229,18 +234,46 @@ class BlockCode:
                 setattr(n, f, [self.expr(x) if isinstance(x, ast.expr) else x for x in v])
         return n
 
-    def two_words(self, array: Any, addr: str, base: int, prefix: str, rom: bool) -> str:
+    def ext_base(self, a: str) -> Tuple[int, Optional[ast.expr]]:
+        """(base, base register) of a list in the SDRAM: a template's (steps.py) at
+        its slot's base (the slot its high bits, its low ones 0: the base's bits
+        beside the address's, not a sum), another's at its own."""
+        info = self.ext_lists[a]
+        if info.get("param"):
+            return 0, ast.BinOp(left=_name(self.scalar(info["param"])), op=ast.LShift(),
+                                right=ast.Constant(int(info["shift"])))
+        return info["base"], None
+
+    @staticmethod
+    def based(base_reg: Optional[ast.expr], word: ast.expr) -> ast.expr:
+        """A word's address from its list's base register (ext_base), if it has one."""
+        if base_reg is None:
+            return word
+        return ast.BinOp(left=copy.deepcopy(base_reg), op=ast.BitOr(), right=word)
+
+    def at_base(self, a: str, addr: str, base_reg: Optional[ast.expr], what: str) -> str:
+        """addr from its list's base register, if it has one."""
+        if base_reg is None:
+            return addr
+        return self.emit(f"{a}_{what}", self.based(base_reg, _name(addr)))
+
+    def two_words(self, array: Any, addr: str, base: int, prefix: str, rom: bool,
+                  base_reg: Optional[ast.expr] = None) -> str:
         """A value in two SDRAM words (a list's or a table's): its low word,
         unsigned, and its high one, read in turn and put together."""
         halves = {}
-        for half, extra in (("lo", 0), ("hi", 1)):
-            wa = self.emit(f"{prefix}a{half}", ast.BinOp(
-                left=ast.BinOp(left=_name(addr), op=ast.Mult(), right=ast.Constant(2)),
-                op=ast.Add(), right=ast.Constant(extra)))
+        # (both words at the low one's address, even: the high one's is it, the
+        # SDRAM's port adding its odd bit, ext_odd)
+        word = ast.BinOp(left=_name(addr), op=ast.Mult(), right=ast.Constant(2))
+        if base_reg is not None:
+            word = self.based(base_reg, word)
+        even = self.emit(f"{prefix}alo", word)
+        for half in ("lo", "hi"):
+            wa = even if half == "lo" else self.emit(f"{prefix}ahi", _name(even))
             halves[half] = self.tmp(f"{prefix}d{half}")
             clock = self.ext_slot(self.ready[wa])
             self.sites.append(_Site(array, wa, halves[half], clock, rom=rom, ext=base, half=half))
-            self.ready[halves[half]] = clock + EXT_LATENCY
+            self.ready[halves[half]] = clock + EXT_HELD
         return self.emit(f"{prefix}d", ast.BinOp(
             left=ast.BinOp(left=_name(halves["hi"]), op=ast.LShift(), right=ast.Constant(16)),
             op=ast.Add(), right=_name(halves["lo"])))
@@ -252,15 +285,17 @@ class BlockCode:
             key = (a, ast.dump(idx))
             if key in self.reads:
                 return copy.deepcopy(self.reads[key])
-            addr = self.emit(f"{a}_ra", idx)
+            addr = self.emit(f"{a}_ra", self.products(idx, values_only=True))
             data = self.tmp(f"{a}_rd")
             if a in self.ext_lists and self.ext_lists[a].get("words", 1) == 2:
-                data = self.two_words(a, addr, self.ext_lists[a]["base"], f"{a}_r", rom=False)
+                base, base_reg = self.ext_base(a)
+                data = self.two_words(a, addr, base, f"{a}_r", rom=False, base_reg=base_reg)
             elif a in self.ext_lists:
-                clock = self.ext_slot(self.ready[addr])
-                self.sites.append(_Site(a, addr, data, clock, rom=False,
-                                        ext=self.ext_lists[a]["base"]))
-                self.ready[data] = clock + EXT_LATENCY
+                base, base_reg = self.ext_base(a)
+                at = self.at_base(a, addr, base_reg, "rb")
+                clock = self.ext_slot(self.ready[at])
+                self.sites.append(_Site(a, at, data, clock, rom=False, ext=base))
+                self.ready[data] = clock + EXT_HELD
             else:
                 clock = self.ready[addr]
                 self.sites.append(_Site(a, addr, data, clock, rom=False))
@@ -475,7 +510,7 @@ class BlockCode:
         key = (entries, ast.dump(idx))
         if key in self.reads:
             return copy.deepcopy(self.reads[key])
-        addr = self.emit("rom_a", idx)
+        addr = self.emit("rom_a", self.products(idx, values_only=True))
         data = self.tmp("rom_d")
         if entries in self.ext_tables and self.ext_tables[entries].get("words", 1) == 2:
             data = self.two_words(entries, addr, self.ext_tables[entries]["base"], "rom_",
@@ -484,7 +519,7 @@ class BlockCode:
             clock = self.ext_slot(self.ready[addr])
             self.sites.append(_Site(entries, addr, data, clock, rom=True,
                                     ext=self.ext_tables[entries]["base"]))
-            self.ready[data] = clock + EXT_LATENCY
+            self.ready[data] = clock + EXT_HELD
         else:
             clock = self.ready[addr]
             self.sites.append(_Site(entries, addr, data, clock, rom=True))
@@ -526,11 +561,12 @@ class BlockCode:
                 return
         raise self.NotSequenceable(f"Unsupported statement in a sequenced design: {ast.unparse(s)}")
 
-    def products(self, value: ast.expr) -> ast.expr:
+    def products(self, value: ast.expr, values_only: bool = False) -> ast.expr:
         """A product (of two computed values, or by a constant that isn't a power of
         two: a multiplier either way): a register after its multiplier (its value a
         clock later), so that a clock has one multiplier on a path at most (two in
-        a row, with the adders around them, take longer than 20 ns)."""
+        a row, with the adders around them, take longer than 20 ns). values_only:
+        products of two values only (an address: by a constant, a few adders)."""
         code = self
 
         def shift(x: ast.expr) -> bool:
@@ -541,6 +577,8 @@ class BlockCode:
             def visit_BinOp(self, n: ast.BinOp):
                 self.generic_visit(n)
                 consts = [x for x in (n.left, n.right) if isinstance(x, ast.Constant)]
+                if values_only and consts:
+                    return n
                 if isinstance(n.op, ast.Mult) and len(consts) < 2 and not any(map(shift, consts)):
                     name = code.emit("mul", n, bump=True)
                     code.muls.add(name)
@@ -573,28 +611,32 @@ class BlockCode:
             raise self.NotSequenceable(f"The argument '{a}' is written")
         if a in self.rams:
             self.reads = {k: v for k, v in self.reads.items() if k[0] != a}
-            addr = self.emit(f"{a}_wa", idx)
+            addr = self.emit(f"{a}_wa", self.products(idx, values_only=True))
             data = self.emit(f"{a}_wd", self.products(value))
             self.declare(data, a)
             c = self.emit(f"{a}_we", cond) if cond is not None else None
+            base, base_reg = self.ext_base(a) if a in self.ext_lists else (None, None)
             if a in self.ext_lists and self.ext_lists[a].get("words", 1) == 2:
-                # (a value in two words: its low 16 bits, then the rest)
-                for half, extra in (("lo", 0), ("hi", 1)):
-                    wa = self.emit(f"{a}_wa{half}", ast.BinOp(
-                        left=ast.BinOp(left=_name(addr), op=ast.Mult(), right=ast.Constant(2)),
-                        op=ast.Add(), right=ast.Constant(extra)))
+                # (a value in two words: its low 16 bits, then the rest, both at the
+                # low one's address, the port adding the high one's odd bit)
+                word = ast.BinOp(left=_name(addr), op=ast.Mult(), right=ast.Constant(2))
+                if base_reg is not None:
+                    word = self.based(base_reg, word)
+                even = self.emit(f"{a}_walo", word)
+                for half in ("lo", "hi"):
+                    wa = even if half == "lo" else self.emit(f"{a}_wahi", _name(even))
                     part = (ast.BinOp(left=_name(data), op=ast.BitAnd(), right=ast.Constant(0xFFFF))
                             if half == "lo" else
                             ast.BinOp(left=_name(data), op=ast.RShift(), right=ast.Constant(16)))
                     wd = self.emit(f"{a}_wd{half}", part)
                     self.writes.append(_Write(a, wa, wd, c, max(
                         self.ready[wa], self.ready[wd], self.ready.get(c, 0) if c else 0),
-                        ext=self.ext_lists[a]["base"], index=addr, value=data, half=half))
+                        ext=base, index=addr, value=data, half=half))
                 return
-            self.writes.append(_Write(a, addr, data, c, max(self.ready[addr], self.ready[data],
-                                                            self.ready.get(c, 0) if c else 0),
-                                      ext=self.ext_lists[a]["base"] if a in self.ext_lists
-                                      else None))
+            at = self.at_base(a, addr, base_reg, "wb")
+            self.writes.append(_Write(a, at, data, c, max(self.ready[at], self.ready[data],
+                                                          self.ready.get(c, 0) if c else 0),
+                                      ext=base, index=addr))
             return
         elems = self.elements(a)
         try:
@@ -635,9 +677,135 @@ class BlockCode:
         self.clocks = last + 1
 
 
+def share_products(codes, ranges_of: Dict[int, Dict[str, Tuple[int, int]]], attr,
+                   fresh) -> List[Dict[str, Any]]:
+    """
+    The products of two values (not by a constant) on a few multipliers, every
+    block's: the machine runs one block at a time, so a multiplier serves them
+    all; when they'd take more than the device's multipliers (DSP_ELEMENTS:
+    fewer, each its own, without operands to pick between, a few logic
+    elements fewer). A block's products at one clock each take their own (a pipelined
+    loop's: all of them, at every clock); a unit serves blocks of one kind,
+    pipelined or not, and has two users at least (one alone keeps its
+    multiplier). A user's operands are picked by the state (and its clock,
+    outside a pipelined loop); outside one, the product is read only from its
+    register, which loads at its clock (references to the product's wire are
+    to the register). Returns the units: {'name', 'pipelined', 'users': [{'k',
+    'clock' (None: a pipelined loop's), 't' (the product), 'a', 'b' (its
+    operands), 'ra', 'rb' (their ranges), 'held' (its register)}]}.
+    """
+    from .share import NotShareable, _interval
+    mode = os.environ.get("PY2VER_SHARE_PRODUCTS", "auto")     # (1: always, 0: never)
+    if mode == "0":
+        return []
+    wires = {s.targets[0].id for code in codes.values() for s in code.out}
+    users: Dict[bool, List[Dict[str, Any]]] = {False: [], True: []}
+    for k in sorted(codes):
+        code = codes[k]
+        rng = ranges_of.get(k)
+        if rng is None or not code.muls:
+            continue
+        piped = code.pipe is not None
+        held_of = {m: r for r, (m, _) in code.held.items()}
+        slots: Dict[Optional[int], int] = {}
+        for s in code.out:
+            t, v = s.targets[0].id, s.value
+            if t not in code.muls or not (isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult)) \
+                    or any(isinstance(x, ast.Constant) for x in (v.left, v.right)):
+                continue
+            if piped and any(isinstance(x, ast.Name) and x.id in wires for x in ast.walk(v)):
+                continue                          # (its operands: registers, at a stage)
+            if not piped and t not in held_of:
+                continue                          # (no register: used the clock it's made)
+            try:
+                ra, rb = _interval(v.left, rng, attr), _interval(v.right, rng, attr)
+            except NotShareable:
+                continue
+            clock = None if piped else code.ready[t] - 1
+            unit = slots.get(clock, 0)
+            slots[clock] = unit + 1
+            users[piped].append({"k": k, "clock": clock, "t": t, "a": v.left, "b": v.right,
+                                 "ra": ra, "rb": rb, "held": held_of.get(t), "unit": unit})
+    # (products the device's multipliers take as they are: theirs, no operands to pick)
+    def elements(u: Dict[str, Any]) -> int:
+        wa, wb = (int(_fmt_of(r)["width"]) for r in (u["ra"], u["rb"]))
+        return 1 if wa <= 9 and wb <= 9 else 2 * -(-wa // 18) * -(-wb // 18)
+    if mode == "auto" and sum(elements(u) for us in users.values() for u in us) <= DSP_ELEMENTS:
+        return []
+    units: List[Dict[str, Any]] = []
+    for piped in (True, False):
+        for i in range(max([u["unit"] for u in users[piped]] + [-1]) + 1):
+            mine = [u for u in users[piped] if u["unit"] == i]
+            if len(mine) < 2:
+                continue
+            units.append({"name": fresh(f"pmul{len(units)}"), "pipelined": piped, "users": mine})
+    # (a shared product another's operand, outside a pipelined loop: its register)
+    regs_of = {(u["k"], u["t"]): u["held"] for unit in units if not unit["pipelined"]
+               for u in unit["users"]}
+    for unit in units:
+        for u in unit["users"]:
+            for side in ("a", "b"):
+                e = copy.deepcopy(u[side])
+                for x in ast.walk(e):
+                    if isinstance(x, ast.Name) and (u["k"], x.id) in regs_of:
+                        x.id = regs_of[(u["k"], x.id)]
+                u[side] = e
+    for unit in units:
+        for u in unit["users"]:
+            code = codes[u["k"]]
+            if unit["pipelined"]:                 # (the product: the unit's, at its stage)
+                code.out = [_assign(u["t"], _name(unit["name"])) if s.targets[0].id == u["t"]
+                            else s for s in code.out]
+                continue
+            held = u["held"]
+
+            class _Reg(ast.NodeTransformer):
+                def visit_Name(self, x: ast.Name):
+                    return _name(held) if x.id == u["t"] else x
+            code.out = [_Reg().visit(s) for s in code.out if s.targets[0].id != u["t"]]
+            code.shared_held[held] = (unit["name"], u["clock"])
+    if units:
+        log.info("%d products on %d multipliers", sum(len(u["users"]) for u in units), len(units))
+    return units
+
+
+def emit_units(units, codes, issue_chain, new_attr, fresh, piped: bool) -> List[ast.stmt]:
+    """The shared multipliers (share_products) of one kind: each user's operands
+    in the unit's formats, picked by the state (and clock), and their product."""
+    from .share import _hull
+    out: List[ast.stmt] = []
+    for unit in units:
+        if unit["pipelined"] != piped:
+            continue
+        operands = {}
+        for side in ("a", "b"):
+            meta = dict(_fmt_of(_hull((-1, 0), *[u["r" + side] for u in unit["users"]])),
+                        type="wire")
+            items = []
+            for u in unit["users"]:
+                w = fresh(f"{unit['name']}_{side}")
+                out.append(_assign(w, copy.deepcopy(u[side])))
+                new_attr[w] = dict(meta)
+                items.append((u["k"], u["clock"] or 0, _name(w)))
+            operands[side] = fresh(f"{unit['name']}_{side}")
+            out.append(_assign(operands[side], issue_chain(items, ast.Constant(0))))
+            new_attr[operands[side]] = dict(meta)
+        out.append(_assign(unit["name"], ast.BinOp(left=_name(operands["a"]), op=ast.Mult(),
+                                                   right=_name(operands["b"]))))
+        lo_a, hi_a = _hull((-1, 0), *[u["ra"] for u in unit["users"]])
+        lo_b, hi_b = _hull((-1, 0), *[u["rb"] for u in unit["users"]])
+        corners = [x * y for x in (lo_a, hi_a) for y in (lo_b, hi_b)]
+        new_attr[unit["name"]] = dict(_fmt_of((min(corners), max(corners))), type="wire")
+    return out
+
+
 def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
-                 DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories=(), ext=None):
-    """The per-clock function (share.py's form) and its schedule."""
+                 DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories=(), ext=None,
+                 units=(), control_regs=(), steps=(0, 0), aliases=None):
+    """The per-clock function (share.py's form) and its schedule. control_regs:
+    scalars the control reads (steps.py's slots: loop counts, the state to go to);
+    steps: (steps, templates) of steps.py; aliases: a template's name of a slot ->
+    the slot (a wire from its register, in the template's format)."""
     from .sequencer import Loop, _walk_items
     fd = sq.fd
     n = len(blocks)
@@ -667,6 +835,23 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                if codes[k].pipe else codes[k].clocks) for k in codes}
     max_c = max(run.values())
     reg(cyc, bits(max_c + 1))
+
+    def iterations(k: int, less: int = 0) -> ast.expr:
+        """A pipelined loop's iterations (less fewer) times its ii: a slot's count
+        (steps.py) or its own."""
+        ii = codes[k].pipe.get("ii", 1)
+        if codes[k].pipe.get("count"):
+            n = ast.BinOp(left=_name(codes[k].pipe["count"]), op=ast.Sub(),
+                          right=ast.Constant(less)) if less else _name(codes[k].pipe["count"])
+            return n if ii == 1 else ast.BinOp(left=n, op=ast.Mult(), right=ast.Constant(ii))
+        return ast.Constant((codes[k].pipe["n"] - less) * ii)
+
+    def last_clock(k: int) -> ast.expr:
+        """The clock a block ends at, each time it runs."""
+        if codes[k].pipe is not None and codes[k].pipe.get("count"):
+            return ast.BinOp(left=iterations(k, 1), op=ast.Add(),
+                             right=ast.Constant(codes[k].clocks - 1))
+        return ast.Constant(run[k] - 1)
     at_start("st_now", st, start_state)
     at_start("cyc_now", cyc, ast.Constant(0))
     new_attr["st_now"] = dict(bits(DONE + 1), type="wire")
@@ -685,7 +870,13 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         new_attr[f"{cnt}_now"] = dict(meta, type="wire")
         at_start(f"{cnt}_now", f"r_{cnt}", start_sets.get(cnt))
 
+    # ----- a template's slots (steps.py): its registers', in its own format
+    for name, q in sorted((aliases or {}).items()):
+        stmts.append(_assign(name, _name(f"r_{q}")))
+        new_attr[name] = fmt(name)
+
     # ----- every block's logic
+    piped_units_at = len(stmts)                   # (the shared multipliers of pipelined loops)
     for k in range(n):
         stmts += codes[k].out
         for r, (v, meta) in codes[k].held.items():      # (a product's register)
@@ -695,6 +886,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         for r, (nxt, meta) in codes[k].extra_regs.items():     # (dividers)
             regs[r] = nxt
             new_attr[r] = dict(meta, type="wire")
+    units_at = len(stmts)                         # (the other shared multipliers)
 
     # ----- pipelined loops: which stages hold an iteration (valid), the delays
     valid: Dict[Tuple[int, int], str] = {}
@@ -705,7 +897,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         v0 = sq.fresh(f"b{k}_valid0")
         ii = pipe.get("ii", 1)
         first = _and(_eq(_name("st_now"), k), ast.Compare(
-            left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant(pipe["n"] * ii)]))
+            left=_name("cyc_now"), ops=[ast.Lt()], comparators=[iterations(k)]))
         if ii > 1:                                   # (an iteration starts every ii clocks)
             first = _and(first, _eq(_name(f"cm{ii}_now"), 0))
         stmts.append(_assign(v0, first))
@@ -729,22 +921,35 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     # block, or a loop's previous iteration) or returned; the rest are wires
     ret_names = {x.id for x in ast.walk(ret) if isinstance(x, ast.Name)}
     assigned = {v for k in codes for v in codes[k].env}
-    scalars = sorted({v for k in codes for v in codes[k].read_regs} | (ret_names & assigned))
+    scalars = sorted({v for k in codes for v in codes[k].read_regs} | (ret_names & assigned)
+                     | set(control_regs))
     end = _name("blk_end")
-    stmts.append(_assign("blk_end", ast.Compare(
+    counted = [k for k in range(n) if codes[k].pipe is not None and codes[k].pipe.get("count")]
+    blk_end: ast.expr = ast.Compare(
         left=_name("cyc_now"), ops=[ast.Eq()],
-        comparators=[_sel([ast.Constant(run[k] - 1) for k in range(n)]
-                          + [ast.Constant(0)], _name("st_now"))])))
+        comparators=[_sel([ast.Constant(0 if k in counted else run[k] - 1) for k in range(n)]
+                          + [ast.Constant(0)], _name("st_now"))])
+    for k in counted:                            # (a slot's count of iterations: its own test)
+        blk_end = ast.IfExp(test=_eq(_name("st_now"), k), body=ast.Compare(
+            left=_name("cyc_now"), ops=[ast.Eq()], comparators=[last_clock(k)]), orelse=blk_end)
+    stmts.append(_assign("blk_end", blk_end))
 
     def next_value(per_block: List[ast.expr], keep: ast.expr) -> ast.expr:
         # (a register only a few blocks set: a chain over those, not a multiplexer over
         # every block; a state machine of hundreds of blocks made gigantic ones)
         kept = _key(keep)
         writers = [(k, v) for k, v in enumerate(per_block) if _key(v) != kept]
-        if len(writers) <= max(8, len(per_block) // 4):
+        # (the blocks that set it to one value: one of the chain, a test of them
+        # all; the ends of steps.py's templates, say, one next step)
+        values: Dict[Any, Tuple[ast.expr, List[int]]] = {}
+        for k, v in writers:
+            values.setdefault(_key(v), (v, []))[1].append(k)
+        if len(values) <= max(8, len(per_block) // 4):
             value: ast.expr = _copy(keep)
-            for k, v in reversed(writers):
-                value = ast.IfExp(test=_eq(_name("st_now"), k), body=_copy(v), orelse=value)
+            for v, ks in reversed(list(values.values())):
+                test = _eq(_name("st_now"), ks[0]) if len(ks) == 1 else ast.BoolOp(
+                    op=ast.Or(), values=[_eq(_name("st_now"), k) for k in ks])
+                value = ast.IfExp(test=test, body=_copy(v), orelse=value)
         else:
             value = _sel(per_block + [keep], _name("st_now"))
         return ast.IfExp(test=copy.deepcopy(end), body=value, orelse=keep)
@@ -810,7 +1015,7 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                 step = lp.values[1] - lp.values[0]
                 ii = pipe.get("ii", 1)
                 test = _and(_eq(_name("st_now"), k), ast.Compare(
-                    left=_name("cyc_now"), ops=[ast.Lt()], comparators=[ast.Constant((pipe["n"] - 1) * ii)]))
+                    left=_name("cyc_now"), ops=[ast.Lt()], comparators=[iterations(k, 1)]))
                 if ii > 1:                           # (a step every ii clocks)
                     test = _and(test, _eq(_name(f"cm{ii}_now"), ii - 1))
                 value = ast.IfExp(test=test,
@@ -831,12 +1036,20 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         pipelined block: a write at its stage while an iteration is there, a read
         every clock."""
         def chain(part: List[Tuple[int, int, ast.expr]]) -> ast.expr:
-            out = hold
-            for k, c, v in reversed(part):
+            # (a block's items of one value: one of the chain, its clocks together)
+            merged: Dict[Any, Tuple[ast.expr, List[ast.expr]]] = {}
+            for k, c, v in part:
                 if codes[k].pipe is None:
                     test = _and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), c))
                 else:
                     test = _name(valid[(k, c)]) if write else _eq(_name("st_now"), k)
+                key = (k, _key(v))
+                if key not in merged:
+                    merged[key] = (v, [])
+                merged[key][1].append(test)
+            out = hold
+            for v, tests in reversed(list(merged.values())):
+                test = tests[0] if len(tests) == 1 else ast.BoolOp(op=ast.Or(), values=tests)
                 out = ast.IfExp(test=test, body=v, orelse=out)
             return out
         blocks: Dict[int, List[Tuple[int, int, ast.expr]]] = {}
@@ -856,6 +1069,23 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                                               comparators=[ast.Constant(keys[mid])]),
                              body=search(lo, mid), orelse=search(mid, hi))
         return search(0, len(keys))
+
+    # ----- shared multipliers (share_products): a pipelined loop's operands are
+    # registers, its units first; the others' after every block, with the
+    # registers that load their products
+    if units:
+        late = emit_units(units, codes, issue_chain, new_attr, sq.fresh, piped=False)
+        for k in range(n):
+            for r, (unit, c) in codes[k].shared_held.items():
+                nxt = sq.fresh(f"{r}_n")
+                late.append(_assign(nxt, ast.IfExp(
+                    test=_and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), c)),
+                    body=_name(unit), orelse=_name(r))))
+                new_attr[nxt] = dict(new_attr[r])
+                regs[r] = nxt
+        stmts[units_at:units_at] = late
+        stmts[piped_units_at:piped_units_at] = emit_units(units, codes, issue_chain, new_attr,
+                                                          sq.fresh, piped=True)
 
     ext_lists = (ext or {}).get("lists", {})
     for a in sorted(set(rams) - set(ext_lists)):
@@ -938,7 +1168,14 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
     ext_reads = [(k, s) for k in codes for s in codes[k].sites if s.ext is not None]
     ext_writes = [(k, w) for k in codes for w in codes[k].writes if w.ext is not None]
     if ext_reads or ext_writes:
+        # (an address that's another's copy, a high word's: that one, so a block's
+        # items of it are one)
+        copies = {s.targets[0].id: s.value.id for code in codes.values() for s in code.out
+                  if isinstance(s.value, ast.Name)}
+
         def at_base(base: int, a: str) -> ast.expr:
+            while a in copies:
+                a = copies[a]
             return ast.BinOp(left=ast.Constant(base), op=ast.Add(), right=_name(a))
         # (in a pipelined loop a read only while an iteration is at its stage: the
         # reads of an iteration take turns on the port)
@@ -950,17 +1187,29 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
                             ast.Constant(0), write=True)
         waddr = issue_chain([(k, w.clock, at_base(w.ext, w.addr)) for k, w in ext_writes],
                             ast.Constant(0), write=True)
+        # (a value's high word: at its low word's address, which is even, plus one)
+        odd = issue_chain([(k, s.clock, ast.Constant(1)) for k, s in ext_reads if s.half == "hi"]
+                          + [(k, w.clock, ast.Constant(1)) for k, w in ext_writes
+                             if w.half == "hi"], ast.Constant(0), write=True)
         stmts.append(_assign("ext_we", wr))
         stmts.append(_assign("ext_req", ast.BoolOp(op=ast.Or(), values=[_name("ext_we"), rd])))
-        stmts.append(_assign("ext_addr", ast.IfExp(test=_name("ext_we"), body=waddr, orelse=raddr)))
+        stmts.append(_assign("ext_odd", odd))
+        stmts.append(_assign("ext_addr", ast.BinOp(
+            left=ast.IfExp(test=_name("ext_we"), body=waddr, orelse=raddr), op=ast.BitOr(),
+            right=_name("ext_odd"))))
         stmts.append(_assign("ext_wdata", issue_chain(
             [(k, w.clock, _name(w.data)) for k, w in ext_writes], ast.Constant(0), write=True)))
         one = {"signed": 0, "width": 1, "type": "wire"}
-        new_attr.update({"ext_we": one, "ext_req": one,
+        new_attr.update({"ext_we": one, "ext_req": one, "ext_odd": one,
                          "ext_addr": {"signed": 0, "width": 24, "type": "wire"},
                          "ext_wdata": {"signed": 0, "width": 16, "type": "wire"},
                          "ext_q": {"signed": 0, "width": 16, "type": "wire"}})
-        for k, s in ext_reads:
+        # (outside a pipelined loop: a block's j-th read held in the j-th of a few
+        # registers, every block's, loaded the clock its data comes, read after)
+        pool: List[str] = []
+        arrive: List[Dict[int, int]] = []           # j -> {block: the clock its j-th comes}
+        nth: Dict[int, int] = {}
+        for k, s in sorted(ext_reads, key=lambda ks: (ks[0], ks[1].clock)):
             meta = (_fmt_of((min(s.array), max(s.array))) if s.rom else fmt(s.array))
             if s.half == "lo":                           # (a value in two words)
                 meta = {"signed": 0, "width": 16}
@@ -970,14 +1219,31 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
             if codes[k].pipe is not None:
                 # (a pipelined loop: the data at its stage, delayed after as any value)
                 stmts.insert(0, _assign(s.data, _name("ext_q")))
-            else:
-                # (a block: the data held from the clock it comes)
-                hold = sq.fresh(f"r_{s.data}_h")
-                reg(hold, meta)
-                when = _and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), s.clock + EXT_LATENCY))
-                stmts.insert(0, _assign(s.data, ast.IfExp(test=when, body=_name("ext_q"),
-                                                          orelse=_name(hold))))
-                regs[hold] = s.data
+                continue
+            j = nth.get(k, 0)
+            nth[k] = j + 1
+            if j == len(pool):
+                pool.append(reg(sq.fresh(f"r_extq{j}"), {"signed": 0, "width": 16}))
+                arrive.append({})
+            arrive[j][k] = s.clock + EXT_LATENCY
+            stmts.insert(0, _assign(s.data, _name(pool[j])))
+        for j, r in enumerate(pool):
+            ks = sorted(arrive[j])
+            if len(ks) <= 8:
+                load: ast.expr = ast.BoolOp(op=ast.Or(), values=[
+                    _and(_eq(_name("st_now"), k), _eq(_name("cyc_now"), arrive[j][k])) for k in ks]) \
+                    if len(ks) > 1 else _and(_eq(_name("st_now"), ks[0]),
+                                             _eq(_name("cyc_now"), arrive[j][ks[0]]))
+            else:                                     # (by the state: its clock, if it has one)
+                load = _and(_sel([ast.Constant(int(k in arrive[j])) for k in range(n)]
+                                 + [ast.Constant(0)], _name("st_now")),
+                            ast.Compare(left=_name("cyc_now"), ops=[ast.Eq()], comparators=[
+                                _sel([ast.Constant(arrive[j].get(k, 0)) for k in range(n)]
+                                     + [ast.Constant(0)], _name("st_now"))]))
+            nxt = sq.fresh(f"{r}_n")
+            stmts.append(_assign(nxt, ast.IfExp(test=load, body=_name("ext_q"), orelse=_name(r))))
+            new_attr[nxt] = dict(new_attr[r])
+            regs[r] = nxt
         extra_params.append("ext_q")
         extra_returns += ["ext_req", "ext_we", "ext_addr", "ext_wdata"]
         sdram_info = dict(ext, latency=EXT_LATENCY)
@@ -1030,7 +1296,8 @@ def emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_
         params={phase} | set(reg_names) | set(extra_params), attr=new_attr, reg_init=reg_init,
         roms=roms, rfs=rfs, extra_params=extra_params, extra_returns=extra_returns,
         register_bits=sum(int(new_attr[r]["width"]) for r in reg_names), memories=mem_info,
-        sdram=sdram_info, blocks=n, pipelined=sum(1 for k in codes if codes[k].pipe is not None))
+        sdram=sdram_info, blocks=n, pipelined=sum(1 for k in codes if codes[k].pipe is not None),
+        steps=steps[0], templates=steps[1])
 
 
 def _wrap(n: int, w: int, signed: bool) -> int:
@@ -1136,7 +1403,9 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     data_of = {s.addr: s.data for s in code.sites}
     latency = {s.addr: EXT_LATENCY if s.ext is not None else 1 for s in code.sites}
     ext_addrs = [s.addr for s in code.sites if s.ext is not None]
-    bump: Dict[str, int] = {a: 0 for a in ext_addrs}  # (an SDRAM read issued this much later)
+    # (an SDRAM read issued this much later: a stage after its address at least, the
+    # port's address from a register, not from the stage's products and sums)
+    bump: Dict[str, int] = {a: 1 for a in ext_addrs}
 
     def stage(e: ast.expr) -> int:
         return max([0] + [ready.get(n.id, 0) for n in ast.walk(e)
@@ -1224,6 +1493,8 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     taken = {(ready[a] + bump[a]) % ii for a in ext_addrs}
     for w in code.writes:
         w.clock = max(ready.get(w.addr, 0), ready.get(w.data, 0), ready.get(w.cond, 0) if w.cond else 0)
+        if w.ext is not None:                        # (the SDRAM's: from registers, a stage on)
+            w.clock += 1
         if w.ext is not None and ii > 1:             # (its own clock of the ii, too)
             while w.clock % ii in taken:
                 w.clock += 1

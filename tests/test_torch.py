@@ -380,6 +380,25 @@ def test_a_diffusion_u_net_in_hardware(monkeypatch, tmp_path):
     assert p.TB_batch()(xs[5:6]) == p.PY_batch()(xs[5:6])
 
 
+@pytest.mark.sim
+@pytest.mark.slow
+def test_a_diffusion_u_net_as_steps_in_the_sdram(monkeypatch, tmp_path):
+    """The U-Net for the board (sdram=True): its hundreds of loop nests a loop over
+    its steps, a few dozen templates (steps.py), simulated the same as its model."""
+    import shutil
+    monkeypatch.chdir(tmp_path)
+    if shutil.which("verilator"):
+        monkeypatch.setenv("PY2VER_SIM", "verilator")
+    D, m = _unet()
+    g = torch.Generator().manual_seed(2)
+    xs = [(torch.randn(1, 1, 8, 8, generator=g), torch.tensor([t]),
+           torch.randint(0, 11, (1,), generator=g)) for t in (0, 999, 300, 650, 120, 870)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs[:5], width=24, round=True, margin=2, sdram=True)
+    assert p.schedule.steps > 4 * p.schedule.templates
+    assert p.TB_batch()(xs[5:]) == p.PY_batch()(xs[5:])
+
+
 def test_an_assert_is_checked_when_translating():
     class Checked(nn.Module):
         def forward(self, x):

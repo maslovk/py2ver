@@ -42,6 +42,8 @@ class Schedule:
     sdram: Dict[str, Any] | None = None
     blocks: int = 0
     pipelined: int = 0
+    steps: int = 0                          # (steps.py: the steps, their templates)
+    templates: int = 0
 
     @property
     def sequenced(self) -> bool:

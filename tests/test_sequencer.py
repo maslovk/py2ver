@@ -187,6 +187,55 @@ def test_a_deep_pipeline_in_hardware(monkeypatch, tmp_path):
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
 
 
+def products(x):
+    h = [0] * 40
+    for i in range(40):
+        h[i] = x[i % 16] * x[(i + 3) % 16]          # pipelined: a product a clock
+    s = 0
+    for i in range(40):
+        s = s + h[i] * x[i % 16]                    # another loop's, on the same multiplier
+    for j in range(4):
+        a = x[j] * x[j + 4] * x[j + 8]              # outside a pipelined loop, one after another
+        for i in range(8):
+            a = a + h[i * 4 + j] * x[i]
+        h[j] = a * x[j + 12]
+    t = x[0] * x[1] - h[2] * h[3]                    # two in one clock: one alone, its own
+    u = h[0] + h[3]
+    return s, t, u
+
+
+def _units(info):
+    return sorted(k for k in info.attr if k.startswith("pmul") and "_" not in k)
+
+
+def test_products_of_every_loop_share_a_few_multipliers(monkeypatch):
+    # (a few products: the device's multipliers would take them, shared all the same)
+    monkeypatch.setenv("PY2VER_SHARE_PRODUCTS", "1")
+    fe = front_end(products, X16)
+    tree, info = sequence(fe.tree, fe.attr, _namespace(products))
+    model = build_model(tree, dict(fe.attr, **info.attr), _namespace(products))
+    for _ in range(20):
+        x = _vec()
+        assert simulate(info, model, (x,)) == products(x)
+    # (the pipelined loops' products on one, the other blocks' on another)
+    assert info.pipelined == 3 and len(_units(info)) == 2
+    for mode in ("0", "auto"):                       # (by default: within the device's, its own)
+        monkeypatch.setenv("PY2VER_SHARE_PRODUCTS", mode)
+        _, alone = sequence(fe.tree, fe.attr, _namespace(products))
+        assert not _units(alone) and alone.phases == info.phases
+
+
+@pytest.mark.sim
+def test_shared_multipliers_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SHARE_PRODUCTS", "1")
+    p = Py2ver(products, X16, sequential=True)
+    assert "pmul" in (tmp_path / "hdl" / "main.v").read_text()
+    vectors = [(_vec(),) for _ in range(6)]
+    assert p.PY_batch()(vectors) == [products(*v) for v in vectors]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
 import functools                                      # noqa: E402
 from py2ver.fixed import isqrt                        # noqa: E402
 

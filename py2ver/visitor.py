@@ -751,7 +751,8 @@ class FunctionVisitor(ast.NodeVisitor):
                 try:
                     sh = max(0, int(self._eval_int(node.right)))
                 except Exception:
-                    sh = rw
+                    # (by a value: as far as its format reaches, 2^rw - 1 at most)
+                    sh = (1 << (rw - 1 if rs else rw)) - 1
                 return {"width": lw + sh, "signed": ls}
             if isinstance(node.op, ast.RShift):
                 return {"width": lw, "signed": ls}

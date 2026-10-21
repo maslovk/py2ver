@@ -28,9 +28,10 @@
 #   python examples/diffusion_hardware.py --steps 20    # more DDIM steps (two calls each)
 #   python examples/diffusion_hardware.py --sdram       # built for the board (weights in the SDRAM)
 #
-# With --sdram it builds (1,096,539,628 clocks a call: 22 s at 50 MHz) but doesn't
-# fit the EP4CE22: its thousand-odd loop nests, each its own logic, take about
-# 138,000 combinational nodes in Quartus, the device has 22,320.
+# With --sdram its 422 loop nests are 540 steps of 59 templates (steps.py), its
+# products on a few multipliers, and the board's whole project fits the EP4CE22
+# and meets 50 MHz: 20,531 logic elements (92 %), 51.8 MHz; 1,127,273,570 clocks
+# a call (22.5 s at 50 MHz).
 import contextlib
 import io
 import os
