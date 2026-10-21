@@ -78,6 +78,7 @@ EXT_LATENCY = 7          # a read of the SDRAM: its data this many clocks after 
 EXT_HELD = EXT_LATENCY + 1   # (outside a pipelined loop: from a register a clock later)
 CHAIN_BLOCKS = 32         # a port shared by more blocks: chosen by a search on the state
 DSP_ELEMENTS = 132        # the EP4CE22's 9-bit multipliers: products past them share (share_products)
+UNIT_USERS = 8            # a shared multiplier's products at most
 
 
 class _Site:
@@ -735,10 +736,15 @@ def share_products(codes, ranges_of: Dict[int, Dict[str, Tuple[int, int]]], attr
     units: List[Dict[str, Any]] = []
     for piped in (True, False):
         for i in range(max([u["unit"] for u in users[piped]] + [-1]) + 1):
-            mine = [u for u in users[piped] if u["unit"] == i]
-            if len(mine) < 2:
-                continue
-            units.append({"name": fresh(f"pmul{len(units)}"), "pipelined": piped, "users": mine})
+            mine = sorted((u for u in users[piped] if u["unit"] == i), key=lambda u: u["k"])
+            # (UNIT_USERS a multiplier at most: its operands' multiplexer a few levels)
+            n_units = -(-len(mine) // UNIT_USERS)
+            for j in range(n_units):
+                part = mine[j * len(mine) // n_units:(j + 1) * len(mine) // n_units]
+                if len(part) < 2:
+                    continue
+                units.append({"name": fresh(f"pmul{len(units)}"), "pipelined": piped,
+                              "users": part})
     # (a shared product another's operand, outside a pipelined loop: its register)
     regs_of = {(u["k"], u["t"]): u["held"] for unit in units if not unit["pipelined"]
                for u in unit["users"]}

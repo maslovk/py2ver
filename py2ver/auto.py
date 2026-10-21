@@ -535,11 +535,17 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
         number for all outputs or {output: error} (other outputs are free).
     margin: extra integer bits above the measured range.
     round / saturate: added to every chosen format.
+    attr['weights'] = {'width': N}: a numpy loop program's weight tables N bits
+        wide (their integer bits their values', no margin), the rest width's.
     """
     if width is None and max_error is None:
         raise ValueError("Give width=<bits> or max_error=<error> (or both)")
     attr = dict(attr or {})
     while_n = attr.pop("while", None)          # iterations of the while loops (else measured)
+    # ('weights': {'width': N}: a numpy loop program's weight tables N bits wide,
+    # their integer bits their values' (constants: no margin))
+    weights = attr.pop("weights", None) or {}
+    weight_width = int(weights["width"]) if "width" in weights else None
     base = {k: dict(v) for k, v in normalize_attr(attr).items()}
     samples = list(samples)
     if not samples:
@@ -657,8 +663,14 @@ def auto_fixed(func: Callable, samples: List[Any], attr: Optional[Dict[str, Any]
         return {k: out[k] for k in sorted(out, key=lambda k: (k not in params,
                                                                 params.index(k) if k in params else 0))}
 
+    if weight_width is not None:
+        for name in ns0.get(WEIGHT_TABLES, ()):
+            if name in auto:
+                r = auto[name][0]
+                auto[name] = (r, r.int_bits())
     if max_error is None:
-        fracs = {n: width - 1 - ib + wider.get(n, 0) for n, (_, ib) in auto.items()}
+        fracs = {n: (weight_width if weight_width is not None and n in ns0.get(WEIGHT_TABLES, ())
+                     else width) - 1 - ib + wider.get(n, 0) for n, (_, ib) in auto.items()}
         return formats(fracs)
 
     # max_error: inputs are interface formats, not searched

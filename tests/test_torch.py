@@ -94,6 +94,25 @@ def test_a_torch_model_is_built_as_written():
     assert not tr.memories                                # (eval: nothing changes)
 
 
+def test_the_weights_get_a_width_of_their_own():
+    from py2ver.auto import WEIGHT_TABLES, auto_fixed
+    from py2ver.hwtypes import _namespace
+    m = _model()
+    m.eval()
+    xs = [torch.randn(1, 1, 6, 6) for _ in range(4)]
+    tr = numpy_loops.translate(m, xs[:3])
+    samples = [tr.adapt(x) for x in xs]
+    attr = auto_fixed(tr.func, samples, {"weights": {"width": 12}}, width=20, margin=2)
+    tables = _namespace(tr.func)[WEIGHT_TABLES]
+    # (the weight tables 12 bits, their integer bits their values', no margin: the
+    # rest as width says)
+    assert tables and all(attr[t]["width"] == 12 for t in tables)
+    assert {m_["width"] for n, m_ in attr.items() if n not in tables and "frac" in m_} == {20}
+    for t in tables:
+        top = max(abs(v) for v in _namespace(tr.func)[t])
+        assert top * 2 ** attr[t]["frac"] >= 2 ** 10          # (its 11 magnitude bits used)
+
+
 def test_torch_s_own_meanings_of_methods():
     torch.manual_seed(3)
     m = Ops()

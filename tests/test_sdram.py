@@ -327,6 +327,48 @@ def test_lists_not_needed_at_once_share_the_sdram(monkeypatch, tmp_path):
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
 
 
+def _rows_product(x):
+    a = [0] * 4096
+    for i in range(4096):
+        a[i] = x[i % 16] * ((i % 7) - 3)
+    s = 0
+    for i in range(64):                       # (each row of a: read once, for 4 filters)
+        for f in range(4):
+            acc = 0
+            for k in range(64):
+                acc = acc + a[i * 64 + k] * _W[(f * 31 + k) % 128]
+            s = s + acc * (f + 1)
+    return s
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_a_product_s_rows_are_read_once(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    from py2ver.core import front_end
+    from py2ver.hwtypes import _namespace
+    from py2ver.sequencer import sequence
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    fe = front_end(_rows_product, {"x": {"signed": 1, "width": 8, "length": 16}})
+    clocks = {}
+    for rows in ("0", "1"):
+        monkeypatch.setenv("PY2VER_ROWS", rows)
+        clocks[rows] = sequence(fe.tree, fe.attr, _namespace(_rows_product), sdram=0)[1].phases
+    # (an access a product, the table's, not two; each loop's start and end the
+    # same: rows of 64, 0.7 of the clocks)
+    assert clocks["1"] < 0.75 * clocks["0"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_rows_product, {"x": {"signed": 1, "width": 8, "length": 16}},
+                   sequential=True, sdram=0)
+    r = random.Random(1)
+    vectors = [([r.randint(-128, 127) for _ in range(16)],) for _ in range(2)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
 def _returns_a_list(x):
     h = [0] * 64
     for i in range(64):

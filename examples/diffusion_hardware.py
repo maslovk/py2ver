@@ -11,9 +11,10 @@
 # connections a Python list, SiLU a table. The weights are ROMs, the loops a
 # state machine (sequencer.py). Formats are chosen from inputs the network sees
 # while drawing (DDIM steps of a few digits, with and without their label: 20
-# bits, rounded, room for values twice as large: margin=2). The noise it
-# predicts (to about 4) is within 1.03 of torch's at 16 bits (the drawing lost),
-# 0.08 at 18, 0.02 at 20, 0.004 at 24.
+# bits, rounded, room for values twice as large: margin=2; the weights 16 bits,
+# a word of the SDRAM each, their integer bits their values'). The noise it
+# predicts (to about 4) is within 1.03 of torch's at 16 bits everywhere (the
+# drawing lost), 0.08 at 18, 0.02 at 20, 0.004 at 24.
 #
 # Drawing (Diffusion.sample: DDIM with classifier-free guidance) stays Python:
 # each step asks the hardware's bit-exact model for the noise twice (with the
@@ -30,8 +31,8 @@
 #
 # With --sdram its 422 loop nests are 540 steps of 59 templates (steps.py), its
 # products on a few multipliers, and the board's whole project fits the EP4CE22
-# and meets 50 MHz: 20,531 logic elements (92 %), 51.8 MHz; 1,127,273,570 clocks
-# a call (22.5 s at 50 MHz).
+# and meets 50 MHz: 21,624 logic elements (97 %), 54.1 MHz; 394,869,922 clocks a
+# call (7.9 s at 50 MHz).
 import contextlib
 import io
 import os
@@ -109,7 +110,8 @@ if __name__ == "__main__":
     t0 = time.time()
     with contextlib.redirect_stdout(io.StringIO()):
         p = Py2ver(model, samples=samples, width=20, round=True, margin=2,
-                   attr={"np.exp": {"bits": 14}, "__py2ver_silu": {"bits": 14}},
+                   attr={"np.exp": {"bits": 14}, "__py2ver_silu": {"bits": 14},
+                         "weights": {"width": 16}},
                    **({"sdram": True} if "--sdram" in sys.argv[1:] else {}))
     print(f"hardware: built in {time.time() - t0:.0f} s, {p.ram_phases:,} clocks per call "
           f"({p.ram_phases / 50e6:.1f} s at 50 MHz)")

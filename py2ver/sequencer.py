@@ -47,6 +47,7 @@ import copy
 import itertools
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -68,6 +69,7 @@ def _m9ks(depth: int, width: int) -> int:
     """The M9K blocks a RAM of depth x width takes (its best shape)."""
     return min(-(-depth // d) * -(-width // w) for d, w in M9K_SHAPES)
 ROM_MIN = 64              # a constant table this long or longer is a ROM
+ROW_MIN = 4096            # sdram=: a list this long or longer has its rows read once (_cached_rows)
 # A loop with dividers / square roots is pipelined (a register stage per step of
 # each) only if that saves at least this part of a sample's clocks
 UNIT_SAVING = 0.05
@@ -220,6 +222,80 @@ def _allocations(items, rams: Set[str], sq) -> List[Union[Block, Loop]]:
         if cur:
             out.append(Block(cur))
     return out
+
+
+def _cached_rows(items, rams: Set[str], sq, row: str) -> int:
+    """sdram=: a long list's row read again and again (a matrix product's: cols[i
+    * K + k] for every filter f) read once into a block RAM, row: a loop
+    ``for f`` with an inner loop ``for k`` reading A[idx], idx of k but not of
+    f nor of anything set inside the f loop, A (ROW_MIN long or more) not
+    written there, gets the row filled first, ``for k: row[k] = A[idx]``, and
+    reads row[k]: an SDRAM access an element of the row, not one an element
+    for each f. Changes items in place; returns the longest row (0: none)."""
+    longest = 0
+
+    def assigned(it) -> Set[str]:
+        out: Set[str] = set()
+        for x in _walk_items([it]):
+            if isinstance(x, Loop):
+                out.add(x.var)
+            else:
+                for s in x.stmts:
+                    out |= {n.id for n in ast.walk(s) if isinstance(n, ast.Name)
+                            and isinstance(n.ctx, ast.Store)}
+                    out |= {n.value.id for n in ast.walk(s) if isinstance(n, ast.Subscript)
+                            and isinstance(n.ctx, ast.Store) and isinstance(n.value, ast.Name)}
+        return out
+
+    def visit(body: List[Union[Block, Loop]]) -> None:
+        nonlocal longest
+        at = 0
+        while at < len(body):
+            lp = body[at]
+            if not isinstance(lp, Loop):
+                at += 1
+                continue
+            visit(lp.body)
+            inside = assigned(lp)
+            fill = None
+            for k in lp.body:
+                if not (isinstance(k, Loop) and len(k.body) == 1 and isinstance(k.body[0], Block)
+                        and k.values == list(range(len(k.values))) and len(lp.values) > 1):
+                    continue
+                for s in k.body[0].stmts:
+                    for x in ast.walk(s):
+                        if not (isinstance(x, ast.Subscript) and isinstance(x.ctx, ast.Load)
+                                and isinstance(x.value, ast.Name) and x.value.id in rams
+                                and sq.lists.get(x.value.id, 0) >= ROW_MIN
+                                and x.value.id not in inside):
+                            continue
+                        free = {n.id for n in ast.walk(x.slice) if isinstance(n, ast.Name)}
+                        if k.var not in free or free & (inside - {k.var}):
+                            continue
+                        var = sq.fresh("__rowi")
+
+                        class _K(ast.NodeTransformer):
+                            def visit_Name(self, n: ast.Name):
+                                return ast.Name(id=var, ctx=n.ctx) if n.id == k.var else n
+                        fill = Loop(var, list(k.values), [Block([ast.fix_missing_locations(ast.Assign(
+                            targets=[ast.Subscript(value=ast.Name(id=row, ctx=ast.Load()),
+                                                   slice=ast.Name(id=var, ctx=ast.Load()),
+                                                   ctx=ast.Store())],
+                            value=_K().visit(copy.deepcopy(x))))])])
+                        x.value = ast.Name(id=row, ctx=ast.Load())
+                        x.slice = ast.Name(id=k.var, ctx=ast.Load())
+                        longest = max(longest, len(k.values))
+                        break
+                    if fill is not None:
+                        break
+                if fill is not None:
+                    break
+            if fill is not None:
+                body.insert(at, fill)
+                at += 1
+            at += 1
+    visit(items)
+    return longest
 
 
 def _writes_all(loop: Loop, name: str, n: int, limit: int = 1 << 20) -> bool:
@@ -748,6 +824,15 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
     program = _allocations(program, rams, sq)
     if lanes > 1:
         program = _unrolled(program, lanes, sq.fresh)
+    # (sdram=: a product's row read once, into a block RAM of its own: _cached_rows)
+    rows: Set[str] = set()
+    if sdram is not None and sdram is not False and os.environ.get("PY2VER_ROWS", "1") != "0":
+        row = sq.fresh("__row")
+        n_row = _cached_rows(program, rams, sq, row)
+        if n_row:
+            sq.lists[row] = n_row
+            rams.add(row)
+            rows.add(row)
     blocks, loops = _number(program)
 
     # ----- ranges (for register widths)
@@ -781,7 +866,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         return dict(_fmt_of(r), type="wire")
 
     # ----- lists and tables in the SDRAM (sdram=): the largest, until the rest fits
-    ext = (_external(program, rams - ext_outputs - placeholders, fmt, attr, memories, sdram,
+    ext = (_external(program, rams - ext_outputs - placeholders - rows, fmt, attr, memories, sdram,
                      sq.lists, forced=steps.forced if steps else (),
                      order=steps.order if steps else None,
                      align=steps.align if steps else None)
@@ -824,6 +909,7 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
     def clocks_per_sample() -> int:
         """(a pipelined loop: N + its stages - 1 clocks each time it runs)"""
         total = 0
+        per_template.clear()
 
         def count(items, n: int, vals: Dict[str, int]):
             nonlocal total
@@ -844,8 +930,11 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         count(program, 1, {})
         if steps is not None:                          # (each step: its template, its counts)
             for proc, values in steps.calls:
+                before = total
                 count(proc.body, 1, steps.counts(values))
+                per_template[id(proc)] = per_template.get(id(proc), 0) + total - before
         return total
+    per_template: Dict[int, int] = {}
 
     # ----- innermost loops of one block: an iteration a clock (see pipeline_block)
     from .sequencer_blocks import pipeline_block
@@ -1022,6 +1111,15 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
 
     # How many times each block runs, and the clocks of a sample
     phases = clocks_per_sample() + 1
+    if steps is not None:                     # (where a sample's clocks go: -v)
+        procs = {id(it): it for it in program if isinstance(it, Proc)}
+        for pid, clocks in sorted(per_template.items(), key=lambda x: -x[1])[:12]:
+            first = max((s for b in _walk_items(procs[pid].body) if isinstance(b, Block)
+                         for s in b.stmts), key=lambda s: sum(1 for _ in ast.walk(s)),
+                        default=None)
+            log.info("%5.1f %% of the clocks: %d steps of the template of %s", 100 * clocks / phases,
+                     sum(1 for p, _ in steps.calls if id(p) == pid),
+                     ast.unparse(first)[:100] if first is not None else "-")
 
     return emit_machine(sq, program, blocks, codes, counters, succ, start_state, start_sets,
                         DONE, phases, ret, rams, reg_lists, rng, fmt, attr, memories, ext,
