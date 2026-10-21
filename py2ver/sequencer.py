@@ -855,6 +855,9 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         if code.pipe is not None or not code.muls:
             continue
         ranges = dict(known)
+        # (the divider's and the square root's own registers: their formats)
+        ranges.update({r: _fmt_range(meta) for r, (_, meta) in code.extra_regs.items()
+                       if r not in ranges})
         try:
             for s in code.out:
                 ranges[s.targets[0].id] = _interval(s.value, ranges, attr)

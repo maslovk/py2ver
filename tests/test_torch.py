@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import io
+import re
 import warnings
 
 import numpy as np
@@ -320,6 +321,18 @@ def _llama(seed=0, **size):
     m = L.MiniLlama(cfg)
     m.eval()
     return m
+
+
+def test_a_norm_s_products_are_registered():
+    """RMSNorm's x * rsqrt(...) * weight: a square root and a divider in its block,
+    and a register after each of its two multipliers all the same (two in a row
+    in a clock miss 50 MHz in Quartus)."""
+    m = _llama()
+    xs = [torch.randint(0, 13, (1, 8)) for _ in range(6)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs, width=16, round=True, margin=2, write=False)
+    held = re.findall(r"\breg\b[^;\n]*\b(r_b\d+_mul\w*);", p.verilog)
+    assert len(held) == 6                          # (two products in each of the 3 norms)
 
 
 def test_a_mini_llama_s_forward_pass_is_built_as_written():
