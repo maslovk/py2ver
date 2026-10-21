@@ -1,5 +1,5 @@
 # tests/conftest.py
-import pathlib, sys, textwrap, types, shutil, pytest
+import os, pathlib, sys, textwrap, types, shutil, pytest
 
 # Ensure project root on sys.path (so `visitor`, `renderer` import)
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -56,10 +56,40 @@ def _normalize_expected(py_out, p):
 
 
 def pytest_collection_modifyitems(items):
-    """A test using the simulation fixture is a simulation test."""
+    """A test using the simulation fixture is a simulation test; one using
+    Quartus's, a quartus test."""
     for item in items:
         if "assert_python_matches_sim" in getattr(item, "fixturenames", ()):
             item.add_marker(pytest.mark.sim)
+        if "quartus" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.quartus)
+
+
+# Quartus where the DE0-Nano's toolchain installs it (examples/_run.py's default)
+DEFAULT_QUARTUS_DIR = "/opt/intelFPGA/22.1std/quartus/bin"
+
+
+def quartus_dir():
+    """Quartus's bin directory: $QUARTUS_DIR, quartus_sh on PATH, or its usual
+    install; None if there is none."""
+    on_path = shutil.which("quartus_sh")
+    for d in (os.environ.get("QUARTUS_DIR"), os.path.dirname(on_path) if on_path else None,
+              DEFAULT_QUARTUS_DIR):
+        if d and os.path.exists(os.path.join(d, "quartus_sh")):
+            return d
+    return None
+
+
+@pytest.fixture
+def quartus(monkeypatch, tmp_path):
+    """SYN()'s options with Quartus's directory, the test in its own directory;
+    the test skipped if there is no Quartus."""
+    d = quartus_dir()
+    if d is None:
+        pytest.skip(f"Quartus not found (set QUARTUS_DIR, put quartus_sh on PATH or install "
+                    f"it in {DEFAULT_QUARTUS_DIR})")
+    monkeypatch.chdir(tmp_path)
+    return {"QUARTUS_DIR": d}
 
 
 @pytest.fixture(autouse=True)

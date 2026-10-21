@@ -336,6 +336,20 @@ def test_a_norm_s_products_are_registered():
     assert len(held) == 6                          # (two products in each of the 3 norms)
 
 
+def test_a_mini_llama_in_the_sdram_meets_50_mhz(quartus):
+    """The board's build (lists and tables in the SDRAM: sdram=0) meets the
+    DE0-Nano's clock: a norm's two products a clock apart (registered), the
+    SDRAM's write data and its controller. (At this size, 57 MHz; without the
+    products' registers, 46: smaller, both meet it.)"""
+    m = _llama(vocab_size=256, block_size=32, n_embd=64)
+    g = torch.Generator().manual_seed(1)
+    xs = [torch.randint(0, 256, (1, 32), generator=g) for _ in range(6)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs, width=16, round=True, margin=2, sdram=0)
+    r = p.SYN(quartus)
+    assert r.meets_timing, str(r)
+
+
 def _unbounded_products(real):
     """share._interval, raising for a product of a block's values (b5_x * b5_y: as a
     value py2ver can't bound; the program's own, before, as they are)."""

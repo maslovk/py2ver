@@ -1,8 +1,6 @@
 import cmath
 import math
-import os
 import random
-import shutil
 
 import pytest
 
@@ -164,18 +162,6 @@ def test_a_staged_interpolator_gives_one_sample_per_transfer(monkeypatch, tmp_pa
     assert p.TB_stages()(xs) == p.PY_stages()(xs)
 
 
-def _quartus_dir():
-    env = os.environ.get("QUARTUS_DIR")
-    if env and os.path.exists(os.path.join(env, "quartus_sh")):
-        return env
-    found = shutil.which("quartus_sh")
-    return os.path.dirname(found) if found else None
-
-
-@pytest.mark.quartus
-@pytest.mark.skipif(_quartus_dir() is None, reason="Quartus not found")
-def test_stages_are_smaller_in_quartus(monkeypatch, tmp_path, formats):
-    monkeypatch.chdir(tmp_path)
-    q = {"QUARTUS_DIR": _quartus_dir()}
+def test_stages_are_smaller_in_quartus(quartus, formats):
     p = Py2ver(receiver, formats, stages=True)
-    assert p.SYN_stages(q).combinational < p.SYN(q).combinational / 2
+    assert p.SYN_stages(quartus).combinational < p.SYN(quartus).combinational / 2

@@ -1420,10 +1420,10 @@ everything:
 ```
 .venv/bin/python -m pytest -q -n auto -m "not sim and not board"   # no simulator: ~30 s
 .venv/bin/python -m pytest -q -n auto -m "not board and not slow"  # + simulation: ~2.5 min
-.venv/bin/python -m pytest -q -n auto                              # everything: ~8 min
+.venv/bin/python -m pytest -q -n auto                              # everything: ~10 min
 .venv/bin/python -m pytest -q -n auto tests/test_share.py          # one feature's tests
 .venv/bin/python -m pytest -q --lf                                 # what failed last time
-QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   # + the Quartus tests
+.venv/bin/python -m pytest -q -n auto -m "not quartus"             # everything but Quartus
 ```
 
 - `sim`: compares the Python function against a simulation (the native
@@ -1434,7 +1434,10 @@ QUARTUS_DIR=/opt/intelFPGA/22.1std/quartus/bin .venv/bin/python -m pytest -q   #
   included, simulated.
 - `slow`: a large design simulated (a torch training step: minutes, most of
   them compiling its Verilog).
-- `quartus`: a real Quartus compile, skipped unless Quartus is found.
+- `quartus`: a real Quartus compile (area, timing at 50 MHz: an SDRAM design
+  of the mini Llama's must meet it), with Quartus from `QUARTUS_DIR`,
+  `quartus_sh` on `PATH`, or its usual install
+  (`/opt/intelFPGA/22.1std/quartus/bin`); skipped if none of them has it.
 
 The SDRAM controller is tested against py2ver's model of the chip, and also
 against Micron's MT48LC16M16A2 model (organized as the DE0-Nano's chip; not in

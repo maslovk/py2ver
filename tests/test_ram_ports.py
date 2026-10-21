@@ -1,4 +1,3 @@
-import os
 import random
 import shutil
 
@@ -115,19 +114,10 @@ def test_one_copy_per_read_port(monkeypatch, tmp_path):
     assert verilog.count("<= mem__wd;") == 2
 
 
-@pytest.mark.quartus
-def test_ram_ports_stay_block_ram_in_quartus(monkeypatch, tmp_path):
-    tool = os.environ.get("QUARTUS_DIR")
-    if not (tool and os.path.exists(os.path.join(tool, "quartus_sh"))):
-        found = shutil.which("quartus_sh")
-        tool = os.path.dirname(found) if found else None
-    if tool is None:
-        pytest.skip("Quartus not found (set QUARTUS_DIR or put quartus_sh on PATH)")
-    monkeypatch.chdir(tmp_path)
-
+def test_ram_ports_stay_block_ram_in_quartus(quartus):
     attr = {"i": {"signed": 0, "width": 8}, "j": {"signed": 0, "width": 8},
             "mem": {"signed": 1, "width": 16, "length": 256, "memory": "ram"}}
-    r = Py2ver(swap, attr).SYN({"QUARTUS_DIR": tool})
+    r = Py2ver(swap, attr).SYN(quartus)
 
     assert r.memory_bits == 2 * 256 * 16      # two read ports -> two copies
     assert r.combinational < 300

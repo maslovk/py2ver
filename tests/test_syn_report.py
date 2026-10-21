@@ -1,5 +1,3 @@
-import os
-import shutil
 import stat
 from pathlib import Path
 
@@ -28,14 +26,6 @@ FOO_ATTR = {
     "m": {"width": 32},
     "q": {"width": 16},
 }
-
-
-def _quartus_dir():
-    env = os.environ.get("QUARTUS_DIR")
-    if env and os.path.exists(os.path.join(env, "quartus_sh")):
-        return env
-    found = shutil.which("quartus_sh")
-    return os.path.dirname(found) if found else None
 
 
 # ----------------------------- parsers on real reports -----------------------------
@@ -164,14 +154,8 @@ def test_syn_project_combinational_core_has_no_clk_connection(monkeypatch, tmp_p
 
 # ----------------------------- real Quartus -----------------------------
 
-@pytest.mark.quartus
-def test_syn_real_quartus_lpf(monkeypatch, tmp_path):
-    tool = _quartus_dir()
-    if tool is None:
-        pytest.skip("Quartus not found (set QUARTUS_DIR or put quartus_sh on PATH)")
-    monkeypatch.chdir(tmp_path)
-
-    r = Py2ver(lpf_step, LPF_ATTR).SYN({"QUARTUS_DIR": tool})
+def test_syn_real_quartus_lpf(quartus):
+    r = Py2ver(lpf_step, LPF_ATTR).SYN(quartus)
 
     assert r.registers == 16
     assert r.combinational and r.combinational > 0

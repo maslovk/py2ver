@@ -1,5 +1,4 @@
 import re
-import os
 import random
 import shutil
 
@@ -101,16 +100,7 @@ def test_pipeline_with_ram_is_rejected(monkeypatch, tmp_path):
         Py2ver(hist_ram, HIST_RAM_ATTR, pipeline=2)
 
 
-@pytest.mark.quartus
-def test_pipelining_a_stateful_fir_raises_fmax(monkeypatch, tmp_path):
-    tool = os.environ.get("QUARTUS_DIR")
-    if not (tool and os.path.exists(os.path.join(tool, "quartus_sh"))):
-        found = shutil.which("quartus_sh")
-        tool = os.path.dirname(found) if found else None
-    if tool is None:
-        pytest.skip("Quartus not found (set QUARTUS_DIR or put quartus_sh on PATH)")
-    monkeypatch.chdir(tmp_path)
-
-    flat = Py2ver(fir_step, FIR_ATTR).SYN({"QUARTUS_DIR": tool})
-    piped = Py2ver(fir_step, FIR_ATTR, pipeline=2).SYN({"QUARTUS_DIR": tool})
+def test_pipelining_a_stateful_fir_raises_fmax(quartus):
+    flat = Py2ver(fir_step, FIR_ATTR).SYN(quartus)
+    piped = Py2ver(fir_step, FIR_ATTR, pipeline=2).SYN(quartus)
     assert piped.fmax_mhz > 1.3 * flat.fmax_mhz         # ~84 -> ~126 MHz

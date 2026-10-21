@@ -1,8 +1,6 @@
 import math
-import os
 import random
 import re
-import shutil
 
 import pytest
 
@@ -158,19 +156,7 @@ def test_a_folded_design_on_the_virtual_board(monkeypatch, tmp_path):
     assert p.HW_sim()(vectors) == p.PY_batch()(vectors)
 
 
-def _quartus_dir():
-    env = os.environ.get("QUARTUS_DIR")
-    if env and os.path.exists(os.path.join(env, "quartus_sh")):
-        return env
-    found = shutil.which("quartus_sh")
-    return os.path.dirname(found) if found else None
-
-
-@pytest.mark.quartus
-@pytest.mark.skipif(_quartus_dir() is None, reason="Quartus not found")
-def test_folding_saves_area_in_quartus(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    q = {"QUARTUS_DIR": _quartus_dir()}
-    full = Py2ver(fir, FIR).SYN(q)
-    folded = Py2ver(fir, FIR, fold="k").SYN(q)
+def test_folding_saves_area_in_quartus(quartus):
+    full = Py2ver(fir, FIR).SYN(quartus)
+    folded = Py2ver(fir, FIR, fold="k").SYN(quartus)
     assert folded.combinational < full.combinational / 2

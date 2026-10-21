@@ -1,8 +1,6 @@
 import ast
 import inspect
-import os
 import random
-import shutil
 
 import pytest
 
@@ -192,18 +190,9 @@ def test_pipelined_loop_matches_python(assert_python_matches_sim):
 
 # ----------------------------- real Quartus -----------------------------
 
-@pytest.mark.quartus
-def test_pipelining_raises_fmax_in_quartus(monkeypatch, tmp_path):
-    tool = os.environ.get("QUARTUS_DIR")
-    if not (tool and os.path.exists(os.path.join(tool, "quartus_sh"))):
-        found = shutil.which("quartus_sh")
-        tool = os.path.dirname(found) if found else None
-    if tool is None:
-        pytest.skip("Quartus not found (set QUARTUS_DIR or put quartus_sh on PATH)")
-    monkeypatch.chdir(tmp_path)
-
-    flat = Py2ver(sha4_round_core, SHA_ATTR).SYN({"QUARTUS_DIR": tool})
-    piped = Py2ver(sha4_round_core, SHA_ATTR, pipeline=3).SYN({"QUARTUS_DIR": tool})
+def test_pipelining_raises_fmax_in_quartus(quartus):
+    flat = Py2ver(sha4_round_core, SHA_ATTR).SYN(quartus)
+    piped = Py2ver(sha4_round_core, SHA_ATTR, pipeline=3).SYN(quartus)
 
     assert flat.meets_timing is False      # ~31 MHz against a 50 MHz target
     assert piped.meets_timing is True      # ~88 MHz
