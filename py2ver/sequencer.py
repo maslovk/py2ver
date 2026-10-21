@@ -45,12 +45,15 @@ from __future__ import annotations
 import ast
 import copy
 import itertools
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .schedule import Schedule
 from .share import _fmt_of, _fmt_range, _hull, _interval, NotShareable
+
+log = logging.getLogger(__name__)
 
 RAM_MIN = 32              # a list this long or longer is a block RAM
 SDRAM_WIDTH = 16          # the DE0-Nano's SDRAM: a 16-bit word an address
@@ -792,6 +795,12 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
                                        - ((n - 1) * alt.pipe.get("ii", 1) + alt.clocks))
             if saved >= UNIT_SAVING * before:
                 codes[k] = alt
+                log.info("Loop of block %d pipelined, its dividers and square roots written "
+                         "out: %d clocks saved", k, saved)
+            else:
+                log.info("Loop of block %d kept a step at a time: pipelining it written out "
+                         "would save %d of %d clocks a sample (under %.0f %%)", k, saved, before,
+                         100 * UNIT_SAVING)
 
     # ----- the control: successor of each block, how often each runs
     n = len(blocks)
@@ -858,12 +867,25 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
         # (the divider's and the square root's own registers: their formats)
         ranges.update({r: _fmt_range(meta) for r, (_, meta) in code.extra_regs.items()
                        if r not in ranges})
-        try:
-            for s in code.out:
-                ranges[s.targets[0].id] = _interval(s.value, ranges, attr)
-        except NotShareable:
+        unknown: Dict[str, str] = {}          # (values that can't be bounded: why)
+        for s in code.out:
+            t = s.targets[0].id
+            try:
+                ranges[t] = _interval(s.value, ranges, attr)
+            except NotShareable as e:
+                if t in code.formats:          # (it wraps to its declared format)
+                    ranges[t] = _fmt_range(code.formats[t])
+                else:
+                    unknown[t] = str(e)
+        held = {m: sq.fresh(f"r_{m}") for m in sorted(code.muls) if m in ranges}
+        lost = sorted(set(code.muls) - set(held))
+        if lost:
+            # (no register to size: the product and the next one may share a clock)
+            log.warning("Block %d: no register after %s (can't bound it: %s); two multipliers "
+                        "may be on one path in a clock", code.k, ", ".join(lost),
+                        unknown.get(lost[0], "?"))
+        if not held:
             continue
-        held = {m: sq.fresh(f"r_{m}") for m in sorted(code.muls)}
 
         class _Held(ast.NodeTransformer):
             def visit_Name(self, x: ast.Name):

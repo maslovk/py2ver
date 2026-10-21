@@ -472,7 +472,9 @@ machine runs the program a step at a time, for designs far too big to unroll
   writes a list held in registers, writes one RAM twice, reads a RAM it writes
   anywhere but at the element it writes (a different one each iteration: `m[i]
   = 0.9 * m[i] + g[i]` is fine, `a[i] = a[i - 1] + x[i]` isn't), or carries a
-  value through a RAM read
+  value through a RAM read. Which loops weren't pipelined, and why, is logged
+  (INFO: `-v` in the examples); a product left without its register or a loop
+  left unpipelined because py2ver can't bound a value is a WARNING
 - `multipliers=N` runs the multiply-accumulate loops (an innermost loop that
   multiplies computed values and writes no list: a matrix product's sums) `N`
   iterations a clock: the body is written once per lane, each lane with its

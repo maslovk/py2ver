@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import ast
 import copy
+import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+log = logging.getLogger(__name__)
 
 FOLD_SHARE = 0.8      # a loop holding this share of the products is folded
 
@@ -98,7 +101,8 @@ def _try_fold(tree: ast.Module, attr: Dict[str, Any], budget: int, products: Opt
                 unfolded = FunctionVisitor(attr)
                 unfolded.visit(copy.deepcopy(tree))
                 fold_loop(tree, True, unroll, unfolded.attr, dict(unfolded._lists))
-            except (NotImplementedError, ValueError):
+            except (NotImplementedError, ValueError) as e:
+                log.info("rate=: the loop can't be folded (%s); trying the other structures", e)
                 return None
             return unroll, n // unroll
     return None

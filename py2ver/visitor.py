@@ -1,10 +1,13 @@
 import ast
 import functools
+import logging
 import re
 from typing import Dict, Any, List
 from .ast_ir import ModuleIR, Port, Assignment, resolve_meta
 from .fixed import FIT_LIST
 from .semantics import Unsupported, analyze, parse
+
+log = logging.getLogger(__name__)
 
 try:
     import textwrap
@@ -168,7 +171,8 @@ class FunctionVisitor(ast.NodeVisitor):
         """Exact width/sign of an expression, as semantics.exact_ir computes it."""
         try:
             info = analyze(parse(rhs), lambda n: resolve_meta(n, self.attr, {}))
-        except Unsupported:
+        except Unsupported as e:
+            log.warning("Can't size %s (%s): 1 bit; declare it in attr", rhs, e)
             return {"width": 1, "signed": 0}
         if info.nonneg:
             return {"width": max(1, info.bits - 1), "signed": 0}

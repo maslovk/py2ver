@@ -37,8 +37,11 @@ from __future__ import annotations
 
 import ast
 import math
+import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+log = logging.getLogger(__name__)
 
 VECTOR_KEY = "__py2ver_vector__"   # (in a namespace) a loop program: models run with numpy
 MAX_ROUNDS = 64              # more repeats of a store's index: one iteration at a time
@@ -899,7 +902,9 @@ def program(fd: ast.FunctionDef, env: Dict[str, Any], fallback: Callable,
         return fallback
     try:
         prog = Program(fd, env, record, table_keys)
-    except Unsupported:
+    except Unsupported as e:
+        log.info("%s runs as Python, not with numpy (slower): %s",
+                 getattr(fallback, "__name__", "the program"), e)
         return fallback
     import inspect
     prog.__signature__ = inspect.signature(fallback)          # (the function's own)

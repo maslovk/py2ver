@@ -1,3 +1,4 @@
+import ast
 import contextlib
 import copy
 import io
@@ -333,6 +334,61 @@ def test_a_norm_s_products_are_registered():
         p = Py2ver(m, samples=xs, width=16, round=True, margin=2, write=False)
     held = re.findall(r"\breg\b[^;\n]*\b(r_b\d+_mul\w*);", p.verilog)
     assert len(held) == 6                          # (two products in each of the 3 norms)
+
+
+def _unbounded_products(real):
+    """share._interval, raising for a product of a block's values (b5_x * b5_y: as a
+    value py2ver can't bound; the program's own, before, as they are)."""
+    from py2ver.share import NotShareable
+
+    def interval(node, rng, attr):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult) and any(
+                isinstance(x, ast.Name) and re.match(r"(r_)?b\d+_", x.id)
+                for x in (node.left, node.right)):
+            raise NotShareable("a product (in the test)")
+        return real(node, rng, attr)
+    return interval
+
+
+def test_a_product_left_without_its_register_is_said(monkeypatch, caplog):
+    import py2ver.sequencer as S
+    monkeypatch.setattr(S, "_interval", _unbounded_products(S._interval))
+    m = _llama()
+    xs = [torch.randint(0, 13, (1, 8)) for _ in range(6)]
+    with caplog.at_level("WARNING", logger="py2ver.sequencer"), \
+            contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs, width=16, round=True, margin=2, write=False)
+    assert not re.findall(r"\breg\b[^;\n]*\br_b\d+_mul\w*;", p.verilog)
+    assert caplog.text.count("no register after") == 3 and "a product (in the test)" in caplog.text
+
+
+def test_a_loop_left_unpipelined_is_said(monkeypatch, caplog):
+    import py2ver.sequencer_blocks as B
+    import py2ver.share as share
+    real = B.pipeline_block
+
+    def pipeline_block(*args):                     # (its products can't be bounded)
+        saved = share._interval
+        share._interval = _unbounded_products(saved)
+        try:
+            return real(*args)
+        finally:
+            share._interval = saved
+    monkeypatch.setattr(B, "pipeline_block", pipeline_block)
+    m = _llama()
+    xs = [torch.randint(0, 13, (1, 8)) for _ in range(6)]
+    with caplog.at_level("WARNING", logger="py2ver.sequencer_blocks"), \
+            contextlib.redirect_stdout(io.StringIO()):
+        Py2ver(m, samples=xs, width=16, round=True, margin=2, write=False)
+    assert "not pipelined: can't bound" in caplog.text and "a product (in the test)" in caplog.text
+
+
+def test_a_value_the_visitor_can_t_size_is_said(caplog):
+    from py2ver.visitor import FunctionVisitor
+    v = FunctionVisitor({"a": {"width": 8, "signed": 0}})
+    with caplog.at_level("WARNING", logger="py2ver.visitor"):
+        assert v._infer_meta("foo(a)") == {"width": 1, "signed": 0}
+    assert "Can't size foo(a)" in caplog.text and "declare it in attr" in caplog.text
 
 
 def test_a_mini_llama_s_forward_pass_is_built_as_written():

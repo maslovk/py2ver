@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import ast
 import copy
+import logging
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schedule import Schedule
 from .share import _fmt_of, _hull
+
+log = logging.getLogger(__name__)
 
 
 def _name(n: str) -> ast.Name:
@@ -1091,8 +1094,17 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     known: ranges of the registers and counters (for the delay registers' widths).
     """
     from .share import NotShareable, _fmt_of, _fmt_range, _interval
-    if code.extra_regs or code.elems or n_iter < 2:
+
+    def no(why: str) -> bool:                         # (said why, at -v)
+        log.info("Loop of block %d not pipelined: %s", code.k, why)
         return False
+    if n_iter < 2:
+        return False
+    if code.extra_regs:
+        return no("a divider or a square root, a bit a clock (tried again written out, a "
+                  "step a stage)")
+    if code.elems:
+        return no("a list in registers written")
     # An iteration every ii clocks: as many as its SDRAM accesses (one a clock)
     ii = max(1, sum(1 for s in code.sites if s.ext is not None)
              + sum(1 for w in code.writes if w.ext is not None))
@@ -1105,13 +1117,13 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
     written: Dict[str, _Write] = {}
     for w in code.writes:
         if w.array in written:
-            return False
+            return no(f"two writes to {w.array}")
         written[w.array] = w
     for s in code.sites:
         if not s.rom and s.array in written:
             ra, wa = _expand(defs[s.addr], defs), _expand(defs[written[s.array].addr], defs)
             if ast.dump(ra) != ast.dump(wa) or not _coefficient(ra, now, varying - {now}):
-                return False
+                return no(f"{s.array} read elsewhere than where it is written")
 
     # Stages: a statement's is the latest of its inputs'; a carried value's register
     # is there at the stage its new value is
@@ -1139,7 +1151,7 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
                 return True
         return False                                  # (carried through a read: no fixed stage)
     if not settle():
-        return False
+        return no("a value carried through a read (no fixed stage)")
     if ii > 1:
         # The SDRAM's reads at different clocks of the ii (a read a stage later where
         # two would meet), the stages settled again
@@ -1156,21 +1168,25 @@ def pipeline_block(code: "BlockCode", cnt: str, n_iter: int, known: Dict[str, Tu
             if not moved:
                 break
             if not settle():
-                return False
+                return no("a value carried through a read (no fixed stage)")
 
-    # Ranges of the block's values (for the delay registers' widths)
+    # Ranges of the block's values (for the delay registers' widths); one that
+    # can't be bounded takes its declared format
     rng = dict(known)
-    try:
-        for s in code.out:
-            t = s.targets[0].id
+    for s in code.out:
+        t = s.targets[0].id
+        try:
             r = _interval(s.value, rng, attr)
-            if t in code.formats:
-                f = _fmt_range(code.formats[t])
-                if not (f[0] <= r[0] and r[1] <= f[1]):
-                    r = f
-            rng[t] = r
-    except NotShareable:
-        return False
+        except NotShareable as e:
+            if t not in code.formats:
+                log.warning("Loop of block %d not pipelined: can't bound %s (%s)", code.k, t, e)
+                return False
+            r = _fmt_range(code.formats[t])
+        if t in code.formats:
+            f = _fmt_range(code.formats[t])
+            if not (f[0] <= r[0] and r[1] <= f[1]):
+                r = f
+        rng[t] = r
 
     delays: Dict[Tuple[str, int], str] = {}
     regs: Dict[str, str] = {}
