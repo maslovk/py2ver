@@ -204,7 +204,12 @@ attr = {..., 'math.tanh': {'range': (-4, 4), 'bits': 10, 'signed': 1, 'width': 1
 The table has up to `2**bits` entries (default 10) at a power-of-two step
 covering `range`; each holds the function at the middle of its step, rounded
 to the format given. The argument picks its entry (arguments outside the
-range use the end entries). Every call of that function shares the
+range use the end entries). `sin` and `cos` (`math`'s, numpy's, torch's)
+over a range wider than a period are a table of one period instead, its
+`2**bits` entries over `2 pi`, indexed by the argument's phase (a product by a
+constant, a shift and a mask): every argument, beyond the range too, gets its
+own value, at a step that doesn't grow with the range (a timestep embedding's
+`sin(t * f)` for `t` up to 1000). Every call of that function shares the
 configuration. With `samples=` / `auto_fixed`, the ranges, formats and (with
 `max_error`) the table sizes are chosen for you.
 
@@ -491,7 +496,8 @@ machine runs the program a step at a time, for designs far too big to unroll
   registers, if it is short) keeps its values from one sample to the next,
   starting from its `'init'`, and isn't a port
 - `sdram=True` (or a number of bits) puts the largest lists and tables in the
-  DE0-Nano's SDRAM until the rest fits its block RAM: the module gets the
+  DE0-Nano's SDRAM until the rest fits its block RAM (counted in whole M9K
+  blocks, 9,216 bits each: a short list takes one all the same): the module gets the
   SDRAM's pins and a controller (`templates/hw/sdram`), one access a clock,
   a read's data 6 clocks after its address, and its clock enable stops while
   the SDRAM opens a row or refreshes. A pipelined loop starts an iteration
@@ -499,13 +505,16 @@ machine runs the program a step at a time, for designs far too big to unroll
   product of two lists in the SDRAM: a multiply-accumulate every 2 clocks).
   The simulations include a model of the chip, loaded with the tables: the
   PyTorch MNIST network with `sdram=True` keeps 16 Mbit in the SDRAM and takes
-  39,444,210 clocks an image (0.79 s at 50 MHz; 19.8 million all in block
+  39,569,650 clocks an image (0.79 s at 50 MHz; 19.8 million all in block
   RAM), simulated in Verilator as its bit-exact model. An input list of 64
   values or more is in the SDRAM too (no ports: each sample's values are
   written there before it runs), and so is a returned list of 64 values or
   more (no ports either: read back after each sample, in its place among the
-  outputs). A list of values up to 32 bits wide takes two words each (two
-  accesses). `SYN()` gives the SDRAM's pins their
+  outputs). A list or table of values up to 32 bits wide takes two words
+  each (two accesses, the low word first), an input or returned list too. Lists not needed at the same time
+  (a layer's activations, done with when a later layer's are written) share
+  addresses: a list's from the program's first top-level step using it to
+  its last. `SYN()` gives the SDRAM's pins their
   DE0-Nano places and timing: the MNIST network fits the EP4CE22, 7,663
   logic elements (34 %), 297 kbit of block RAM (49 %), 16 multipliers, 58 MHz
   (timing met at 50 MHz). `HW()` and `HW_sim()` load the SDRAM over the
@@ -907,18 +916,20 @@ train.PY_stream()(batches)                                   # (total_loss, corr
 - calling a module: `nn.Sequential` runs its children; `Conv2d` (im2col, as
   above, then one matrix product), `BatchNorm1d/2d`, `MaxPool2d`, `Linear`,
   `Embedding` (a gather of its rows), `LayerNorm` (each row's mean and
-  variance), `GELU` and `SiLU` (tables), `ReLU`, `Flatten`, `Dropout`,
-  `Identity`, `Softmax`, `LogSoftmax`, `Tanh` are built from the translator's
-  operations;
+  variance), `GroupNorm` (each group's), `GELU` and `SiLU` (tables), `ReLU`,
+  `Flatten`, `Dropout`, `Identity`, `Softmax`, `LogSoftmax`, `Tanh` are built
+  from the translator's operations;
   a module of your own runs its `forward()` as written. Parameters and buffers
   are tables, or state when a training step changes them; a parameter two
   modules share (weight tying) is one table
 - `torch` / `torch.nn.functional` functions (`relu`, `gelu`, `silu`,
-  `softmax`, `log_softmax`, `cross_entropy`, `layer_norm`, `embedding`,
-  `conv2d`, `linear`, `max_pool2d`, `dropout`, `flatten`, `cat`, `stack`,
-  `argmax`, `exp`, `log`, `rsqrt`, `pow`, ...) and tensor methods with torch's
-  meanings (`view`, `reshape`, `flatten`, `transpose(d0, d1)`, `permute`,
-  `unsqueeze`, `squeeze`, `split`, `chunk`, `repeat_interleave` (a view),
+  `softmax`, `log_softmax`, `cross_entropy`, `layer_norm`, `group_norm`,
+  `embedding`, `conv2d`, `linear`, `max_pool2d`, `dropout`, `flatten`, `cat`,
+  `stack`, `argmax`, `exp`, `log`, `sin`, `cos`, `rsqrt`, `pow`,
+  `interpolate` (`mode='nearest'` by a whole factor: a view), ...) and tensor
+  methods with torch's meanings (`view`, `reshape`, `flatten`, `transpose(d0,
+  d1)`, `permute`, `unsqueeze`, `squeeze`, `split`, `chunk`, `unbind`,
+  `repeat_interleave` (a view),
   `masked_fill`, `size()`, `max(dim)` giving values and indices, `sum` /
   `mean` / `argmax` with `dim` and `keepdim`, `pow`, `item()`, `to()`,
   `type_as()`); `@` broadcasts its leading dimensions (attention's heads), a
@@ -928,7 +939,10 @@ train.PY_stream()(batches)                                   # (total_loss, corr
   scale `1 / sqrt(E)` unless given; `is_causal=True` its lower-triangular
   mask, as `masked_fill(-inf)` below); `examples/mini_llama_hardware.py`
   builds a Llama-style model (RMSNorm, RoPE, grouped-query attention, SwiGLU)
-  this way
+  this way, `examples/diffusion_hardware.py` a diffusion U-Net (GroupNorm, FiLM,
+  attention at low resolution, upsampling, skip connections)
+- a Python list of tensors (a U-Net's skip connections) is a list:
+  `append`, `pop`, `extend`, `insert` run as Python
 - `masked_fill(mask, -inf)` with a constant mask (causal attention), then a
   softmax: the mask stays a mask, the softmax's exponentials multiplied by it,
   so the masked weights are 0 as with torch's -inf, with no infinities in
@@ -1023,7 +1037,7 @@ checked against torch. `examples/tiny_gpt_hardware.py` builds the model
 | scores against torch's | within 0.158 (mean 0.011) |
 | the likeliest next character | torch's at 99.5 % of the positions |
 | per window | 271,157,254 clocks: 5.4 s at 50 MHz |
-| per window, `--sdram` (for the board) | 804,523,929 clocks: 16.1 s at 50 MHz |
+| per window, `--sdram` (for the board) | 804,532,889 clocks: 16.1 s at 50 MHz |
 
 The four blocks are one loop over them (identical layers, see "Sequenced
 loops"), their values a few bits wider than 16 where the layers' ranges
@@ -1052,7 +1066,7 @@ saves (4 blocks, 192 wide, 6 query and 2 key/value heads, a 128-token context:
 | scores against torch's | within 0.106 |
 | the likeliest next token | torch's in all 6 |
 | per window | 257,324,550 clocks: 5.1 s at 50 MHz |
-| per window, `--sdram` (for the board) | 587,678,106 clocks: 11.8 s at 50 MHz |
+| per window, `--sdram` (for the board) | 587,791,770 clocks: 11.8 s at 50 MHz |
 
 It builds in about 70 s. With `--sdram` the core (`SYN()`: the SDRAM's pins and
 timing, its controller) fits the EP4CE22 and meets 50 MHz (Fmax 54.8 MHz):
@@ -1065,6 +1079,34 @@ point (rounded, saturating, `margin=2`: 1.9 million clocks a step), whose loss
 over 12 steps stays within 0.05 of torch's float training and its weights
 too, a step simulated (Verilog) the same as its model; and simulates the
 forward pass, the same as its model. (Not yet run on a real board.)
+
+`examples/diffusion_digits.py` draws digits: a class-conditional U-Net
+(GroupNorm, FiLM from the timestep's sine embedding and the label,
+self-attention at 8x8, skip connections, nearest upsampling) trained to predict
+noise, sampled by DDIM with classifier-free guidance.
+`examples/diffusion_hardware.py` builds its U-Net's forward pass, unchanged, for
+the cpu preset (32x32 images, 1.2 million parameters; 20 bits, rounded,
+`margin=2`; formats from DDIM steps of three digits), the sines and cosines
+one-period tables. Drawing stays Python, asking the bit-exact model for the
+noise twice a step:
+
+| | 6 other calls while drawing |
+|---|---|
+| the noise against torch's (values to 4.2) | within 0.021 (rms 0.0027) |
+| a 7 drawn in 10 DDIM steps | each pixel within 0.27 of torch's drawing |
+| per call | 268,802,472 clocks: 5.4 s at 50 MHz |
+
+16 bits lose the drawing (the noise within 1.03), 18 bits give 0.08, 24 bits
+0.004. It builds in about 4 minutes. With `--sdram` the weights (two words
+each) and the activations go to the SDRAM, the activations of layers done with
+written over (19.8 million words needed at once otherwise, more than the
+chip's 16.8 million), 1,096,539,628 clocks a call, but it doesn't fit the
+EP4CE22: the translation makes about a thousand loop nests (the pads, im2col
+copies, products, GroupNorm's passes, the adds), each its own logic, about
+138,000 combinational nodes in Quartus for the device's 22,320. The tiny GPT and
+the mini Llama fit because their identical blocks are one loop; the U-Net's
+layers differ in their sizes. `tests/test_torch.py` simulates a small U-Net
+(8x8, two levels) the same as its model.
 
 ### Simulation speed (Icarus, Verilator)
 

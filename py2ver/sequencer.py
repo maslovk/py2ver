@@ -59,6 +59,14 @@ RAM_MIN = 32              # a list this long or longer is a block RAM
 SDRAM_WIDTH = 16          # the DE0-Nano's SDRAM: a 16-bit word an address
 SDRAM_BANK_WORDS = 1 << 22  # (4 banks of 8192 rows of 512 words)
 DE0_NANO_BITS = 400_000   # sdram=True: what may stay in block RAM (of the EP4CE22's 594 kbit)
+M9K_BITS = 9216           # (an M9K block: 8192 x 1 to 256 x 36, its 9th bits for 9-bit widths)
+# (an M9K's shapes, depth x width)
+M9K_SHAPES = ((8192, 1), (4096, 2), (2048, 4), (1024, 9), (512, 18), (256, 36))
+
+
+def _m9ks(depth: int, width: int) -> int:
+    """The M9K blocks a RAM of depth x width takes (its best shape)."""
+    return min(-(-depth // d) * -(-width // w) for d, w in M9K_SHAPES)
 ROM_MIN = 64              # a constant table this long or longer is a ROM
 # A loop with dividers / square roots is pipelined (a register stage per step of
 # each) only if that saves at least this part of a sample's clocks
@@ -250,16 +258,17 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
               lengths: Dict[str, int]) -> Dict[str, Any]:
     """
     The lists (block RAMs) and tables (ROMs) that go to the SDRAM: the largest,
-    one after another, until what stays (their lengths times their widths) is
+    one after another, until what stays (the M9K blocks each takes, in bits) is
     within budget bits. Each gets an address range in a bank (the banks taken in
-    turn, so a product's two operands keep two rows open), its words
+    turn, so a product's two operands keep two rows open; shared by lists not
+    needed at the same time), its words
     SDRAM_WIDTH bits: {'lists': {name: info}, 'tables': {entries: info}}, info
     {'base', 'length', 'meta', 'init' (the values it starts with, or None),
     'words' (a value's words: 2 for a list of values up to twice as wide)}.
     """
     budget = DE0_NANO_BITS if budget is True else int(budget)
     items = []
-    for a in rams:
+    for a in sorted(rams):
         meta = fmt(a)
         n = lengths[a]
         init = attr[a].get("init") if a in memories else None
@@ -275,28 +284,49 @@ def _external(program, rams: Set[str], fmt, attr, memories, budget,
                             seen.add(entries)
                             meta = _fmt_of((min(entries), max(entries)))
                             items.append(("table", entries, len(entries), meta, list(entries)))
-    items.sort(key=lambda t: -t[2] * int(t[3]["width"]))
-    total = sum(n * int(m["width"]) for _, _, n, m, _ in items)
+    # (what a list or table takes in block RAM: whole M9Ks, a short one a block)
+    def cost(n: int, meta: Dict[str, Any]) -> int:
+        return M9K_BITS * _m9ks(n, int(meta["width"]))
+    items.sort(key=lambda t: (-cost(t[2], t[3]), -t[2] * int(t[3]["width"])))
+    total = sum(cost(n, m) for _, _, n, m, _ in items)
+    # (a list's steps: the program's top-level items from its first use to its
+    # last, each filled before it's read; lists whose steps don't overlap share
+    # addresses. A memory and a table: always)
+    steps: Dict[str, Tuple[int, int]] = {}
+    for at, it in enumerate(program):
+        for a in rams & {n.id for x in _walk_items([it]) if isinstance(x, Block)
+                         for s in x.stmts for n in ast.walk(s) if isinstance(n, ast.Name)}:
+            steps[a] = (min(steps.get(a, (at, at))[0], at), at)
+    always = (0, len(program))
     out: Dict[str, Any] = {"lists": {}, "tables": {}}
-    free = [0, 0, 0, 0]
+    placed: List[List[Tuple[int, int, Tuple[int, int]]]] = [[], [], [], []]
     k = 0
     for kind, key, n, meta, init in items:
         if total <= budget:
             break
         words = -(-int(meta["width"]) // SDRAM_WIDTH)
-        if words > 2 or (words > 1 and (kind == "table" or init is not None)):
+        if words > 2:
             raise NotSequenceable(f"{'A table' if kind == 'table' else repr(key)} of "
                                   f"{meta['width']}-bit values can't be in the SDRAM "
-                                  f"({SDRAM_WIDTH}-bit words); use width={SDRAM_WIDTH}")
-        bank = k % 4
-        k += 1
-        if free[bank] + n * words > SDRAM_BANK_WORDS:
+                                  f"({SDRAM_WIDTH}-bit words); use width={2 * SDRAM_WIDTH}")
+        live = always if kind == "table" or key in memories else steps.get(key, always)
+        size = -(-n * words // 512) * 512                 # (each from a row's start)
+        # (the banks taken in turn, a full one skipped; in a bank the lowest
+        # address clear of the lists live at the same time)
+        for bank in [(k + j) % 4 for j in range(4)]:
+            busy = [(s, e) for s, e, (lo, hi) in placed[bank] if lo <= live[1] and live[0] <= hi]
+            start = min((p for p in [0] + [e for _, e in busy]
+                         if all(p + size <= s or e <= p for s, e in busy)))
+            if start + size <= SDRAM_BANK_WORDS:
+                break
+        else:
             raise NotSequenceable("The lists don't fit the SDRAM")
-        info = {"base": (bank << 22) | free[bank], "length": n, "meta": meta, "init": init,
+        k += 1
+        placed[bank].append((start, start + size, live))
+        info = {"base": (bank << 22) | start, "length": n, "meta": meta, "init": init,
                 "words": words}
-        free[bank] += -(-n * words // 512) * 512          # (each from a row's start)
         out["lists" if kind == "list" else "tables"][key] = info
-        total -= n * int(meta["width"])
+        total -= cost(n, meta)
     return out
 
 
@@ -311,17 +341,21 @@ def _external_ports(ext: Dict[str, Any], names: Set[str], kind: str, fmt,
         for info in ext[what].values():
             b = info["base"] >> 22
             top[b] = max(top[b], (info["base"] & (SDRAM_BANK_WORDS - 1))
-                         + -(-info["length"] // 512) * 512)
+                         + -(-info["length"] * info.get("words", 1) // 512) * 512)
     for a in sorted(names):
         n = lengths[a]
         meta = fmt(a)
-        if int(meta["width"]) > SDRAM_WIDTH:
+        words = -(-int(meta["width"]) // SDRAM_WIDTH)
+        if words > 2:
             raise NotSequenceable(f"The {kind} {a!r} of {meta['width']}-bit values can't be in "
-                                  f"the SDRAM ({SDRAM_WIDTH}-bit words)")
+                                  f"the SDRAM ({SDRAM_WIDTH}-bit words); use "
+                                  f"width={2 * SDRAM_WIDTH}")
         bank = min(range(4), key=lambda b: top[b])
         ext["lists"][a] = {"base": (bank << 22) | top[bank], "length": n, "meta": meta,
-                           "init": None, kind: True}
-        top[bank] += -(-n // 512) * 512
+                           "init": None, kind: True, "words": words}
+        top[bank] += -(-n * words // 512) * 512
+        if top[bank] > SDRAM_BANK_WORDS:
+            raise NotSequenceable("The lists don't fit the SDRAM")
 
 
 # ==================================================================== lanes
@@ -768,8 +802,13 @@ def _build(sq: _Seq, program, attr, ns, pipelined: bool = True, lanes: int = 1, 
 
     def read_ranges(code) -> None:
         for site in code.sites:
-            known[site.data] = ((min(site.array), max(site.array)) if site.rom
-                                else rng.get(site.array, (0, 0)))
+            lo, hi = ((min(site.array), max(site.array)) if site.rom
+                      else rng.get(site.array, (0, 0)))
+            if site.half == "lo":                      # (a value in two words)
+                lo, hi = 0, 0xFFFF
+            elif site.half == "hi":
+                lo, hi = lo >> 16, hi >> 16
+            known[site.data] = (lo, hi)
     for code in codes.values():
         read_ranges(code)
 

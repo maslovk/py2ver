@@ -244,6 +244,89 @@ def test_a_list_of_values_wider_than_a_word_takes_two(monkeypatch, tmp_path):
     assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
 
 
+_WIDE = tuple((k * 40503) % 200003 - 100001 for k in range(128))
+
+
+def _wide_table(x):
+    s = 0
+    for i in range(64):
+        s = s + x[i % 16] * _WIDE[i * 2 + 1]
+    return s
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_a_table_of_values_wider_than_a_word_takes_two(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_wide_table, {"x": {"signed": 1, "width": 8, "length": 16}},
+                   sequential=True, sdram=0)
+    # (the table's values are 18 bits: two words each, loaded low word first)
+    (t,) = p.schedule.sdram["tables"].values()
+    assert t["meta"]["width"] > 16 and t["words"] == 2
+    r = random.Random(1)
+    vectors = [([r.randint(-128, 127) for _ in range(16)],) for _ in range(3)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
+def _lists_in_turn(x):
+    a = [0] * 64
+    for i in range(64):
+        a[i] = x[i % 16] * (i + 1)
+    s = 0
+    for i in range(64):
+        s = s + a[63 - i]
+    b = [0] * 64
+    for i in range(64):
+        b[i] = x[(i * 5) % 16] - i
+    for i in range(64):
+        s = s + b[i] * b[63 - i]
+    c = [0] * 64
+    for i in range(64):
+        c[i] = x[(i * 3) % 16] + s
+    for i in range(64):
+        s = s - c[63 - i]
+    d = [0] * 64
+    for i in range(64):
+        d[i] = x[(i * 7) % 16] * i
+    for i in range(64):
+        s = s + d[i] // 4
+    e = [0] * 64
+    for i in range(64):
+        e[i] = x[(i * 9) % 16] - s
+    t = 0
+    for i in range(64):
+        t = t + e[63 - i] * (i % 3)
+    return s, t
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_lists_not_needed_at_once_share_the_sdram(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_lists_in_turn, {"x": {"signed": 1, "width": 8, "length": 16}},
+                   sequential=True, sdram=0)
+    # (five lists, each done with when the next is filled, in four banks: two of
+    # them at the same addresses, written over)
+    sd = p.schedule.sdram["lists"]
+    assert sorted(sd) == ["a", "b", "c", "d", "e"]
+    assert len({info["base"] for info in sd.values()}) == 4
+    r = random.Random(1)
+    vectors = [([r.randint(-128, 127) for _ in range(16)],) for _ in range(3)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
 def _returns_a_list(x):
     h = [0] * 64
     for i in range(64):
@@ -282,11 +365,44 @@ def _returns_only_a_list(x):
     return h
 
 
+def _wide_ports(x):
+    h = [0] * 64
+    for i in range(64):
+        h[i] = x[i] * ((i % 7) - 3) + x[63 - i]
+    s = 0
+    for i in range(64):
+        s = s + x[i] // 8
+    return s, h
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_input_and_returned_lists_wider_than_a_word_take_two(monkeypatch, tmp_path):
+    import contextlib
+    import io
+    import random
+    from py2ver import Py2ver
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PY2VER_SIM", "icarus")
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(_wide_ports, {"x": {"signed": 1, "width": 20, "length": 64}},
+                   sequential=True, sdram=0)
+    # (x's 20-bit values and h's 23-bit ones: two words each, x's written before
+    # a sample, h's read back after)
+    sd = p.schedule.sdram["lists"]
+    assert sd["x"]["words"] == 2 and sd["h"]["words"] == 2
+    assert len(p._ext_inputs) == 64 and len(p._ext_outputs) == 64
+    r = random.Random(1)
+    vectors = [([r.randint(-2 ** 19, 2 ** 19 - 1) for _ in range(64)],) for _ in range(3)]
+    assert p.TB_batch()(vectors) == p.PY_batch()(vectors)
+
+
 @pytest.mark.board
 @pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
-@pytest.mark.parametrize("f, n", [(_with_a_list, 16), (_input_in_the_sdram, 64),
-                                  (_returns_a_list, 16), (_returns_only_a_list, 16)])
-def test_the_board_loads_the_sdram_over_its_uart(monkeypatch, tmp_path, f, n):
+@pytest.mark.parametrize("f, n, w", [(_with_a_list, 16, 8), (_input_in_the_sdram, 64, 8),
+                                     (_returns_a_list, 16, 8), (_returns_only_a_list, 16, 8),
+                                     (_wide_table, 16, 8), (_wide_ports, 64, 20)])
+def test_the_board_loads_the_sdram_over_its_uart(monkeypatch, tmp_path, f, n, w):
     # The DE0-Nano's project (UART, the commands, the design, the controller) with
     # a model of the chip on its pins: the tables written with 'W' commands, a
     # sample's input lists too, then 'R' and its outputs, as HW() does on the board
@@ -296,7 +412,8 @@ def test_the_board_loads_the_sdram_over_its_uart(monkeypatch, tmp_path, f, n):
     from py2ver import Py2ver
     monkeypatch.chdir(tmp_path)
     with contextlib.redirect_stdout(io.StringIO()):
-        p = Py2ver(f, {"x": {"signed": 1, "width": 8, "length": n}}, sequential=True, sdram=0)
+        p = Py2ver(f, {"x": {"signed": 1, "width": w, "length": n}}, sequential=True, sdram=0)
     r = random.Random(2)
-    vectors = [([r.randint(-128, 127) for _ in range(n)],) for _ in range(2)]
+    vectors = [([r.randint(-2 ** (w - 1), 2 ** (w - 1) - 1) for _ in range(n)],)
+               for _ in range(2)]
     assert p.HW_sim()(vectors) == p.PY_batch()(vectors)

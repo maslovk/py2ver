@@ -301,6 +301,85 @@ def test_a_llama_s_operations_are_torch_s():
             assert got.shape == want.shape and np.allclose(got, want, atol=1e-4)
 
 
+class DiffusionOps(nn.Module):
+    """The operations a diffusion U-Net adds, as torch means them."""
+
+    def __init__(self):
+        super().__init__()
+        self.norm = nn.GroupNorm(2, 4)
+        torch.nn.init.normal_(self.norm.weight)
+        torch.nn.init.normal_(self.norm.bias)
+
+    def forward(self, x):                                 # x: (1, 4, 3, 3)
+        parts = []
+        parts.append(x.sin() + torch.cos(x * 2))
+        parts.append(self.norm(x))
+        parts.append(F.group_norm(x, 4, eps=1e-3))
+        a, b = x.reshape(1, 2, 2, 9).unbind(1)
+        parts.append(a * 2 - b)
+        parts.append(F.interpolate(x, scale_factor=2, mode="nearest"))
+        parts.append(F.interpolate(x, size=(9, 6)))
+        last = parts.pop()                                # (a Python list of tensors)
+        return tuple(parts) + (last,)
+
+
+def test_a_diffusion_net_s_operations_are_torch_s():
+    torch.manual_seed(6)
+    m = DiffusionOps()
+    m.eval()
+    xs = [torch.randn(1, 4, 3, 3) for _ in range(4)]
+    tr = numpy_loops.translate(m, xs[:2])
+    with torch.no_grad():
+        for x in xs:
+            got = np.concatenate([np.ravel(v) for v in tr.func(*tr.adapt(x))])
+            want = np.concatenate([t.numpy().ravel() for t in m(x)])
+            assert got.shape == want.shape and np.allclose(got, want, atol=1e-4)
+
+
+def _unet(seed=0):
+    import sys
+    from pathlib import Path
+    pytest.importorskip("torchvision")             # (diffusion_digits.py loads MNIST with it)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
+    import diffusion_digits as D
+    torch.manual_seed(seed)
+    m = D.UNet(ch=8, mults=(1, 2), n_res=1, attn_res=(16,))
+    for p in m.parameters():                       # (not its zeros: every path counts)
+        torch.nn.init.normal_(p, std=0.2)
+    m.eval()
+    return D, m
+
+
+def test_a_diffusion_u_net_s_forward_pass_is_built_as_written():
+    D, m = _unet()
+    g = torch.Generator().manual_seed(1)
+    xs = [(torch.randn(1, 1, D.IMG, D.IMG, generator=g), torch.randint(0, 1000, (1,), generator=g),
+           torch.randint(0, 11, (1,), generator=g)) for _ in range(3)]
+    tr = numpy_loops.translate(m, xs[:2])        # (the skip connections, attention, upsampling)
+    with torch.no_grad():
+        for x in xs:
+            assert np.allclose(tr.func(*tr.adapt(x)), m(*x).numpy().ravel(), atol=1e-4)
+
+
+@pytest.mark.sim
+@pytest.mark.slow
+def test_a_diffusion_u_net_in_hardware(monkeypatch, tmp_path):
+    """The U-Net (8x8 images: the same layers, a sixteenth of the clocks) in fixed
+    point near torch's, and simulated (Verilog) the same as its model."""
+    monkeypatch.chdir(tmp_path)
+    D, m = _unet()
+    g = torch.Generator().manual_seed(2)
+    xs = [(torch.randn(1, 1, 8, 8, generator=g), torch.tensor([t]),
+           torch.randint(0, 11, (1,), generator=g)) for t in (0, 999, 300, 650, 120, 870, 500)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(m, samples=xs[:5], width=24, round=True, margin=2)
+    model = np.array(p.PY_batch()(xs[5:]))
+    with torch.no_grad():
+        want = np.array([m(*x).numpy().ravel() for x in xs[5:]])
+    assert np.abs(model - want).max() < 0.05
+    assert p.TB_batch()(xs[5:6]) == p.PY_batch()(xs[5:6])
+
+
 def test_an_assert_is_checked_when_translating():
     class Checked(nn.Module):
         def forward(self, x):

@@ -95,9 +95,22 @@ def test_math_tables(monkeypatch, tmp_path):
     assert err["y"][0] < 0.01                         # 1024-entry tables over 8 and 4
     p = Py2ver(wave, WAVE)                            # from math import sin; math.pi
     assert p.PY_batch()([(0.5,)])[0][0] == pytest.approx(0.5, abs=0.02)
-    # Arguments beyond the range use the end entries
+    # sin over more than a period: a table of one period, so an argument beyond the
+    # range gets sin's own value (another function's table uses its end entries)
     far = p.PY_batch()([(1.99,)])[0][0]
-    assert far == pytest.approx(0.5 * math.sin(6 - 6 / 512), abs=0.01)
+    assert far == pytest.approx(0.5 * math.sin(math.pi * 1.99), abs=0.01)
+
+
+@pytest.mark.sim
+def test_a_periodic_table_in_hardware(monkeypatch, tmp_path):
+    """sin's one-period table in Verilog (the phase: a wide product, a shift, a
+    mask) the same as the model, arguments within the range and beyond it."""
+    monkeypatch.chdir(tmp_path)
+    p = Py2ver(wave, WAVE)
+    vs = [(x,) for x in (-1.99, -1.2, -0.3, 0.0, 0.5, 1.0, 1.7, 1.99)]
+    assert p.TB_batch()(vs) == p.PY_batch()(vs)
+    for (x,), (y,) in zip(vs, p.PY_batch()(vs)):
+        assert y == pytest.approx(0.5 * math.sin(math.pi * x), abs=0.02)
 
 
 def test_integer_complex_parameters(monkeypatch, tmp_path):

@@ -354,6 +354,25 @@ def layer_norm(it, x, shape, weight=None, bias=None, eps=1e-5):
     return y
 
 
+def group_norm(it, x, groups, weight=None, bias=None, eps=1e-5):
+    """GroupNorm: each sample's channels in `groups` groups, each group (its
+    channels and positions) normalized as layer_norm's rows, then a scale and a
+    shift per channel."""
+    x = it.to_arr(x)
+    N, C, rest = x.shape[0], x.shape[1], tuple(x.shape[2:])
+    if C % groups:
+        raise NotTranslatable(f"group_norm: {C} channels don't divide into {groups} groups")
+    rows = it.method(x, "reshape", [(N, groups, (C // groups) * math.prod(rest))], {})
+    y = it.method(it.to_arr(layer_norm(it, rows, (rows.shape[-1],), eps=eps)), "reshape",
+                  [tuple(x.shape)], {})
+    per_channel = (C,) + (1,) * len(rest)
+    if weight is not None:
+        y = it.binop(ast.Mult(), y, it.method(it.to_arr(weight), "reshape", [per_channel], {}))
+    if bias is not None:
+        y = it.binop(ast.Add(), y, it.method(it.to_arr(bias), "reshape", [per_channel], {}))
+    return y
+
+
 def gelu(it, x, approximate="none"):
     """GELU as a table of the function (with its derivative, for autograd)."""
     from .numpy_fe import TABLES_KEY
@@ -411,6 +430,31 @@ def repeat_interleave(it, a, repeats, dim=None):
     v = a.view(a.shape[:d + 1] + (repeats,) + a.shape[d + 1:],
                a.strides[:d + 1] + (0,) + a.strides[d + 1:])
     return flatten(it, v, d, d + 1)
+
+
+def interpolate(it, x, size=None, scale_factor=None, mode="nearest", align_corners=None,
+                recompute_scale_factor=None, antialias=False):
+    """F.interpolate, mode 'nearest' by a whole factor: each element repeated
+    along each spatial dimension (output i reads input i // factor, as torch's)."""
+    x = it.to_arr(x)
+    spatial = len(x.shape) - 2
+    if mode != "nearest" or antialias:
+        raise NotTranslatable(f"interpolate: only mode='nearest' is supported (not {mode!r})")
+    if size is not None:
+        size = (size,) * spatial if isinstance(size, int) else tuple(size)
+        factors = [s // n for s, n in zip(size, x.shape[2:])]
+        if any(s != f * n for s, f, n in zip(size, factors, x.shape[2:])):
+            raise NotTranslatable("interpolate: only a size a whole multiple of the input's")
+    else:
+        sf = (scale_factor,) * spatial if isinstance(scale_factor, (int, float)) \
+            else tuple(scale_factor)
+        if any(float(f) != int(f) or f < 1 for f in sf):
+            raise NotTranslatable("interpolate: only a whole scale_factor is supported")
+        factors = [int(f) for f in sf]
+    for d, f in enumerate(factors):
+        if f > 1:
+            x = it.to_arr(repeat_interleave(it, x, f, d + 2))
+    return x
 
 
 def scaled_dot_product_attention(it, q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
@@ -542,6 +586,10 @@ def module_call(it, mod, args: List[Any], kwargs: Dict[str, Any]) -> Any:
                               mod.eps)
         if name == "GELU":
             return gelu(it, x, mod.approximate)
+        if name == "GroupNorm":
+            return group_norm(it, x, mod.num_groups,
+                              it.param(mod, "weight") if mod.affine else None,
+                              it.param(mod, "bias") if mod.affine else None, mod.eps)
         if name == "SiLU":
             return silu(it, x)
         if name == "Softmax":
@@ -586,6 +634,13 @@ def function(it, fn, args: List[Any], kwargs: Dict[str, Any]) -> Any:
     if name == "layer_norm":
         return layer_norm(it, args[0], arg(1, "normalized_shape"), arg(2, "weight"),
                           arg(3, "bias"), arg(4, "eps", 1e-5))
+    if name == "interpolate":
+        return interpolate(it, args[0], arg(1, "size"), arg(2, "scale_factor"),
+                           arg(3, "mode", "nearest"), arg(4, "align_corners"),
+                           arg(5, "recompute_scale_factor"), arg(6, "antialias", False))
+    if name == "group_norm":
+        return group_norm(it, args[0], arg(1, "num_groups"), arg(2, "weight"), arg(3, "bias"),
+                          arg(4, "eps", 1e-5))
     if name == "embedding":
         return embedding(it, args[0], arg(1, "weight"))
     if name == "masked_fill":
@@ -614,7 +669,8 @@ def function(it, fn, args: List[Any], kwargs: Dict[str, Any]) -> Any:
         return it.numpy("concatenate", [list(args[0])], {"axis": arg(1, "dim", 0)})
     if name in ("argmax", "sum", "mean", "max", "amax"):
         return tensor_method(it, it.to_arr(args[0]), name, list(args[1:]), kwargs)
-    if name in ("exp", "log", "tanh", "sigmoid", "sqrt", "abs", "maximum", "minimum"):
+    if name in ("exp", "log", "tanh", "sigmoid", "sqrt", "abs", "maximum", "minimum", "sin",
+                "cos"):
         return it.numpy(name, list(args), kwargs)
     if name in ("matmul", "mm"):
         return it.matmul(args[0], args[1])
@@ -688,6 +744,13 @@ def tensor_method(it, a, name: str, args: List[Any], kwargs: Dict[str, Any]) -> 
             out.append(a.view(tuple(shape), a.strides, a.offset + at * a.strides[dim]))
             at += k
         return tuple(out)
+    if name == "unbind":                               # (each slice along dim: a view)
+        dim = _dim(arg(0, "dim", 0), nd)
+        a = it.to_arr(a)
+        shape = tuple(a.shape[:dim] + a.shape[dim + 1:])
+        strides = tuple(a.strides[:dim] + a.strides[dim + 1:])
+        return tuple(a.view(shape, strides, a.offset + i * a.strides[dim])
+                     for i in range(a.shape[dim]))
     if name == "masked_fill":
         return masked_fill(it, a, arg(0, "mask"), arg(1, "value"))
     if name == "size":
@@ -713,7 +776,7 @@ def tensor_method(it, a, name: str, args: List[Any], kwargs: Dict[str, Any]) -> 
         return log_softmax(it, a, arg(0, "dim"))
     if name in ("relu", "relu_"):
         return relu(it, a)
-    if name in ("exp", "log", "tanh", "sigmoid", "sqrt", "abs"):
+    if name in ("exp", "log", "tanh", "sigmoid", "sqrt", "abs", "sin", "cos"):
         return it.numpy(name, [a], {})
     if name in ("add", "sub", "mul", "div"):
         op = {"add": ast.Add(), "sub": ast.Sub(), "mul": ast.Mult(), "div": ast.Div()}[name]

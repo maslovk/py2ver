@@ -660,7 +660,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
                         port = f"{a}_{i}" if f"{a}_{i}" in names else (a if i == 0 and a in names
                                                                        else None)
                         if port is not None:
-                            self._ext_inputs[port] = int(info["base"]) + i
+                            self._ext_inputs[port] = int(info["base"]) + i * info.get("words", 1)
             fold_ports |= set(self._ext_inputs)
         inputs = [p for p in ir.inputs if p.name not in self.state_map and p.name not in fold_ports]
         have = {p.name for p in inputs}
@@ -761,7 +761,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
             for i in range(count):
                 port = f"{name}_{i}"
                 merged.append((port, w))
-                ext[port] = int(info["base"]) + i
+                ext[port] = int(info["base"]) + i * info.get("words", 1)
                 attr.setdefault(port, {"signed": sgn, "width": w})
         if at != len(ports):
             raise RuntimeError(f"The outputs don't match the return: {at} of {len(ports)} ports")

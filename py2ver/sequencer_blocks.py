@@ -229,6 +229,22 @@ class BlockCode:
                 setattr(n, f, [self.expr(x) if isinstance(x, ast.expr) else x for x in v])
         return n
 
+    def two_words(self, array: Any, addr: str, base: int, prefix: str, rom: bool) -> str:
+        """A value in two SDRAM words (a list's or a table's): its low word,
+        unsigned, and its high one, read in turn and put together."""
+        halves = {}
+        for half, extra in (("lo", 0), ("hi", 1)):
+            wa = self.emit(f"{prefix}a{half}", ast.BinOp(
+                left=ast.BinOp(left=_name(addr), op=ast.Mult(), right=ast.Constant(2)),
+                op=ast.Add(), right=ast.Constant(extra)))
+            halves[half] = self.tmp(f"{prefix}d{half}")
+            clock = self.ext_slot(self.ready[wa])
+            self.sites.append(_Site(array, wa, halves[half], clock, rom=rom, ext=base, half=half))
+            self.ready[halves[half]] = clock + EXT_LATENCY
+        return self.emit(f"{prefix}d", ast.BinOp(
+            left=ast.BinOp(left=_name(halves["hi"]), op=ast.LShift(), right=ast.Constant(16)),
+            op=ast.Add(), right=_name(halves["lo"])))
+
     def read(self, a: str, idx: ast.expr) -> ast.expr:
         if a in self.inputs and a not in self.ext_lists:
             return ast.Subscript(value=_name(a), slice=idx, ctx=ast.Load())
@@ -239,21 +255,7 @@ class BlockCode:
             addr = self.emit(f"{a}_ra", idx)
             data = self.tmp(f"{a}_rd")
             if a in self.ext_lists and self.ext_lists[a].get("words", 1) == 2:
-                # (a value in two words: its low word, unsigned, and its high one)
-                base = self.ext_lists[a]["base"]
-                halves = {}
-                for half, extra in (("lo", 0), ("hi", 1)):
-                    wa = self.emit(f"{a}_ra{half}", ast.BinOp(
-                        left=ast.BinOp(left=_name(addr), op=ast.Mult(), right=ast.Constant(2)),
-                        op=ast.Add(), right=ast.Constant(extra)))
-                    halves[half] = self.tmp(f"{a}_rd{half}")
-                    clock = self.ext_slot(self.ready[wa])
-                    self.sites.append(_Site(a, wa, halves[half], clock, rom=False, ext=base,
-                                            half=half))
-                    self.ready[halves[half]] = clock + EXT_LATENCY
-                data = self.emit(f"{a}_rd", ast.BinOp(
-                    left=ast.BinOp(left=_name(halves["hi"]), op=ast.LShift(), right=ast.Constant(16)),
-                    op=ast.Add(), right=_name(halves["lo"])))
+                data = self.two_words(a, addr, self.ext_lists[a]["base"], f"{a}_r", rom=False)
             elif a in self.ext_lists:
                 clock = self.ext_slot(self.ready[addr])
                 self.sites.append(_Site(a, addr, data, clock, rom=False,
@@ -475,7 +477,10 @@ class BlockCode:
             return copy.deepcopy(self.reads[key])
         addr = self.emit("rom_a", idx)
         data = self.tmp("rom_d")
-        if entries in self.ext_tables:
+        if entries in self.ext_tables and self.ext_tables[entries].get("words", 1) == 2:
+            data = self.two_words(entries, addr, self.ext_tables[entries]["base"], "rom_",
+                                  rom=True)
+        elif entries in self.ext_tables:
             clock = self.ext_slot(self.ready[addr])
             self.sites.append(_Site(entries, addr, data, clock, rom=True,
                                     ext=self.ext_tables[entries]["base"]))

@@ -131,7 +131,8 @@ def testbench(p, mode: Dict[str, Any]) -> str:
             # (returned lists in the SDRAM: read from the chip's model at the clock
             # after a sample, its last write in and the next sample's not yet, a
             # line a sample)
-            addrs = [ext_out[n] for n in p.output_args_list if n in ext_out]
+            addrs = [a for _, a, _ in ext_words(p.output_args_list, p.output_args_width_list,
+                                                ext_out)]
             lines += ["  integer fx, ex, dump, ending;",
                       "  function integer out_addr(input integer e);", "    begin"]
             for start, base, count in _runs(addrs):
@@ -175,7 +176,7 @@ def testbench(p, mode: Dict[str, Any]) -> str:
         read.append("      end")
     if ext_in:
         # (the sample's inputs in the SDRAM: written into the chip's model, in order)
-        addrs = [ext_in[n] for n in p.input_args_list if n in ext_in]
+        addrs = [a for _, a, _ in ext_words(p.input_args_list, p.input_args_width_list, ext_in)]
         read = read[:-1] + [f"        for (e = 0; e < {len(addrs)}; e = e + 1) begin",
                             '          got = $fscanf(fext, "%h", word);',
                             "          __mem.mem[ext_addr(e)] = word;",
@@ -285,8 +286,25 @@ def sdram_images(p) -> List[Tuple[int, List[int]]]:
         for key, info in sdram.get(kind, {}).items():
             init = info.get("init")
             if init is not None:
-                out.append((int(info["base"]), [int(v) & 0xFFFF for v in init]))
+                if info.get("words", 1) == 2:            # (a value in two words: low, high)
+                    words = [int(v) >> s & 0xFFFF for v in init for s in (0, 16)]
+                else:
+                    words = [int(v) & 0xFFFF for v in init]
+                out.append((int(info["base"]), words))
     return out
+
+
+def ext_words(names: List[str], widths: List[int], ext: Dict[str, int]) -> List[Tuple[str, int, int]]:
+    """(port, address, shift) of each SDRAM word of the ports in ext (input or
+    output lists in the SDRAM), in the ports' order: a value over 16 bits in two
+    words, its low one first."""
+    return [(n, ext[n] + k, 16 * k) for n, w in zip(names, widths) if n in ext
+            for k in range(-(-int(w) // 16))]
+
+
+def ext_value(words: List[int], shifts: List[int], width: int) -> int:
+    """A port's value from its SDRAM words (unsigned, width bits)."""
+    return sum(w << s for w, s in zip(words, shifts)) & ((1 << width) - 1)
 
 
 def _chunks(width: int) -> List[Tuple[int, int]]:
@@ -371,11 +389,12 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
     d = build(p, mode, simulator, workdir)
     ext_in = getattr(p, "_ext_inputs", {})
     keep = [i for i, n in enumerate(p.input_args_list) if n not in ext_in]
-    ext_pos = [i for i, n in enumerate(p.input_args_list) if n in ext_in]
     if ext_in:
+        pos = {n: i for i, n in enumerate(p.input_args_list)}
+        words = ext_words(p.input_args_list, p.input_args_width_list, ext_in)
         with (d / "inputs.hex").open("w") as f:
             for vec in vectors:
-                f.write("".join(f"{int(vec[i]) & 0xFFFF:04x}\n" for i in ext_pos))
+                f.write("".join(f"{int(vec[pos[n]]) >> s & 0xFFFF:04x}\n" for n, _, s in words))
     widths = [p.input_args_width_list[i] for i in keep]
     vectors = [tuple(vec[i] for i in keep) for vec in vectors]
     with (d / "vectors.hex").open("w") as f:
@@ -409,12 +428,16 @@ def run(p, vectors: List[Tuple[int, ...]], simulator: str) -> List[Dict[str, int
                          for n, v in zip(names, vals)})
     if ext_out:                                # (the returned lists in the SDRAM)
         widths = dict(zip(p.output_args_list, p.output_args_width_list))
-        names = [n for n in p.output_args_list if n in ext_out]
+        words = ext_words(p.output_args_list, p.output_args_width_list, ext_out)
         lines = [x for x in (d / "outputs_ext.hex").read_text().split("\n") if x.strip()]
         for row, line in zip(rows, lines):
-            for n, v in zip(names, line.split()):
+            got: Dict[str, Tuple[List[int], List[int]]] = {}
+            for (n, _, s), v in zip(words, line.split()):
                 ok = "x" not in v.lower() and "z" not in v.lower()
-                row[n] = (int(v, 16) if ok else 0) & ((1 << widths[n]) - 1)
+                got.setdefault(n, ([], []))[0].append(int(v, 16) if ok else 0)
+                got[n][1].append(s)
+            for n, (ws, ss) in got.items():
+                row[n] = ext_value(ws, ss, widths[n])
     return rows
 
 

@@ -1265,6 +1265,9 @@ class _Interp:
             return self.call(fn.__func__, args, kwargs, obj=fn.__self__)
         if inspect.isfunction(fn):
             return self.call(fn, args, kwargs)
+        if isinstance(getattr(fn, "__self__", None), list) and getattr(fn, "__name__", "") in (
+                "append", "extend", "insert", "pop"):
+            return fn(*args, **kwargs)                 # (a Python list of values: skips.append(h))
         if sym:
             raise NotTranslatable(f"Unsupported call on values computed in hardware: {text}")
         for a in _arrays_in(list(args) + list(kwargs.values())):    # (kept by Python code?)

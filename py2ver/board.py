@@ -505,7 +505,7 @@ class BoardMixin:
         """The UART commands of a sample (vec: its raw inputs, as input_args_list):
         the tables first (first=True), its input lists into the SDRAM, then 'R'.
         [(bytes, bytes of the reply)]."""
-        from .native import sdram_images, _runs
+        from .native import ext_words, sdram_images, _runs
         ext = getattr(self, "_ext_inputs", {})
         steps: List[Tuple[bytes, int]] = []
 
@@ -518,8 +518,10 @@ class BoardMixin:
             for base, values in sdram_images(self):
                 write(base, values)
         names = list(self.input_args_list)
-        addrs = [ext[n] for n in names if n in ext]
-        values = [int(vec[i]) for i, n in enumerate(names) if n in ext]
+        pos = {n: i for i, n in enumerate(names)}
+        words = ext_words(names, self.input_args_width_list, ext)
+        addrs = [a for _, a, _ in words]
+        values = [int(vec[pos[n]]) >> s for n, _, s in words]
         for start, base, count in _runs(addrs):
             write(base, values[start:start + count])
         acc, off = 0, 0
@@ -535,8 +537,9 @@ class BoardMixin:
 
     def _sdram_reads(self) -> List[Tuple[int, int]]:
         """(address, words) of the 'X' reads of a sample's returned lists in the SDRAM."""
-        from .native import _runs
-        addrs = [self._ext_outputs[n] for n in self.output_args_list if n in self._ext_outputs]
+        from .native import ext_words, _runs
+        addrs = [a for _, a, _ in ext_words(self.output_args_list, self.output_args_width_list,
+                                            self._ext_outputs)]
         return [(base + at, min(4096, count - at)) for _, base, count in _runs(addrs)
                 for at in range(0, count, 4096)]
 
@@ -546,16 +549,18 @@ class BoardMixin:
         nx = len(self._sdram_reads())
         acc = int.from_bytes(replies[len(replies) - 1 - nx], "little")
         words = b"".join(replies[len(replies) - nx:])
+        from .native import ext_words
         values: Dict[str, int] = {}
         off = 0
-        ext = [n for n in self.output_args_list if n in self._ext_outputs]
         for n, w in zip(self.output_args_list, self.output_args_width_list):
             if n not in self._ext_outputs:
                 values[n] = (acc >> off) & ((1 << w) - 1)
                 off += (w + 7) // 8 * 8
         widths = dict(zip(self.output_args_list, self.output_args_width_list))
-        for i, n in enumerate(ext):
-            values[n] = int.from_bytes(words[2 * i:2 * i + 2], "big") & ((1 << widths[n]) - 1)
+        for i, (n, _, s) in enumerate(ext_words(self.output_args_list, self.output_args_width_list,
+                                                self._ext_outputs)):
+            values[n] = (values.get(n, 0) + (int.from_bytes(words[2 * i:2 * i + 2], "big") << s)) \
+                & ((1 << widths[n]) - 1)
         return tuple(self.tosigned(values[n], widths[n]) if self.attr.get(n, {}).get("signed") == 1
                      else values[n] for n in self.output_args_list)
 

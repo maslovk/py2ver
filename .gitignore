@@ -30,3 +30,4 @@ examples/data/
 examples/*.pt
 examples/*.txt
 examples/tokenizer.json
+examples/samples/

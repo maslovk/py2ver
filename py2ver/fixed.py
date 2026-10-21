@@ -680,6 +680,9 @@ class _Lower:
         fn = self._global_value(n.func)
         if not callable(fn):
             self._err(n, f"'{key}' is not a function")
+        lo, hi = (Fraction(r) for r in meta["range"])
+        if _is_periodic(fn) and hi - lo > 2 * Fraction(math.pi):
+            return self._periodic_table(n, fn, meta, v, t), out
         try:
             s, start, values = _table_entries(fn, tuple(meta["range"]),
                                               int(meta.get("bits", DEFAULT_TABLE_BITS)),
@@ -700,6 +703,25 @@ class _Lower:
                                       args=[ast.Constant(count - 1), index])])
         index = self._named(index)
         return ast.Subscript(value=table, slice=index, ctx=ast.Load()), out
+
+    def _periodic_table(self, n: ast.Call, fn: Callable, meta, v: ast.expr, t) -> ast.expr:
+        """sin / cos over more than a period: a table of one period, 2**bits
+        entries (f at the middle of each step), indexed by the argument's phase in
+        turns: floor(x * 2**bits / (2 pi)) mod 2**bits, a product by a constant
+        (PHASE_BITS of fraction: the index exact to well under a step for any
+        argument a 64-bit value holds), a shift and a mask."""
+        bits = int(meta.get("bits", DEFAULT_TABLE_BITS))
+        size = 1 << bits
+        values = tuple(quantize(fn((k + 0.5) * 2 * math.pi / size), int(meta["frac"]),
+                                int(meta["width"]), bool(meta.get("signed", 1)), round=True,
+                                saturate=True) for k in range(size))
+        scale = round(size * (1 << PHASE_BITS) / (2 * math.pi))
+        index = ast.BinOp(left=ast.BinOp(left=ast.BinOp(left=v, op=ast.Mult(),
+                                                        right=ast.Constant(scale)),
+                                         op=ast.RShift(),
+                                         right=ast.Constant(_frac(t) + PHASE_BITS)),
+                          op=ast.BitAnd(), right=ast.Constant(size - 1))
+        return ast.Subscript(value=table_node(values), slice=self._named(index), ctx=ast.Load())
 
     def _call(self, n: ast.Call):
         f = n.func
@@ -927,6 +949,16 @@ def _table_entries(fn: Callable, rng: Tuple[Any, Any], bits: int, width: int, si
     values = tuple(quantize(fn(float(start + (k + Fraction(1, 2)) * step)), frac, width, signed,
                             round=True, saturate=True) for k in range(count))
     return s, start, values
+
+
+PHASE_BITS = 24     # a periodic table's index: the phase's fraction bits past the table's
+
+
+def _is_periodic(fn: Any) -> bool:
+    """math's or numpy's sin or cos (a period of 2 pi)."""
+    return getattr(fn, "__name__", "") in ("sin", "cos") and getattr(
+        fn, "__module__", None) in ("math", "numpy", None) and (
+        fn is math.sin or fn is math.cos or type(fn).__name__ == "ufunc")
 
 
 def is_sqrt(fn: Any) -> bool:
