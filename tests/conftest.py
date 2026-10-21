@@ -55,14 +55,24 @@ def _normalize_expected(py_out, p):
     return tuple(out)
 
 
-def pytest_collection_modifyitems(items):
+def pytest_addoption(parser):
+    parser.addoption("--long", action="store_true",
+                     help="also run the checks marked long (minutes each)")
+
+
+def pytest_collection_modifyitems(config, items):
     """A test using the simulation fixture is a simulation test; one using
-    Quartus's, a quartus test."""
+    Quartus's, a quartus test, and slow (a compile: a minute or more). A long
+    one runs only with --long."""
+    long_skip = pytest.mark.skip(reason="minutes: run with --long")
     for item in items:
         if "assert_python_matches_sim" in getattr(item, "fixturenames", ()):
             item.add_marker(pytest.mark.sim)
         if "quartus" in getattr(item, "fixturenames", ()):
             item.add_marker(pytest.mark.quartus)
+            item.add_marker(pytest.mark.slow)
+        if item.get_closest_marker("long") and not config.getoption("--long"):
+            item.add_marker(long_skip)
 
 
 # Quartus where the DE0-Nano's toolchain installs it (examples/_run.py's default)

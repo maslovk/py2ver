@@ -336,6 +336,7 @@ def test_a_norm_s_products_are_registered():
     assert len(held) == 6                          # (two products in each of the 3 norms)
 
 
+@pytest.mark.long
 def test_a_mini_llama_in_the_sdram_meets_50_mhz(quartus):
     """The board's build (lists and tables in the SDRAM: sdram=0) meets the
     DE0-Nano's clock: a norm's two products a clock apart (registered), the
@@ -462,6 +463,7 @@ def test_a_mini_llama_trains_as_torch_does():
 
 @pytest.mark.sim
 @pytest.mark.slow
+@pytest.mark.long
 def test_a_mini_llama_trains_in_fixed_point_and_in_hardware(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     # (smaller than _llama's: a step simulated takes minutes at that size)

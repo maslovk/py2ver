@@ -162,6 +162,7 @@ def test_a_staged_interpolator_gives_one_sample_per_transfer(monkeypatch, tmp_pa
     assert p.TB_stages()(xs) == p.PY_stages()(xs)
 
 
+@pytest.mark.long
 def test_stages_are_smaller_in_quartus(quartus, formats):
     p = Py2ver(receiver, formats, stages=True)
     assert p.SYN_stages(quartus).combinational < p.SYN(quartus).combinational / 2

@@ -45,5 +45,6 @@ markers = [
     "sim: end-to-end simulator integration tests (cocotb + Icarus)",
     "board: the virtual DE0-Nano board (UART-level simulation of the whole project; slow)",
     "quartus: real Quartus compile (skipped unless QUARTUS_DIR is set or quartus_sh is on PATH)",
-    "slow: a large design's simulation (minutes: a training step's Verilog compiled)",
+    "slow: a large design's simulation or a Quartus compile (a minute or more)",
+    "long: minutes each: skipped unless pytest runs with --long",
 ]
