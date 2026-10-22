@@ -1365,7 +1365,10 @@ as `SYN()` does. It does not program the board: load
 `syn/<name>_pins/DE0_Nano.sof` with Quartus's programmer. A design that uses
 the SDRAM goes on the board with `HW()` instead. A pin marked
 `{'open_drain': True}` (I2C's SCL and SDA) is pulled low or left floating,
-its line read back from the same pin. `PINS(q, signaltap=True)` builds
+its line read back from the same pin. The JTAG UART's pins (`JTAG_RX_DATA`,
+`JTAG_RX_VALID`, `JTAG_TX_DATA`, `JTAG_TX_VALID`, ...) carry bytes to and
+from the PC over the USB-Blaster cable (`juart-terminal`, no serial adapter;
+`examples/jtag_echo.py`). `PINS(q, signaltap=True)` builds
 SignalTap in too, recording the pins (with `Py2ver(..., probes=True)`, the
 process's state as well) on the board; `syn/<name>_pins/signaltap.txt` says
 which bits are which. See sections 8 and 9 of

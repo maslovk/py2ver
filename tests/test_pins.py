@@ -108,6 +108,81 @@ def test_signaltap_on_the_board_in_quartus(quartus):
     assert "rx___pc_out\t15:13\t3" in (p._pins_dir / "signaltap.txt").read_text()
 
 
+import jtag_echo as J  # noqa: E402
+
+# (the PC's side of the JTAG UART, as the JTAG UART IP's handshake has it: a byte on
+# t_dat while t_ena, given only while t_dav; the FPGA's back on r_dat with r_val the
+# clock after r_ena; Intel's alt_jtag_atlantic has no simulation model)
+_JTAG_PC = """
+module alt_jtag_atlantic #(parameter INSTANCE_ID = 0, LOG2_RXFIFO_DEPTH = 6,
+                           LOG2_TXFIFO_DEPTH = 6, SLD_AUTO_INSTANCE_INDEX = "YES") (
+    input clk, input rst_n,
+    input [7:0] r_dat, input r_val, output reg r_ena = 1'b0,
+    output reg [7:0] t_dat = 8'd0, input t_dav, output reg t_ena = 1'b0, output t_pause);
+    assign t_pause = 1'b0;
+    reg [7:0] text [0:4];
+    integer k = 0, n = 0;
+    initial begin text[0] = "h"; text[1] = "e"; text[2] = "l"; text[3] = "l"; text[4] = "o"; end
+    always @(posedge clk) begin
+        t_ena <= 1'b0;
+        r_ena <= (n % 3) != 0;                      // (the PC not always ready)
+        n = n + 1;
+        if (rst_n && t_dav && k < 5) begin t_dat <= text[k]; t_ena <= 1'b1; k = k + 1; end
+        if (r_val) $display("PC %c", r_dat);
+    end
+endmodule
+"""
+
+_JTAG_TB = """
+`timescale 1ns/1ps
+module tb;
+    reg clk = 0;
+    always #10 clk = !clk;
+    wire [7:0] led;
+    DE0_Nano board(.CLOCK_50(clk), .KEY(2'b11), .LED(led));
+    initial begin repeat (400) @(posedge clk); $display("LED %c", led); $finish; end
+endmodule
+"""
+
+
+def test_the_jtag_uart_s_pins():
+    top = _quiet(J.jtag_echo, J.PINS).board_top()
+    assert "alt_jtag_atlantic #(" in top and ".byte_(jtag_rx_data)" in top
+    assert "assign jtag_tx_data = out_w;" in top and "assign jtag_rx_ready = ready_w;" in top
+    assert "jtag_rx_data_s1" not in top                    # (its clock: no two registers)
+    with pytest.raises(ValueError, match="JTAG_TX_DATA is for an output of the design's"):
+        _quiet(J.jtag_echo, dict(J.PINS, byte="JTAG_TX_DATA", out="GPIO_0[9:2]"))
+    one_bit = {k: v for k, v in J.PINS.items() if k != "out"}
+    with pytest.raises(ValueError, match=r"the port 'ready' \(1 bit\): JTAG_TX_DATA: 8 bits "
+                                         r"for a port of 1"):
+        _quiet(J.jtag_echo, dict(one_bit, ready="JTAG_TX_DATA"))
+    assert pin_width("JTAG_RX_DATA") == 8 and pin_width("JTAG_TX_VALID") == 1
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_an_echo_over_the_jtag_uart_on_the_board(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    d = _quiet(J.jtag_echo, J.PINS).gen_pins_project()
+    (d / "tb.v").write_text(_JTAG_TB, encoding="utf-8")
+    (d / "pc.v").write_text(_JTAG_PC, encoding="utf-8")
+    subprocess.run(["iverilog", "-o", "tb.vvp", "tb.v", "pc.v", "DE0_Nano.v", "jtag_echo.v"],
+                   cwd=d, check=True)
+    out = subprocess.run(["vvp", "-n", "tb.vvp"], cwd=d, check=True, capture_output=True,
+                         text=True).stdout.splitlines()
+    assert "".join(l[-1] for l in out if l.startswith("PC ")) == "hello"   # (all back, in order)
+    assert "LED o" in out
+
+
+def test_the_jtag_uart_in_quartus(quartus):
+    p = _quiet(J.jtag_echo, J.PINS)
+    r = p.PINS(quartus)
+    assert r.meets_timing and r.fmax_mhz > 50
+    # (Intel's JTAG UART core in it, on the JTAG hub)
+    built = (p._pins_dir / "DE0_Nano.map.rpt").read_text(encoding="utf-8", errors="replace")
+    assert "alt_jtag_atlantic:u_jtag_uart" in built and "sld_hub:auto_hub" in built
+
+
 def test_processes_together_take_the_board_s_pins():
     top = _quiet(U.echo(), U.ECHO_PINS).board_top()
     assert "input GPIO_0_RX" in top and "output GPIO_0_TX" in top

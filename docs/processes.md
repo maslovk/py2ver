@@ -472,6 +472,7 @@ with Quartus's programmer.
 | the GPIO_0 header | `GPIO_0[33:2]` (inputs or outputs); `GPIO_0_IN[1:0]` (inputs only) |
 | the serial pins, where the USB-UART adapter goes | `GPIO_0_RX` (FPGA pin D3), `GPIO_0_TX` (C3): GPIO_0's first two pins |
 | GPIO_1, GPIO_2 | `GPIO_1[33:0]`, `GPIO_1_IN[1:0]`, `GPIO_2[12:0]`, `GPIO_2_IN[2:0]` |
+| the JTAG UART (bytes to and from the PC, below) | `JTAG_RX_DATA`, `JTAG_RX_VALID`, `JTAG_RX_READY`, `JTAG_TX_DATA`, `JTAG_TX_VALID`, `JTAG_TX_READY` |
 
 The FPGA pin of every name is in the assignments file, and the board's user
 manual maps FPGA pins to header pins. `GPIO_0[0]` and `GPIO_0[1]` don't
@@ -546,6 +547,51 @@ line.
 **Fmax.** Quartus reports the *restricted* Fmax. On this device it is at
 most 250 MHz (the I/O toggle rate), even when the logic alone could run
 faster.
+
+### Talking to the PC: the JTAG UART
+
+The JTAG UART carries bytes between the design and the PC over the same
+USB-Blaster cable that programs the board, so no serial adapter is needed.
+Its six pins connect it to the design's ports:
+
+| pin | the design's | means |
+|---|---|---|
+| `JTAG_RX_DATA` | input, 8 bits | a byte from the PC |
+| `JTAG_RX_VALID` | input | high for the clock a byte is given, and taken |
+| `JTAG_RX_READY` | output (optional) | bytes are given only while this is high; without it, as they come |
+| `JTAG_TX_DATA` | output, 8 bits | a byte to the PC |
+| `JTAG_TX_VALID` | output | high one clock per byte to send |
+| `JTAG_TX_READY` | input (optional) | high while there's room to send |
+
+```py
+def jtag_echo(port):                           # examples/jtag_echo.py
+    port.ready = 1
+    port.send = 0
+    while True:
+        yield from wait_until(port, "valid")   # a byte from the PC, taken this clock
+        b = port.byte
+        port.ready = 0                         # no more until it's sent back
+        port.out = b
+        port.leds = b
+        yield from wait_until(port, "room")
+        port.send = 1                          # one clock: one byte to the PC
+        yield
+        port.send = 0
+        port.ready = 1
+
+board = Py2ver(jtag_echo, {"byte": "JTAG_RX_DATA", "valid": "JTAG_RX_VALID",
+                           "ready": "JTAG_RX_READY", "out": "JTAG_TX_DATA",
+                           "send": "JTAG_TX_VALID", "room": "JTAG_TX_READY", "leds": "LED"})
+board.PINS({"QUARTUS_DIR": "/opt/intelFPGA/22.1std/quartus/bin"})
+```
+
+The board's top adds Intel's JTAG UART core (`alt_jtag_atlantic`), with a
+FIFO of 8 bytes from the PC and 16 to it. These pins are inside the FPGA, on
+the design's clock, so they don't go through the two input registers. On
+the PC, after programming the board, run `juart-terminal` (in Quartus's
+`bin` directory) and type. It reads its standard input and writes its
+standard output, so a script can drive it too. The JTAG UART and SignalTap
+can be used together; both connect to the board through the same JTAG hub.
 
 ### Debugging on the board with SignalTap
 

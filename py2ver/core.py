@@ -322,6 +322,10 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         tree, attr = fe.tree, fe.attr
         self._py_attr, self._py_params = fe.py_attr, fe.py_params
         self._hw_name, self._py_name = fe.hw_name, fe.py_name
+        # (the board's pins by the ports' names in the Verilog: byte -> byte_)
+        self._pins = {self._hw_name.get(k, k): v for k, v in self._pins.items()}
+        self._opens = {self._hw_name.get(k, k): self._hw_name.get(v, v)
+                       for k, v in getattr(self, "_opens", {}).items()}
         self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
         self._fx_types, self._model = fe.fx_types, fe.model
         self._shapes = fe.shapes             # lists of lists: (rows, ...) per argument
