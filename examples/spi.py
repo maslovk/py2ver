@@ -1,6 +1,6 @@
 # SPI (mode 0), from its spec to the FPGA: a master and a slave written as the
-# protocol says, as Python generators in which a yield is a clock (see "Processes"
-# in the README), connected as one design and checked by a testbench written the
+# protocol says, as Python generators in which a yield is a clock (see
+# docs/processes.md, the guide), connected as one design and checked by a testbench written the
 # same way.
 #
 # Mode 0: the clock idle low; the chip select low for a transfer; each bit, most
@@ -95,21 +95,17 @@ def exchange(pairs):
 
 
 if __name__ == "__main__":
-    import contextlib
-    import io
     from py2ver import Py2ver
 
     pairs = [(0xA5, 0x3C), (0x01, 0x80), (0xFF, 0x00)]
-    with contextlib.redirect_stdout(io.StringIO()):
-        p = Py2ver(spi_pair())
+    p = Py2ver(spi_pair())
     run = p.check(exchange(pairs), verilog="--sim" in sys.argv[1:])
     print(f"{len(run.inputs)} clocks: master and slave received "
           f"{[(hex(m), hex(s)) for m, s in run.value]} (sent {[(hex(a), hex(b)) for a, b in pairs]})")
     print("the same in the model" + (" and the Verilog" if "--sim" in sys.argv[1:] else ""))
     if "--syn" in sys.argv[1:]:
         q = {"QUARTUS_DIR": os.environ.get("QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}
-        with contextlib.redirect_stdout(io.StringIO()):
-            m = Py2ver(spi_master, {"start": 1, "send": BITS, "miso": 1})
-            s = Py2ver(spi_slave, {"reply": BITS, "sclk": 1, "mosi": 1, "cs_n": 1})
+        m = Py2ver(spi_master, {"start": 1, "send": BITS, "miso": 1})
+        s = Py2ver(spi_slave, {"reply": BITS, "sclk": 1, "mosi": 1, "cs_n": 1})
         for name, d in (("master", m), ("slave", s)):
             print(name, d.SYN(q))

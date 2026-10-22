@@ -1,6 +1,6 @@
 # WS2812 (NeoPixel) LEDs, from their spec to the FPGA: the driver written as the
-# datasheet says, a Python generator in which a yield is a clock (see "Processes"
-# in the README), checked by a testbench that reads its line back as an LED does.
+# datasheet says, a Python generator in which a yield is a clock (see
+# docs/processes.md, the guide), checked by a testbench that reads its line back as an LED does.
 #
 # The line: each bit a high pulse then low, 1.25 us in all: a 0 high 0.4 us, a 1
 # high 0.8 us (each +-0.15 us); 24 bits an LED, green, red, blue, most significant
@@ -87,13 +87,10 @@ def led_strip(line):
 
 
 if __name__ == "__main__":
-    import contextlib
-    import io
     from py2ver import Py2ver
 
     colors = [0xFF0000, 0x00FF00, 0x0000FF, 0x123456]
-    with contextlib.redirect_stdout(io.StringIO()):
-        p = Py2ver(ws2812, ATTR)
+    p = Py2ver(ws2812, ATTR)
     run = p.check(show(colors), verilog="--sim" in sys.argv[1:])
     got = led_strip([r["dout"] for r in run.outputs])
     print(f"{len(run.inputs):,} clocks; the LEDs got {[hex(c) for c in got]} "

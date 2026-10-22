@@ -305,6 +305,19 @@ def test_a_testbench_s_assert_says_its_clock():
         process.drive(U.echo(), forever, limit=50)
 
 
+def test_a_testbench_stuck_in_together_says_which_step():
+    def never(dut):
+        yield from wait_until(dut, "error")            # (the echo's error: never)
+
+    def tb(dut):
+        dut.rx = 1
+        yield from together(uart_send(dut, "rx", 0x41, U.BIT), never(dut))
+    with pytest.raises(process.ProcessError, match=r"\(together\) \[\S*test_protocol\.py:\d+ "
+                                                   r"\(never\) -> py2ver/protocol\.py:\d+ "
+                                                   r"\(wait_until\)\]"):
+        process.drive(U.echo(), tb, limit=12 * U.BIT)
+
+
 @pytest.mark.sim
 def test_a_check_says_which_simulator(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)

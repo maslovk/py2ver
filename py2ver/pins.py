@@ -75,6 +75,9 @@ def parse_pin(spec: str, width: int, pins: Dict[str, List[int]]) -> List[str]:
             raise ValueError(f"{name} is a single pin: a port of 1 bit")
         return [name]
     if a is None:
+        if width > len(have):
+            raise ValueError(f"{spec}: {len(have)} pins for a port of {width} bits (give it "
+                             f"{width} pins, or the port its width in attr)")
         lo, hi = have[0], have[0] + width - 1
     elif b is None:
         lo = hi = int(a)
@@ -111,7 +114,8 @@ class PinsMixin:
             try:
                 return parse_pin(self._pins[p.name], p.width, pins)
             except ValueError as e:
-                raise ValueError(f"the port '{p.name}' ({p.width} bits): {e}") from None
+                bits = "1 bit" if p.width == 1 else f"{p.width} bits"
+                raise ValueError(f"the port '{p.name}' ({bits}): {e}") from None
         ins = {p.name: parse(p) for p in self.ir.inputs
                if p.kind == "input" and p.name in self._pins}
         outs = {p.name: parse(p) for p in self.ir.outputs if p.name in self._pins}
@@ -181,8 +185,11 @@ class PinsMixin:
             conns.append(f".{p.name}({p.name}_w)")
             for i, pin in enumerate(outs.get(p.name, [])):
                 lines.append(f"    assign {pin} = {p.name}_w" + (f"[{i}];" if p.width > 1 else ";"))
-        # (a GPIO pin no output drives: floating)
+        # (a GPIO pin no output drives: floating; an LED: off)
         driven = {pin for ps in outs.values() for pin in ps}
+        for g in groups:
+            if g in _OUT_GROUPS:
+                lines += [f"    assign {g}[{i}] = 1'b0;" for i in pins[g] if f"{g}[{i}]" not in driven]
         for g in groups:
             if g.startswith("GPIO") and g not in _IN_GROUPS and pins[g]:
                 free = [i for i in pins[g] if f"{g}[{i}]" not in driven]

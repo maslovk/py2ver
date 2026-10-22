@@ -69,6 +69,15 @@ def test_the_board_s_top_takes_the_design_between_its_pins():
     assert "|| !KEY[0]" in top                                       # (KEY[0] resets)
 
 
+def test_unused_leds_are_off_and_pins_count_bits():
+    top = _quiet(U.uart_tx, {"start": 1, "data": 8, "tx": "GPIO_0_TX", "busy": "LED[0]"}).board_top()
+    assert "assign LED[0] = busy_w;" in top and "assign LED[7] = 1'b0;" in top
+    with pytest.raises(ValueError, match=r"the port 'data' \(8 bits\): SW: 4 pins for a port of 8"):
+        _quiet(U.uart_tx, {"start": 1, "data": {"width": 8, "pin": "SW"}})
+    with pytest.raises(ValueError, match=r"the port 'tx' \(1 bit\): GPIO_0\[1\]"):
+        _quiet(U.uart_tx, {"start": 1, "data": 8, "tx": "GPIO_0[1]"})
+
+
 def test_processes_together_take_the_board_s_pins():
     top = _quiet(U.echo(), U.ECHO_PINS).board_top()
     assert "input GPIO_0_RX" in top and "output GPIO_0_TX" in top

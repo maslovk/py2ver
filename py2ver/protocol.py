@@ -77,10 +77,14 @@ def shift_in(port, pin, bits, clocks, msb_first=False):
 
 def together(*steps):
     """Steps at once, a clock at a time, in a testbench (a process is one sequence:
-    there, connect() processes); their values, when all have returned:
+    there, connect() processes). It returns when every step has returned, with
+    a list of their values, in order:
 
         _, got = yield from together(uart_send(dut, "rx", b, BIT),
                                      uart_receive(dut, "tx", BIT))
+
+    A step that watches the pins forever keeps it from returning: give such a
+    step its own end (n bytes seen, say).
     """
     waits = [0] * len(steps)
     values = [None] * len(steps)

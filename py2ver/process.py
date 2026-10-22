@@ -242,6 +242,11 @@ def _waiting(gen) -> str:
     while gen is not None and getattr(gen, "gi_frame", None) is not None:
         f = gen.gi_frame
         out.append(f"{_short(f.f_code.co_filename)}:{f.f_lineno} ({f.f_code.co_name})")
+        if f.f_code.co_name == "together" and f.f_code.co_filename.endswith("protocol.py"):
+            # (the steps run at once: each one not done yet, where it waits)
+            steps, done = f.f_locals.get("steps", ()), f.f_locals.get("done", ())
+            out[-1] += " [" + "; ".join(_waiting(s) for s, d in zip(steps, done) if not d) + "]"
+            break
         gen = gen.gi_yieldfrom
     return " -> ".join(out) or "?"
 

@@ -1,0 +1,492 @@
+# Protocols as Python generators: a guide
+
+This guide shows how to go from a protocol's specification to hardware on the
+DE0-Nano with py2ver. You write the protocol as a Python generator in which
+each `yield` is one clock. py2ver turns it into a state machine that does
+exactly what the generator does, clock for clock, and the generator itself
+stays the reference you test against.
+
+The running example is a UART (8N1, 115200 baud at the board's 50 MHz clock):
+a transmitter, a receiver, then both connected as an echo that sends back
+every byte it receives. Every `python` block below runs as written, in order
+(`tests/test_docs.py` runs them).
+
+## 1. Write the protocol
+
+A UART frame is: the line idles high; a start bit (low); eight data bits,
+least significant first; a stop bit (high). Each bit lasts `BIT` clocks.
+
+```python
+import functools
+
+from py2ver import Py2ver, connect, process
+
+BIT = 50_000_000 // 115_200          # 434 clocks per bit
+
+
+def uart_tx(port, bit=BIT):
+    """Send port.data when port.start is high for a clock; port.busy is high
+    while a frame goes out."""
+    port.tx = 1                      # the line idles high
+    while True:
+        port.busy = 0
+        while not port.start:        # wait for a byte to send
+            yield
+        data = port.data
+        port.busy = 1
+        port.tx = 0                  # the start bit
+        yield bit
+        for i in range(8):           # eight data bits, least significant first
+            port.tx = (data >> i) & 1
+            yield bit
+        port.tx = 1                  # the stop bit
+        yield bit
+```
+
+The rules:
+
+- **The port.** The generator's first argument is its port. An attribute it
+  only reads (`port.start`, `port.data`) is an input pin. An attribute it
+  writes (`port.tx`, `port.busy`) is an output pin.
+- **A `yield` is one clock.** `yield n` waits `n` clocks; `n` can be an
+  expression. All the code between two yields runs within one clock.
+- **Outputs are registers.** A value written to an output appears on the pin
+  from the next clock on (see section 4, "When things happen").
+- **Locals keep their values** from one clock to the next. Each one becomes a
+  register.
+- **Loops and ifs.** A `while`, a `for ... in range(...)` or an `if` that
+  contains a yield becomes states of the machine; `break` and `continue`
+  work. A loop with no yield in it is logic within one clock, and its bounds
+  must be constants.
+- **Parameters.** Arguments after the port (`bit=BIT`) are constants: their
+  default values, or the ones a `functools.partial` gives.
+
+## 2. Build it
+
+```python
+tx = Py2ver(uart_tx, {"start": 1, "data": 8, "tx": {"init": 1}})
+```
+
+The second argument, attr, gives each input its width: `8` is short for
+`{"width": 8}`. You don't give widths to outputs or locals; py2ver follows
+the values written to them (see "Widths" below). An output's `"init"` is its
+value after reset (here the line is high from the start).
+
+Run it a clock at a time. Each clock's inputs are a dict; an input left out
+is 0. Each clock's outputs come back as a dict:
+
+```python
+clocks = [{"start": 1, "data": 0x55}] + [{"start": 0}] * (10 * BIT + 2)
+rows = tx.GEN_process()(clocks)          # the generator itself
+assert rows[0] == {"tx": 1, "busy": 0}   # clock 0: start is seen...
+assert rows[1] == {"tx": 0, "busy": 1}   # ...and the start bit is on the line at clock 1
+assert tx.PY_process()(clocks) == rows   # the machine's bit-exact model, the same
+```
+
+There are three ways to run a process, and they must always agree:
+
+| method | runs |
+|---|---|
+| `GEN_process()` | the generator itself (the reference) |
+| `PY_process()` | the state machine py2ver built, as a bit-exact Python model |
+| `TB_process()` | the generated Verilog, in a simulator (Icarus or Verilator) |
+
+### Widths
+
+py2ver works out the width of every local and output by following the
+values assigned to it through each state, taking the `if` tests into
+account:
+
+- `if pos < 255: pos = pos + 1` keeps `pos` at 8 bits, and so does
+  `pos = min(pos + 1, 255)`.
+- A counter reset at a bound (`n = n + 1`, then `if n == 50_000: n = 0`) is
+  as wide as the bound: 16 bits.
+- A `for i in range(8)` variable is 4 bits wide: it reaches 8 when the loop
+  ends.
+
+When a value really can grow without end (`total = total + port.x`), py2ver
+stops with an error naming every such variable and the line where it is
+first assigned. Give those widths in attr: `{"total": 16}`.
+
+Use the names that `explain()` shows (section 6). Two kinds of local are
+renamed:
+
+- A local with the same name as a pin is renamed with `_v`: `data` becomes
+  `data_v`, because `port.data` is a pin.
+- A local of a step is prefixed with the step's name: `n` in `edge` becomes
+  `edge_n` (section 3).
+
+## 3. Steps, parameters and the protocol library
+
+A step that a protocol takes more than once can be written as a generator of
+its own and used with `yield from`. The step is built into the process that
+uses it, so going in and out of it costs no clock. A value it `return`s is
+the value of `x = yield from ...`.
+
+`py2ver.protocol` has common steps. Each takes the port and a pin's name (a
+constant string):
+
+| step | does |
+|---|---|
+| `wait_until(port, pin, value=1)` | waits until the pin has the value (no clock if it already has) |
+| `wait_edge(port, pin, rising=True)` | waits for the pin's next rising (or falling) edge |
+| `wait_cycles(n)` | waits `n` clocks |
+| `shift_out(port, pin, value, bits, clocks, msb_first=False)` | puts `value`'s bits on the pin, `clocks` clocks each |
+| `shift_in(port, pin, bits, clocks, msb_first=False)` | reads `bits` bits from the pin, one every `clocks` clocks, and returns the value |
+| `uart_send(port, pin, byte, bit)` | sends a UART frame |
+| `uart_receive(port, pin, bit)` | receives a UART frame and returns its byte |
+| `together(*steps)` | in testbenches only: runs steps at the same time, and returns when every one has returned, with a list of their values (section 5) |
+
+`debounced(port, clocks)` is a whole process rather than a step: connect it
+in front of a switch or a slow line (section 7) and its `port.clean` follows
+`port.raw` once `raw` has held a new value for `clocks` clocks.
+
+The receiver, written with two of these steps:
+
+```python
+from py2ver.protocol import shift_in, wait_until
+
+
+def uart_rx(port, bit=BIT):
+    """port.rx is the line. For each byte received: port.data, and port.valid
+    high for one clock (port.error too, if the stop bit was low)."""
+    while True:
+        port.valid = 0
+        yield from wait_until(port, "rx", 0)            # the start bit's falling edge
+        yield bit // 2                                  # to the middle of the start bit
+        if port.rx:                                     # high again: a glitch, not a start bit
+            continue
+        data = yield from shift_in(port, "rx", 8, bit)  # each bit at its middle
+        yield bit                                       # the middle of the stop bit
+        port.data = data
+        port.error = 1 - port.rx                        # the stop bit should be high
+        port.valid = 1
+        yield
+
+
+rx = Py2ver(uart_rx, {"rx": 1})
+```
+
+Writing your own step is the same as writing a process: a generator whose
+first argument is the port. Inside a step, `getattr(port, name)` and
+`setattr(port, name, value)` with a constant name read and write that pin.
+
+Parameters make variants without editing the code:
+`functools.partial(uart_rx, bit=217)` is the same receiver at twice the
+baud rate.
+
+## 4. When things happen
+
+Within one clock, a process reads its inputs' values for that clock and runs
+until its next `yield`. What it writes to an output appears on the pin at the
+next clock:
+
+| clock | input `a` | the process | output `y` |
+|---|---|---|---|
+| 0 | 1 | reads `a = 1`, writes `y = 1` | 0 (its initial value) |
+| 1 | 0 | reads `a = 0`, writes `y = 0` | 1 |
+| 2 | 0 | ... | 0 |
+
+```python
+def follow(port):
+    while True:
+        port.y = port.a
+        yield
+
+
+f = Py2ver(follow, {"a": 1})
+assert [r["y"] for r in f.GEN_process()([{"a": 1}, {"a": 0}, {"a": 0}])] == [0, 1, 0]
+```
+
+Two `wait_until`s in a row follow an edge: `wait_until(port, "clk", 1)` then
+`wait_until(port, "clk", 0)` waits for the next falling edge (that is what
+`wait_edge(port, "clk", rising=False)` does). This works because an input
+keeps one value through a clock: once the first wait has passed, the pin is
+known to be 1 for the rest of that clock, so the second one waits at least
+a clock. A 1-bit input that isn't 0 is 1, so `while port.clk == 0:` and
+`while port.clk != 1:` mean the same.
+
+A loop that could go round without a clock passing is an error. The message
+shows the way round: `ps2.py:46 -> ps2.py:34 -> ps2.py:46`. Add a `yield` on
+that path, or a test that the inputs rule out.
+
+## 5. Test it
+
+A testbench is a generator too. Its one argument is the design's pins. It
+writes the design's inputs (a value stays until written again), reads the
+design's outputs, and each `yield` is one clock, as in a process.
+
+The timing follows the table above. Each time the testbench resumes after
+a `yield`, it is at a new clock: reading `dut.y` gives the output's value
+during that clock, which is what the design wrote at the clock before. The
+inputs the testbench sets before its next `yield` are the ones the design
+reads during this clock.
+
+```python
+def tb(dut):
+    dut.a = 1             # clock 0: the design reads a = 1
+    yield
+    assert dut.y == 1     # clock 1: what the design wrote at clock 0
+    dut.a = 0
+    yield
+    assert dut.y == 0
+
+
+process.drive(follow, tb, {"a": 1})     # runs tb against the generator
+```
+
+So a handshake needs no extra clocks. A testbench that sets `start = 1`,
+yields once, then sets `start = 0` and calls `wait_until(dut, "busy", 0)`,
+already sees `busy` high: the transmitter saw `start` during the first clock
+and wrote `busy = 1` then.
+
+`check()` is the one call to test a design. It works in three steps:
+
+1. It runs the testbench against the generator, a clock at a time.
+2. It feeds each clock's inputs from that run to the model, and
+3. to the Verilog in a simulator (skip this with `verilog=False`).
+
+Each must give the generator's outputs at every clock. Because the outputs
+are registers, a testbench that reacts to them (waits for `busy`, reads a
+reply) runs exactly the same against all three.
+
+The echo: the receiver's byte goes to the transmitter. A testbench plays the
+other end of the line. `together()` runs the sending and the receiving steps
+at the same time, because the echo starts answering before the host has
+finished sending:
+
+```python
+from py2ver.protocol import together, uart_receive, uart_send
+
+
+def echo(bit=BIT):
+    """Every byte received on rx, sent back on tx."""
+    return connect(rx=(functools.partial(uart_rx, bit=bit), {"rx": 1}),
+                   tx=(functools.partial(uart_tx, bit=bit), {"tx": {"init": 1}}),
+                   name="uart_echo",
+                   wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
+
+
+def host(text, bit=BIT):
+    """A testbench: send each byte of text and receive what comes back."""
+    def tb(dut):
+        dut.rx = 1                           # the line idles high
+        yield 10
+        got = []
+        for b in text:
+            _, back = yield from together(uart_send(dut, "rx", b, bit),
+                                          uart_receive(dut, "tx", bit))
+            got.append(back)
+        return bytes(got)
+    return tb
+
+
+e = Py2ver(echo())
+run = e.check(host(b"hi"))
+assert run.value == b"hi"                    # what the testbench returned
+print(len(run.inputs), "clocks, Verilog run in", run.simulator)
+```
+
+The `Run` that `check()` returns has each clock's `inputs` and `outputs`,
+the testbench's return `value`, and the `simulator` that ran the Verilog.
+The simulator is Icarus, or Verilator for long runs when it is installed;
+set `PY2VER_SIM=icarus` or `PY2VER_SIM=verilator` to choose.
+
+When something is wrong:
+
+- A failed `assert` in the testbench raises `process.TestbenchFailed`,
+  giving the clock and the line.
+- A model or Verilog that differs from the generator raises
+  `process.CheckFailed` with the first clock and pin that differ, for example
+  `the model differs from the generator at clock 1,000: busy 0 / 1`. It
+  writes the waveforms of both runs next to your script
+  (`uart_echo_generator.vcd`, `uart_echo_model.vcd`) for GTKWave or Surfer.
+- A testbench that never returns stops after `limit=` clocks (10 million by
+  default) and says where it was waiting.
+
+Real protocol timing makes long runs: a few frames at 115200 baud are tens
+of thousands of clocks, and the Python side is the slow part. A parameter
+makes a fast variant for testing:
+
+```python
+fast = Py2ver(echo(bit=8))
+assert fast.check(host(b"hello", bit=8), verilog=False).value == b"hello"
+```
+
+Other tools: `GEN_process(vcd="file.vcd")` (and the same for `PY_process`
+and `TB_process`) writes a run's waveforms, and
+`process.difference(rows_a, rows_b)` gives the first clock where two runs
+differ, or `None`.
+
+## 6. See what was built
+
+```python
+print(rx.explain())
+```
+
+prints each state with the line where it waits, and every register's
+width (here the guide's code was run as `guide.py`):
+
+```text
+uart_rx: 6 states (a state waits at its yield: a clock, or yield n's n)
+  0  guide.py:40  def uart_rx(port, bit=BIT):  (the start)
+  1  py2ver/protocol.py:19  yield  (in wait_until from guide.py:45)
+  2  guide.py:46  yield bit // 2                                  # to the middle of the start bit
+  3  py2ver/protocol.py:70  yield clocks  (in shift_in from guide.py:49)
+  4  guide.py:50  yield bit                                       # the middle of the stop bit
+  5  guide.py:54  yield
+bits (the outputs, the locals and the state: registers):
+  inputs   rx 1
+  outputs  valid 1, data 8, error 1
+  locals   data_v 8, shift_in_i 4
+  state    __pc 3, __wait 9  (__pc: the state; __wait: the clocks a yield n has left)
+  (data_v: the local data (named apart from the pin port.data))
+```
+
+A state inside a step shows the step and where it was used from. `__pc` is
+the state register and `__wait` counts down the clocks of a `yield n`. For a
+connected design, `explain()` shows each process in turn.
+
+## 7. Connect processes
+
+`connect()` makes one design from several processes. Name each process with
+a keyword and give it as `(generator, its attr)`. `wires` connects an input
+of one process to an output of another, as `"process.pin"`:
+
+```python
+assert [q.name for q in e.ir.inputs] == ["rx", "clk", "rst", "ce"]
+assert [q.name for q in e.ir.outputs] == ["valid", "data", "error", "tx", "busy"]
+```
+
+- **What a wire carries.** A wire carries the output's register: the value
+  its process wrote before this clock, exactly as a pin would. Processes
+  therefore can't loop back on each other within a clock, and the order you
+  list them in doesn't matter.
+- **Widths.** A wired input takes its width from the output feeding it, so
+  it needs no width in attr.
+- **The design's pins.** They are the inputs that aren't wired, plus every
+  output, each under its own name. If two processes have a pin of the same
+  name, both get their process's name in front (`rx_data`, `tx_data`).
+- **The design's attr.** `Py2ver(design, attr)` takes those pin names. Use
+  `"process.name"` for a process's own local (`{"enc.count": 16}`).
+
+## 8. Put it on the board
+
+A port's attr can name a DE0-Nano pin. A string is short for `{"pin": ...}`:
+
+```python
+board = Py2ver(echo(), {"rx": "GPIO_0_RX", "tx": "GPIO_0_TX", "data": "LED"})
+print(board.board_top())        # the board's top module, with the design inside
+```
+
+```py
+board.PINS({"QUARTUS_DIR": "/opt/intelFPGA/22.1std/quartus/bin"})
+# Device:          EP4CE22F17C6
+# Combinational:   143
+# Registers:       58
+# Fmax:            181.59 MHz
+# Timing @ 50 MHz: met (worst setup slack 15.541 ns)
+```
+
+`PINS()` compiles the board project with Quartus and reports its area and
+timing. It does not program the board: load `syn/<name>_pins/DE0_Nano.sof`
+with Quartus's programmer.
+
+**Pin names** are those of the board's assignments
+(`py2ver/templates/hw/de0_nano_qsf.txt`):
+
+| pins | names |
+|---|---|
+| the LEDs (outputs) | `LED[7:0]`; `'LED'` is all 8 |
+| the keys and switches (inputs) | `KEY[1:0]`, `SW[3:0]` |
+| the GPIO_0 header | `GPIO_0[33:2]` (inputs or outputs); `GPIO_0_IN[1:0]` (inputs only) |
+| the serial pins, where the USB-UART adapter goes | `GPIO_0_RX` (FPGA pin D3), `GPIO_0_TX` (C3): GPIO_0's first two pins |
+| GPIO_1, GPIO_2 | `GPIO_1[33:0]`, `GPIO_1_IN[1:0]`, `GPIO_2[12:0]`, `GPIO_2_IN[2:0]` |
+
+The FPGA pin of every name is in the assignments file, and the board's user
+manual maps FPGA pins to header pins. `GPIO_0[0]` and `GPIO_0[1]` don't
+exist under those names: they are `GPIO_0_RX` and `GPIO_0_TX`.
+
+**Widths and pins.** An input without a width gets as many bits as it has
+pins. Any other port keeps its width, and pins that don't match it are an
+error as soon as the design is built: an 8-bit `data` on `"LED[7:1]"` is
+"7 pins for a port of 8 bits". Not every port needs a pin. Inputs without
+one are tied to 0, outputs without one are left unconnected, and LEDs no
+output drives are off.
+
+**The keys read 0 while pressed** (they are active-low). A process that
+waits for a press waits for the key to go low:
+`wait_edge(port, "key", rising=False)`.
+
+**Feeding an input from inside the board.** An input with no pin is 0 for
+good, so something on the board has to drive it. Connect a process in front
+of it. Here, each press of `KEY[1]` sends a count of presses out of the
+serial pin, which a terminal on the USB-UART adapter shows. `debounced`
+cleans up the key's bounces:
+
+```python
+from py2ver.protocol import debounced, wait_edge
+
+
+def presses(port):
+    """A one-clock pulse on port.pulse at each press of the key, and the
+    count of presses in port.count."""
+    count = 0
+    port.pulse = 0
+    port.count = 0
+    while True:
+        yield from wait_edge(port, "key", rising=False)    # pressed: the key goes low
+        count = (count + 1) & 255
+        port.count = count
+        port.pulse = 1
+        yield
+        port.pulse = 0
+
+
+button = connect(db=(functools.partial(debounced, clocks=500_000), {"raw": 1}),   # 10 ms
+                 key=(presses, {}),
+                 tx=(uart_tx, {"tx": {"init": 1}}),
+                 name="button_tx",
+                 wires={"key.key": "db.clean", "tx.start": "key.pulse",
+                        "tx.data": "key.count"})
+on_board = Py2ver(button, {"raw": "KEY[1]", "tx": "GPIO_0_TX", "count": "LED"})
+assert "assign GPIO_0_TX = tx_w;" in on_board.board_top()
+```
+
+**What the board's top adds:**
+
+- the 50 MHz clock (`CLOCK_50`);
+- a reset at power-up and while `KEY[0]` is pressed (unless a port uses
+  `KEY[0]`);
+- two registers in front of every input, because a pin can change at any
+  moment. On the board, the design therefore sees an input two clocks
+  later than in simulation.
+
+There is no glitch filter: put `debounced` in front of a switch or a slow
+line.
+
+**Electrical.**
+
+- The GPIO pins are 3.3-V LVTTL. They are not 5-V tolerant: a 5-V device
+  such as a PS/2 keyboard needs a level shifter.
+- No pull-ups are enabled.
+- A GPIO pin that no output drives is left floating. A pin can't yet switch
+  between driving and floating, as I2C and 1-Wire need.
+
+**Fmax.** Quartus reports the *restricted* Fmax. On this device it is at
+most 250 MHz (the I/O toggle rate), even when the logic alone could run
+faster.
+
+## 9. Error messages
+
+| message | meaning, and what to do |
+|---|---|
+| `give the input 'x' its width in attr` | every input needs a width: `{"x": 8}`, or a pin |
+| `'x': its values grow without end as followed: give its width in attr` | nothing bounds `x`; give its width, or test it against a bound |
+| `a loop that doesn't yield: in one clock it can go a.py:46 -> a.py:34 -> a.py:46` | that path never reaches a `yield`; add one, or a test the inputs rule out |
+| `a while loop that doesn't yield (it would wait without a clock passing)` | a `while` without a `yield` in it can't wait; add a `yield` |
+| `the port 'data' (8 bits): LED[7:1]: 7 pins for a port of 8 bits` | give 8 pins, or give the port 7 bits in attr |
+| `the board has no GPIO_0[0]` | see the pin names above |
+| `yield from a generator function's call` | `yield from` takes a call of a step, `yield from step(port, ...)` |
+| `the testbench at clock 1,234 (tb.py:20): ...` | the testbench's `assert` failed at that clock and line |
+| `the model differs from the generator at clock ...` | a width given in attr too small for the values (Python's numbers don't wrap; the hardware's do), or a py2ver bug: please report it, with the waveforms it wrote |

@@ -1,7 +1,7 @@
 # A UART, from how its frames are specified to the FPGA: its transmitter and its
 # receiver written as the protocol says, a frame at a time, as Python generators
-# in which a yield is a clock (see py2ver/process.py and "Processes" in the
-# README). py2ver builds each as a state machine, clock for clock what the
+# in which a yield is a clock (see docs/processes.md, the guide). py2ver
+# builds each as a state machine, clock for clock what the
 # generator does, and the generator itself is the reference.
 #
 # A frame (8N1): the line idle high; a start bit, low; eight data bits, least
@@ -98,8 +98,6 @@ def frames(data, gap=3):
 
 
 if __name__ == "__main__":
-    import contextlib
-    import io
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from py2ver import Py2ver, process
 
@@ -109,8 +107,7 @@ if __name__ == "__main__":
     got = [r["data"] for r in process.simulate(uart_rx, line, RX) if r["valid"]]
     print(f"the generators: sent {message!r} ({len(line):,} clocks of the line), "
           f"received {bytes(got)!r}")
-    with contextlib.redirect_stdout(io.StringIO()):
-        tx, rx = Py2ver(uart_tx, TX), Py2ver(uart_rx, RX)
+    tx, rx = Py2ver(uart_tx, TX), Py2ver(uart_rx, RX)
     print(f"the machines: {tx.process.states} and {rx.process.states} states; their models the "
           f"generators clock for clock: {tx.PY_process()(clocks) == tx.GEN_process()(clocks)}, "
           f"{rx.PY_process()(line) == rx.GEN_process()(line)}")
@@ -133,7 +130,6 @@ if __name__ == "__main__":
     print(f"the echo (the receiver and the transmitter connected): sent back "
           f"{bytes(r['data'] for r in back if r['valid'])!r}")
     if "--pins" in sys.argv[1:]:
-        with contextlib.redirect_stdout(io.StringIO()):
-            board = Py2ver(echo(), ECHO_PINS)
+        board = Py2ver(echo(), ECHO_PINS)
         print("the echo on the board's pins (syn/uart_echo_pins/DE0_Nano.sof):",
               board.PINS(quartus))
