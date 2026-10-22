@@ -7,6 +7,7 @@ import os
 import pickle
 import shutil
 import subprocess
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -139,6 +140,11 @@ class BoardMixin:
         syn_attr must contain:
             'QUARTUS_DIR': path to quartus/bin
         and may contain:
+            'LINK':         'uart' (the default: a USB-UART adapter on GPIO_0_RX/TX)
+                            or 'jtag' (the board's JTAG UART, over the USB-Blaster
+                            that programs it: no adapter)
+            'JTAG_CABLE':   with 'jtag', the USB-Blaster as jtagconfig names it
+                            (default: the one there is)
             'UART_PORT':    serial port (default '/dev/ttyUSB0')
             'UART_BAUD':    baud rate (default DEFAULT_BAUD_RATE)
             'UART_TIMEOUT': read timeout in seconds (default 1.0)
@@ -152,7 +158,9 @@ class BoardMixin:
             with state, each call is one sample and advances the state.
         """
         self.syn_attr = syn_attr
+        self._link()                                 # (checked before the build)
         self._sdram_loaded = False                   # (the SDRAM's tables: loaded on the first call)
+        self._close_jtag()                           # (the board programmed again)
         self._hw_ok = self.createHWproject()
         if not self._hw_ok:
             self._hw_unavailable(getattr(self, "_hw_error", "board project could not be built (see log)"))
@@ -182,82 +190,155 @@ class BoardMixin:
                 getattr(self, "_hw_error", "board project could not be built"), *in_arg
             )
 
-        if serial is None:
+        if serial is None and self._link() == "uart":
             return self._hw_unavailable("pyserial is not installed", *in_arg)
 
-        port = self.syn_attr.get("UART_PORT", "/dev/ttyUSB0")
-        baud = int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE))
         timeout = float(self.syn_attr.get("UART_TIMEOUT", 1.0))
 
         if self._sdram:
-            return self._hw_sdram_call(port, baud, timeout, in_arg)
+            return self._hw_sdram_call(timeout, in_arg)
 
         input_bytes = self._pack_inputs(*self._flatten_args(in_arg))
         output_bytes_expected = (self.tx_width + 7) // 8
 
         try:
-            with serial.Serial(port, baudrate=baud, timeout=timeout) as ser:
-                log.info("Opened UART port %s @ %d baud", port, baud)
+            log.debug("Sending %d input bytes: %s", len(input_bytes), input_bytes.hex(" "))
+            resp = self._exchange([(input_bytes, output_bytes_expected)], timeout)[0]
+        except self._link_errors() as e:
+            return self._hw_unavailable(f"{self._link().upper()} communication failed ({e})",
+                                        *in_arg)
+        log.info("Received %d bytes: %s", len(resp), resp.hex(" "))
+        if len(resp) != output_bytes_expected:
+            return self._hw_unavailable(
+                f"{self._link().upper()}: expected {output_bytes_expected} bytes, got {len(resp)}",
+                *in_arg,
+            )
+        outs = self._unpack_outputs(resp)
+        log.info("Decoded HW outputs: %s", outs)
+        return outs
 
-                try:
-                    ser.reset_input_buffer()
-                    ser.reset_output_buffer()
-                except Exception:
-                    pass
+    def HW_batch(self) -> Callable[[List[Tuple[Any, ...]]], List[Tuple[int, ...]]]:
+        """The board HW() built, a list of input vectors at a time (like
+        TB_batch()). Over the JTAG UART the vectors go out together, the board
+        taking each once it has answered the one before: the replies as fast as
+        the link carries them, not a round trip (about 0.2 s there) each."""
+        return self._fx_rows(self.hw_batch_fun)
 
-                # --- Send input payload ---
-                log.debug("Sending %d input bytes: %s",
-                          len(input_bytes), input_bytes.hex(" "))
-                ser.write(input_bytes)
-                ser.flush()
+    BATCH_BYTES = 2048          # (the JTAG UART: input bytes sent before their replies are read)
 
-                # --- Read response ---
-                resp = b""
-                while len(resp) < output_bytes_expected:
-                    chunk = ser.read(output_bytes_expected - len(resp))
-                    if not chunk:
+    def hw_batch_fun(self, vectors: List[Tuple[Any, ...]]) -> List[Tuple[int, ...]]:
+        vectors = [tuple(v) for v in vectors]
+        if (self._sdram or self._link() != "jtag" or not getattr(self, "_hw_ok", False)
+                or not self.rx_width):
+            return [self.hw_fun(*v) for v in vectors]
+        n = (self.tx_width + 7) // 8
+        words = [self._pack_inputs(*self._flatten_args(v)) for v in vectors]
+        per = max(1, self.BATCH_BYTES // max(len(words[0]) if words else 1, n, 1))
+        timeout = float(self.syn_attr.get("UART_TIMEOUT", 1.0))
+        outs: List[Tuple[int, ...]] = []
+        try:
+            link = self._jtag_link()
+            link.read(None, 0)                       # (nothing left over from before)
+            for k in range(0, len(words), per):
+                chunk = words[k:k + per]
+                link.write(b"".join(chunk))
+                reply = b""
+                while len(reply) < n * len(chunk):   # (till the board's been quiet timeout s)
+                    got = link.read(n * len(chunk) - len(reply), timeout)
+                    if not got:
                         break
-                    resp += chunk
+                    reply += got
+                if len(reply) != n * len(chunk):
+                    reason = (f"JTAG: expected {n * len(chunk)} bytes (vectors {k} to "
+                              f"{k + len(chunk) - 1}), got {len(reply)}")
+                    return [self._hw_unavailable(reason, *v) for v in vectors]
+                outs += [self._unpack_outputs(reply[i * n:(i + 1) * n]) for i in range(len(chunk))]
+        except self._link_errors() as e:
+            return [self._hw_unavailable(f"JTAG communication failed ({e})", *v) for v in vectors]
+        return outs
 
-                if len(resp) == 0:
-                    log.error("UART: No data received.")
-                else:
-                    log.info("Received %d bytes: %s",
-                             len(resp), resp.hex(" "))
-
-                if len(resp) != output_bytes_expected:
-                    return self._hw_unavailable(
-                        f"UART: expected {output_bytes_expected} bytes, got {len(resp)}",
-                        *in_arg,
-                    )
-
-                # --- Decode ---
-                outs = self._unpack_outputs(resp)
-                log.info("Decoded HW outputs: %s", outs)
-                return outs
-
-        except (OSError, serial.SerialException) as e:
-            return self._hw_unavailable(f"UART communication failed ({e})", *in_arg)
-
-    def _hw_sdram_call(self, port: str, baud: int, timeout: float, in_arg) -> Tuple[int, ...]:
+    def _hw_sdram_call(self, timeout: float, in_arg) -> Tuple[int, ...]:
         """A sample on a board with the SDRAM: its tables (once), its input lists,
         then 'R' (see de0_nano_sdram_top.txt)."""
         first = not getattr(self, "_sdram_loaded", False)
         steps = self._sdram_steps(self._input_vector(tuple(in_arg)), first)
         try:
-            with serial.Serial(port, baudrate=baud, timeout=max(timeout, 30.0)) as ser:
-                replies = []
-                for data, n in steps:
-                    ser.write(data)
-                    ser.flush()
-                    replies.append(ser.read(n))
-                    if len(replies[-1]) != n:
-                        return self._hw_unavailable(
-                            f"UART: expected {n} byte(s), got {len(replies[-1])}", *in_arg)
-                self._sdram_loaded = True
-                return self._sdram_results(replies)
-        except (OSError, serial.SerialException) as e:
-            return self._hw_unavailable(f"UART communication failed ({e})", *in_arg)
+            replies = self._exchange(steps, max(timeout, 30.0))
+        except self._link_errors() as e:
+            return self._hw_unavailable(f"{self._link().upper()} communication failed ({e})",
+                                        *in_arg)
+        for (_, n), reply in zip(steps, replies):
+            if len(reply) != n:
+                return self._hw_unavailable(
+                    f"{self._link().upper()}: expected {n} byte(s), got {len(reply)}", *in_arg)
+        self._sdram_loaded = True
+        return self._sdram_results(replies)
+
+    def _link(self) -> str:
+        """The board's link to the PC (syn_attr's LINK): 'uart' or 'jtag'."""
+        link = str(self.syn_attr.get("LINK", "uart")).lower()
+        if link not in ("uart", "jtag"):
+            raise ValueError(f"LINK: {link!r}; 'uart' (a USB-UART adapter on GPIO_0) or 'jtag' "
+                             f"(the JTAG UART, over the USB-Blaster)")
+        return link
+
+    @staticmethod
+    def _link_errors() -> Tuple[type, ...]:
+        return (OSError,) + ((serial.SerialException,) if serial is not None else ())
+
+    def _exchange(self, steps: List[Tuple[bytes, int]], timeout: float) -> List[bytes]:
+        """Each (data, n) of steps: data sent to the board, then n bytes read back
+        (at most timeout seconds waited for them); the replies, as far as they
+        came (one short: the last)."""
+        replies: List[bytes] = []
+        if self._link() == "jtag":
+            link = self._jtag_link()
+            link.read(None, 0)                       # (nothing left over from before)
+            for data, n in steps:
+                link.write(data)
+                replies.append(link.read(n, timeout))
+                if len(replies[-1]) != n:
+                    break
+            return replies
+        port = self.syn_attr.get("UART_PORT", "/dev/ttyUSB0")
+        baud = int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE))
+        with serial.Serial(port, baudrate=baud, timeout=timeout) as ser:
+            log.info("Opened UART port %s @ %d baud", port, baud)
+            try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+            except Exception:
+                pass
+            for data, n in steps:
+                ser.write(data)
+                ser.flush()
+                reply = b""
+                while len(reply) < n:
+                    chunk = ser.read(n - len(reply))
+                    if not chunk:
+                        break
+                    reply += chunk
+                replies.append(reply)
+                if len(reply) != n:
+                    break
+        return replies
+
+    def _jtag_link(self):
+        """The JTAG UART to the board, kept open from the first call (juart-terminal
+        takes a second to start); closed when the board's programmed again, or
+        this Py2ver is gone."""
+        link = getattr(self, "_jtag", None)
+        if link is None or link.proc.poll() is not None:
+            from .jtag_uart import JtagUart
+            link = self._jtag = JtagUart(self.syn_attr.get("QUARTUS_DIR"),
+                                         self.syn_attr.get("JTAG_CABLE"))
+            self._jtag_finalizer = weakref.finalize(self, link.close)
+        return link
+
+    def _close_jtag(self) -> None:
+        if getattr(self, "_jtag", None) is not None:
+            self._jtag_finalizer()
+            self._jtag = None
 
     def hw_run(self) -> int:
         """
@@ -348,8 +429,9 @@ class BoardMixin:
             outs.append(self._sdram_results([bytes(r) for r in reply]))
         return outs
 
-    def gen_hw_project(self, baud: int = DEFAULT_BAUD_RATE) -> Path:
-        """Write the DE0-Nano Quartus project (board top, UART, core). No compile."""
+    def gen_hw_project(self, baud: int = DEFAULT_BAUD_RATE, link: str = "uart") -> Path:
+        """Write the DE0-Nano Quartus project (board top, UART, core). No compile.
+        link: 'jtag', the board's link to the PC the JTAG UART instead."""
         project_dir = self._project_dir
         if project_dir.is_dir():
             shutil.rmtree(project_dir)
@@ -404,6 +486,11 @@ class BoardMixin:
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_fixed_pattern_tx.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_loopback.sv\n')
             qsf.write('set_global_assignment -name SYSTEMVERILOG_FILE uart/uart_transceiver.sv\n')
+            if link == "jtag":
+                for name in ("jtag_bytes", "jtag_transceiver"):
+                    self.get_template(f"hw/uart/{name}.txt").stream({}).dump(
+                        str(uart_dir / f"{name}.sv"))
+                    qsf.write(f"set_global_assignment -name SYSTEMVERILOG_FILE uart/{name}.sv\n")
 
         # SDC / wrappers / board top
         self.get_template("hw/de0_nano_sdc.txt") \
@@ -412,7 +499,7 @@ class BoardMixin:
         if self._sdram:
             # A design with the SDRAM: the board's top takes commands (see the template)
             self.get_template("hw/de0_nano_sdram_top.txt").stream(
-                self._sdram_board(baud)).dump(str(project_dir / "DE0_Nano.v"))
+                dict(self._sdram_board(baud), link=link)).dump(str(project_dir / "DE0_Nano.v"))
             with open(project_dir / "DE0_Nano.SDC", "a", encoding="utf-8") as f:
                 f.write(_SDRAM_SDC.replace("[get_ports clk]", "[get_ports CLOCK_50]"))
         else:
@@ -421,7 +508,7 @@ class BoardMixin:
 
             # DE0_Nano top you provided
             self.get_template("hw/de0_nano_top.txt") \
-                .stream(self.syn_data).dump(str(project_dir / "DE0_Nano.v"))
+                .stream(dict(self.syn_data, link=link)).dump(str(project_dir / "DE0_Nano.v"))
 
         # Copy generated core HDL
         self._copy_hdl(project_dir, f"{project_name}.v")
@@ -451,7 +538,8 @@ class BoardMixin:
             log.error(self._hw_error)
             return False
 
-        project_dir = self.gen_hw_project(int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE)))
+        project_dir = self.gen_hw_project(int(self.syn_attr.get("UART_BAUD", DEFAULT_BAUD_RATE)),
+                                          self._link())
         project_name = self.t_name
 
         # ---- Compile ----

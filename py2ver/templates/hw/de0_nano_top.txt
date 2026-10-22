@@ -229,6 +229,23 @@ assign {
 assign {{ input.name }}_int = {{ input.name }}_seg[{{input.width - 1}}:0];
 {% endfor %}
 
+{% if link == "jtag" %}
+// ---------------- JTAG UART core transceiver -----------
+// The words over the USB-Blaster (juart-terminal); the UART's pins idle
+jtag_transceiver #(
+    .TX_WIDTH (TX_WIDTH),
+    .RX_WIDTH (RX_WIDTH)
+) jtag_transceiver_inst(
+    .clk      (CLOCK_50),
+    .rst_n    (KEY[0]),
+    .tx_data  (tx_data_int),
+    .tx_valid (ready),
+    .tx_busy  (),
+    .rx_data  (rx_data_int),
+    .rx_valid (input_valid)
+);
+assign uart_tx_core = 1'b1;
+{% else %}
 // ---------------- UART core transceiver ----------------
 // Normal mode only — loopback disabled here
 uart_transceiver #(
@@ -249,6 +266,7 @@ uart_transceiver #(
     .rx_valid (input_valid),
     .tx_busy  ()
 );
+{% endif %}
 
 // ---------------- Standalone LOOPBACK core -------------
 uart_loopback #(

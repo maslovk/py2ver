@@ -44,7 +44,9 @@ class JtagUart:
 
     def __init__(self, quartus_dir: Optional[str] = None, cable: Optional[str] = None,
                  connect_s: float = 1.0) -> None:
-        args = [find_tool(TERMINAL, quartus_dir), "-q"] + (["-c", cable] if cable else [])
+        # (a byte 4 from the design is data: by default, ^D, the terminal would quit)
+        args = ([find_tool(TERMINAL, quartus_dir), "-q", "--no-quit-on-ctrl-d"]
+                + (["-c", cable] if cable else []))
         self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE)
         self._sel = selectors.DefaultSelector()
@@ -59,6 +61,8 @@ class JtagUart:
 
     def write(self, data: bytes) -> None:
         """Send bytes to the design."""
+        if self.proc.poll() is not None:
+            raise ConnectionError(f"{TERMINAL} stopped (exit code {self.proc.returncode})")
         self.proc.stdin.write(bytes(data))
         self.proc.stdin.flush()
 
@@ -85,7 +89,10 @@ class JtagUart:
                 self.proc.wait()
         for f in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             if f:
-                f.close()
+                try:
+                    f.close()
+                except OSError:                  # (the terminal gone: its pipe broken)
+                    pass
 
     def __enter__(self) -> "JtagUart":
         return self

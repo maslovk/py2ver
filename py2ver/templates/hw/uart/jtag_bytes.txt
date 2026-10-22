@@ -1,0 +1,75 @@
+// -----------------------------------------------------------------------------
+// jtag_bytes.sv: the JTAG UART (Intel's alt_jtag_atlantic, juart-terminal on the
+// PC, over the USB-Blaster) as a byte link in place of uart_rx_8n1/uart_tx_8n1:
+//
+//   from the PC: rx_byte with rx_byte_ready high a clock, taken that clock (only
+//                while rx_accept: the bytes after wait, in the FIFO and the PC's)
+//   to the PC:   tx_byte taken the clock tx_start is high; tx_busy high the clock
+//                after, and while the FIFO has no room for another
+//
+// alt_jtag_atlantic's handshake as the JTAG UART IP's: a byte to the PC on r_dat
+// with r_val the clock after r_ena; one from the PC on t_dat while t_ena, t_dav
+// saying there's room.
+// -----------------------------------------------------------------------------
+module jtag_bytes #(
+    parameter int RX_FIFO = 8,
+    parameter int TX_FIFO = 16
+)(
+    input  logic       clk,
+    input  logic       rst_n,
+    output logic [7:0] rx_byte,
+    output logic       rx_byte_ready,
+    input  logic       rx_accept,
+    input  logic [7:0] tx_byte,
+    input  logic       tx_start,
+    output logic       tx_busy
+);
+    localparam int RB = $clog2(RX_FIFO), TB = $clog2(TX_FIFO);
+
+    logic       t_ena, r_ena, t_pause;
+    logic [7:0] t_dat;
+    logic       t_dav = 1'b0, r_val = 1'b0;
+    logic [7:0] r_dat = 8'd0;
+
+    alt_jtag_atlantic #(.INSTANCE_ID(0), .LOG2_RXFIFO_DEPTH(6), .LOG2_TXFIFO_DEPTH(6),
+                        .SLD_AUTO_INSTANCE_INDEX("YES")) u_jtag_uart (
+        .clk(clk), .rst_n(rst_n),
+        .r_dat(r_dat), .r_val(r_val), .r_ena(r_ena),
+        .t_dat(t_dat), .t_dav(t_dav), .t_ena(t_ena), .t_pause(t_pause));
+
+    // ------------------------------ from the PC ------------------------------
+    logic [7:0]  rx_mem [0:RX_FIFO-1];
+    logic [RB-1:0] rx_head = '0, rx_tail = '0;
+    logic [RB:0]   rx_count = '0;
+    wire rx_put = t_ena && rx_count != RX_FIFO;
+    assign rx_byte_ready = rx_count != 0 && rx_accept;
+    assign rx_byte = rx_mem[rx_head];
+
+    always_ff @(posedge clk) begin
+        if (rx_put) begin rx_mem[rx_tail] <= t_dat; rx_tail <= rx_tail + 1'b1; end
+        if (rx_byte_ready) rx_head <= rx_head + 1'b1;
+        rx_count <= rx_count + rx_put - rx_byte_ready;
+        t_dav <= (rx_count + rx_put - rx_byte_ready) <= RX_FIFO - 2;   // (room for two: t_dav a clock late)
+        if (!rst_n) begin rx_head <= '0; rx_tail <= '0; rx_count <= '0; t_dav <= 1'b0; end
+    end
+
+    // ------------------------------- to the PC -------------------------------
+    logic [7:0]  tx_mem [0:TX_FIFO-1];
+    logic [TB-1:0] tx_head = '0, tx_tail = '0;
+    logic [TB:0]   tx_count = '0;
+    logic          tx_start_q = 1'b0;
+    wire tx_put = tx_start && tx_count != TX_FIFO;
+    wire tx_take = r_ena && tx_count != 0;
+    assign tx_busy = tx_start_q || tx_count >= TX_FIFO - 1;
+
+    always_ff @(posedge clk) begin
+        if (tx_put) begin tx_mem[tx_tail] <= tx_byte; tx_tail <= tx_tail + 1'b1; end
+        r_val <= tx_take;
+        if (tx_take) begin r_dat <= tx_mem[tx_head]; tx_head <= tx_head + 1'b1; end
+        tx_count <= tx_count + tx_put - tx_take;
+        tx_start_q <= tx_start;
+        if (!rst_n) begin
+            tx_head <= '0; tx_tail <= '0; tx_count <= '0; r_val <= 1'b0; tx_start_q <= 1'b0;
+        end
+    end
+endmodule

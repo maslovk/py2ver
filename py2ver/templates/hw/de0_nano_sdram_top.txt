@@ -33,6 +33,18 @@ module DE0_Nano(
     wire rst = ~KEY[0] | (por != 4'hF);
     wire rst_n = ~rst;
 
+{%- if link == "jtag" %}
+    // ---------------- the JTAG UART (the USB-Blaster); the UART's pins idle
+    wire [7:0] rx_byte;
+    wire rx_ready, rx_accept;
+    wire rx_ferr = 1'b0;
+    reg [7:0] tx_byte;
+    reg tx_start;
+    wire tx_busy;
+    jtag_bytes u_jtag(.clk(CLOCK_50), .rst_n(rst_n), .rx_byte(rx_byte), .rx_byte_ready(rx_ready),
+        .rx_accept(rx_accept), .tx_byte(tx_byte), .tx_start(tx_start), .tx_busy(tx_busy));
+    assign GPIO_0_TX = 1'b1;
+{%- else %}
     // ---------------- UART
     wire os_tick, baud_tick;
     uart_baud_gen #(.CLK_HZ(50000000), .BAUD({{ baud }}), .OSR(16)) u_baud(
@@ -47,6 +59,7 @@ module DE0_Nano(
     wire tx_busy;
     uart_tx_8n1 u_tx(.clk(CLOCK_50), .rst_n(rst_n), .baud_tick(baud_tick), .tx_byte(tx_byte),
         .tx_start(tx_start), .tx(GPIO_0_TX), .tx_busy(tx_busy));
+{%- endif %}
 
     // ---------------- the design
     reg ce_run;
@@ -94,6 +107,10 @@ module DE0_Nano(
     reg [15:0] nbytes;
     reg [31:0] k;
     reg        ack;
+{%- if link == "jtag" %}
+    // (a byte from the PC taken only where one is read; the rest wait)
+    assign rx_accept = state == S_CMD || state == S_WHDR || state == S_WDATA || state == S_RIN;
+{%- endif %}
     // A byte handed to the transmitter: wait for it to start (busy at its next baud
     // tick) and end before the next
     reg        tx_wait, tx_seen;

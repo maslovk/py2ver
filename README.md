@@ -59,6 +59,10 @@ print(foo_batch([(3, 1), (7, 2), (255, 255)]))   # list of output tuples
 
 foo_hw = p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
 print(foo_hw(3, 1))        # synthesizes, programs the board, runs over UART
+
+# or with only the USB-Blaster: over the board's JTAG UART, many vectors at once
+p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin', 'LINK': 'jtag'})
+print(p.HW_batch()([(3, 1), (7, 2), (255, 255)]))
 ```
 
 Generated files (`hdl/`, `sim_build/`, `tb.py`, `results/`, `hw/`, `syn/`) are written
@@ -1389,10 +1393,21 @@ the outputs back. The board waits for your module's latency (`reg` signals,
 
 `HW()` raises instead of returning simulation results when the board can't be
 used, and refuses a build that misses 50 MHz timing (results could be wrong;
-use `pipeline=N`). Options: `QUARTUS_DIR` (required), `UART_PORT` (default
+use `pipeline=N`). Options: `QUARTUS_DIR` (required), `LINK` (`'uart'`, the
+default, or `'jtag'`: below), `UART_PORT` (default
 `/dev/ttyUSB0`), `UART_BAUD` (default `115200`), `UART_TIMEOUT` (default
 `1.0` s), `FALLBACK_TO_SIM` (return simulation results instead of raising),
 `ALLOW_TIMING_FAILURE` (run anyway).
+
+With `'LINK': 'jtag'` the same words go over the board's JTAG UART, through
+the USB-Blaster that programs it (Quartus's `juart-terminal`), so no USB-UART
+adapter is needed; `JTAG_CABLE` picks the USB-Blaster if there are several. A
+call there is a round trip of about 0.2 s (the terminal polls the cable every
+100 ms), so `p.HW_batch()(vectors)`, after `HW()`, sends the vectors together:
+the board takes each once it has answered the one before, and the replies
+come as fast as the link carries them (about 1.3 KB/s of inputs: 1000 vectors
+of 2 bytes in under 2 s). With the UART link `HW_batch()` makes a call each.
+The SDRAM board's commands (below) work over it too.
 
 `HW_sim()` needs no board or Quartus: it simulates the whole board project
 and talks to it over its UART pins with the exact bytes `HW()` would send,
@@ -1416,8 +1431,9 @@ call (the MNIST network's 16 Mbit: about 3 minutes at 115200 baud; this
 board project is built for `UART_BAUD`, so a faster serial adapter helps),
 then for each sample its input lists
 in the SDRAM, `'R'` and `'X'`. `HW_sim()` runs the same bytes against the project
-with a model of the SDRAM chip on its pins. (Checked in simulation and
-compiled by Quartus; not yet run on a real board.)
+with a model of the SDRAM chip on its pins. Over the JTAG UART (`'LINK':
+'jtag'`) it has run on the board: the lists of `tests/test_sdram.py`'s designs
+written into the real chip and read back, as Python computes them.
 
 ### Supported Python subset
 
