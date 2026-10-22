@@ -71,6 +71,34 @@ def jtag_print_hex(port, value, digits, data="tx_data", send="tx_send", room="tx
         yield from jtag_send(port, d + 48 if d < 10 else d + 55, data, send, room)
 
 
+# ----------------------------- SPI (a controller's side) -----------------------------
+
+def spi_transfer(port, word, bits, half, mode=0, sclk="sclk", mosi="mosi", miso="miso"):
+    """bits bits out of word on mosi and as many in from miso, most significant
+    first, half clocks each half of SCLK; the word read. mode: SPI's 0 to 3
+    (CPOL, the clock's idle level, its high bit; CPHA its low: 0, data taken
+    on the leading edge, 1 on the trailing). The chip select is the caller's,
+    and SCLK should be at its idle level when it starts."""
+    got = 0
+    for i in range(bits):
+        out = (word >> (bits - 1 - i)) & 1
+        if mode & 1:                             # (CPHA 1: set on leading, taken on trailing)
+            setattr(port, sclk, 1 - (mode >> 1))
+            setattr(port, mosi, out)
+            yield half
+            setattr(port, sclk, mode >> 1)
+            got = got | (getattr(port, miso) << (bits - 1 - i))
+            yield half
+        else:                                    # (CPHA 0: set before leading, taken on it)
+            setattr(port, mosi, out)
+            yield half
+            setattr(port, sclk, 1 - (mode >> 1))
+            got = got | (getattr(port, miso) << (bits - 1 - i))
+            yield half
+            setattr(port, sclk, mode >> 1)
+    return got
+
+
 # ----------------------------- I2C (a controller's side) -----------------------------
 # SCL and SDA open drain ({'scl': {'open_drain': True}, ...}); q a quarter of SCL's
 # period in clocks (100 kHz at 50 MHz: 125). Checked on a DE0-Nano's ADXL345

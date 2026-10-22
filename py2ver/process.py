@@ -707,6 +707,16 @@ class _Expander:
                     return ex.inline(n.value, n.targets[0], env, n)
                 return n
 
+            # (constants' arithmetic: its value, mode & 1 for a step's mode)
+            def visit_BinOp(self, n: ast.BinOp):
+                self.generic_visit(n)
+                if isinstance(n.left, ast.Constant) and isinstance(n.right, ast.Constant) \
+                        and type(n.left.value) is int and type(n.right.value) is int:
+                    v = _value(n, {})
+                    if v is not None:
+                        return ast.copy_location(ast.Constant(v), n)
+                return n
+
             # (a constant's if, msb_first's: the branch it takes)
             def visit_If(self, n: ast.If):
                 self.generic_visit(n)

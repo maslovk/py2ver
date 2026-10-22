@@ -26,6 +26,28 @@ def test_the_generator_says_what_the_board_must_answer():
 
 
 import accelerometer as A  # noqa: E402
+import adc as D  # noqa: E402
+
+
+def test_an_adc_read_over_spi():
+    import functools
+    values = [0x000, 0x123, 0x456, 0x789, 0xABC, 0xDEF, 0x800, 0xFFF]
+    p = _quiet(functools.partial(D.adc_reader, half=2, period=100), D.ATTR)
+    text = p.check(D.sweep(values), verilog=False).value
+    assert D.readings(text) == [dict(enumerate(values))]
+
+
+@pytest.mark.hardware
+def test_the_board_s_adc_answers_in_frame(quartus):
+    p = _quiet(D.adc_reader, D.PINS)
+    p.PINS(quartus)
+    p.PROGRAM(quartus)
+    with p.jtag_uart(quartus) as link:
+        text = link.read(timeout=3)
+    sweeps = D.readings(text)
+    assert len(sweeps) >= 5 and all(sorted(s) == list(range(8)) for s in sweeps)
+    # (the frame's 4 leading zeros: every value 12 bits; inputs left open read anything)
+    assert all(v <= 0xFFF for s in sweeps for v in s.values())
 import jtag_console as C  # noqa: E402
 
 

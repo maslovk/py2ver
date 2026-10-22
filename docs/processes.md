@@ -135,6 +135,7 @@ constant string):
 | `shift_in(port, pin, bits, clocks, msb_first=False)` | reads `bits` bits from the pin, one every `clocks` clocks, and returns the value |
 | `uart_send(port, pin, byte, bit)` | sends a UART frame |
 | `uart_receive(port, pin, bit)` | receives a UART frame and returns its byte |
+| `spi_transfer(port, word, bits, half, mode=0)` | an SPI word out on `mosi` and in from `miso` (the result), `half` clocks a half of SCLK, in SPI mode 0 to 3; the chip select is yours |
 | `i2c_start(port, q)`, `i2c_stop(port, q)` | an I2C start (or repeated start), a stop; `q` a quarter of SCL's period in clocks |
 | `i2c_write_byte(port, byte, q)` | a byte out; returns 1 if it wasn't acknowledged |
 | `i2c_read_byte(port, last, q)` | a byte in, acknowledged unless `last` |
@@ -441,6 +442,13 @@ an erased I2C EEPROM would. `examples/accelerometer.py` probes the bus, and
 reads the accelerometer's X, Y and Z five times a second onto the JTAG
 console. On a board lying flat it reads about `x=0x0003 y=0x000F z=0x011F`:
 Z is 1 g, about 256 counts at its ±2 g range.
+
+**The board's ADC** (an ADC128S022: 8 inputs, 12 bits) is on `ADC_CS_N`,
+`ADC_SCLK`, `ADC_SADDR` and `ADC_SDAT`, in SPI mode 3. `examples/adc.py`
+reads all 8 inputs with `spi_transfer(port, channel << 11, 16, 10, 3)`
+(2.5 MHz) five times a second onto the JTAG console. Each frame sends back
+4 zeros and then the result of the channel chosen in the frame before.
+Inputs left open read whatever they drift to, about 0x500.
 
 `py2ver.protocol`'s I2C steps (`i2c_start`, `i2c_write_byte`,
 `i2c_read_register`, ...) are the bus's spec written as generators:

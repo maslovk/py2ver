@@ -357,7 +357,8 @@ the board. It covers:
 - writing a protocol, and the rules for loops, ifs and widths;
 - steps with `yield from`, and the library in `py2ver.protocol`
   (`wait_until`, `wait_edge`, `shift_in`, `shift_out`, `uart_send`,
-  `uart_receive`, `i2c_start`, `i2c_read_register`, ..., `jtag_print`, `debounced`);
+  `uart_receive`, `spi_transfer`, `i2c_start`, `i2c_read_register`, ..., `jtag_print`,
+  `debounced`);
 - when inputs are read and outputs change;
 - testbenches written as generators, and `check()`, which checks the
   generator, the model and the Verilog against each other in one call;
@@ -378,6 +379,7 @@ in the generator, the model and the Verilog (on the EP4CE22, each meets
 | `examples/ws2812.py` | WS2812 LED driver; its testbench reads the line as an LED does | 201 | 49 | 135 MHz |
 | `examples/i2c.py` | I2C master (100 kHz, clock stretching) writing and reading a register; its testbench plays a memory chip | 285 | 79 | 166 MHz |
 | `examples/accelerometer.py` | the board's ADXL345 over its I2C bus, X, Y, Z on the JTAG console (run on a DE0-Nano: 1 g lying flat) | 1244 | 136 | 92 MHz |
+| `examples/adc.py` | the board's ADC128S022 over SPI (mode 3), its 8 inputs on the JTAG console (run on a DE0-Nano) | 753 | 82 | 133 MHz |
 
 (250 MHz is the device's limit, Quartus's *restricted* Fmax.)
 

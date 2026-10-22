@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from py2ver import Py2ver, process
-from py2ver.protocol import (debounced, shift_in, shift_out, together, uart_receive, uart_send,
-                             wait_edge, wait_until)
+from py2ver.protocol import (debounced, shift_in, shift_out, spi_transfer, together,
+                             uart_receive, uart_send, wait_edge, wait_until)
 
 # Steps of protocols (protocol.py), used by processes and by testbenches written as
 # generators too (drive(), check()); SPI and WS2812 written from their specs.
@@ -424,6 +424,44 @@ def test_an_open_drain_pin_floats_or_pulls_low_on_the_board(monkeypatch, tmp_pat
     lines = [int(l.split()[1]) for l in out if l.startswith("LINE")]
     assert set(lines) == {0, 1} and lines.count(0) == lines.count(1)   # (low two of four clocks)
     assert "PULLED 0 SEEN 0" in out                       # (pulled by the other: seen low)
+
+
+def spi_loop(port, mode=0):
+    """A word out and in with spi_transfer, in mode, its result kept."""
+    port.sclk = mode >> 1                  # (its idle level)
+    port.cs_n = 1
+    while True:
+        yield from wait_until(port, "go")
+        word = port.word
+        port.cs_n = 0
+        yield 3
+        got = yield from spi_transfer(port, word, 12, 3, mode)
+        port.cs_n = 1
+        port.got = got
+        port.done = 1
+        yield
+        port.done = 0
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+def test_spi_in_each_mode(mode):
+    def tb(dut):                           # (MISO: MOSI, looped back; SCLK's edges counted)
+        yield                              # (its outputs as it set them: a clock on)
+        dut.word, dut.go = 0xA5C, 1
+        edges, last, idle = 0, dut.sclk, dut.sclk
+        while True:
+            dut.miso = dut.mosi
+            if dut.sclk != last:
+                edges += 1
+                last = dut.sclk
+            if dut.done:
+                break
+            yield
+            dut.go = 0
+        return dut.got, edges, idle, dut.sclk
+    p = _quiet(functools.partial(spi_loop, mode=mode), {"go": 1, "word": 12, "miso": 1})
+    got, edges, idle, end = p.check(tb, verilog=False).value
+    assert got == 0xA5C and edges == 24 and idle == end == mode >> 1   # (CPOL: idle level)
 
 
 def bouncing_switch(port):
