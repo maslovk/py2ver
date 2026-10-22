@@ -4,8 +4,8 @@ A design on the DE0-Nano's own pins (a mixin of Py2ver, see core.py).
 A port's attr names the board's pin it goes to, as the board's pin assignments
 (templates/hw/de0_nano_qsf.txt) call it:
 
-    attr = {'rx': {'width': 1, 'pin': 'GPIO_0[0]'},
-            'data': {'width': 8, 'pin': 'LED[7:0]'},     # bit 0 on LED[0]
+    attr = {'rx': 'GPIO_0_RX',                  # (a pin, its width the pins')
+            'data': 'LED[7:0]',                 # bit 0 on LED[0]
             ...}
     p = Py2ver(uart_rx, attr)
     p.PINS({'QUARTUS_DIR': ...})       # compiled for the board, not programmed
@@ -35,31 +35,47 @@ _OUT_GROUPS = {"LED"}
 _IN_GROUPS = {"KEY", "SW", "GPIO_0_IN", "GPIO_1_IN", "GPIO_2_IN"}
 
 
-def board_pins() -> Dict[str, int]:
-    """The DE0-Nano's pins as its assignments name them: a group's width (LED: 8),
-    a single pin's 0."""
+def board_pins() -> Dict[str, List[int]]:
+    """The DE0-Nano's pins as its assignments name them: a group's indices (LED:
+    0..7; GPIO_0: 2..33, its pins 0 and 1 being GPIO_0_RX and GPIO_0_TX), a
+    single pin's none."""
     qsf = (DEFAULT_TEMPLATE_DIR / "hw" / "de0_nano_qsf.txt").read_text(encoding="utf-8")
-    pins: Dict[str, int] = {}
+    pins: Dict[str, List[int]] = {}
     for m in re.finditer(r"set_location_assignment\s+\S+\s+-to\s+(\w+)(?:\[(\d+)\])?", qsf):
         name, idx = m.group(1), m.group(2)
-        pins[name] = max(pins.get(name, 0), int(idx) + 1) if idx is not None else pins.get(name, 0)
-    return pins
+        pins.setdefault(name, [])
+        if idx is not None:
+            pins[name].append(int(idx))
+    return {k: sorted(v) for k, v in pins.items()}
 
 
-def parse_pin(spec: str, width: int, pins: Dict[str, int]) -> List[str]:
-    """A port's pin attr as one pin a bit, its bit 0 first: 'LED[0]', 'LED[3:0]' (bit 0
-    on LED[0]), 'LED' (the group from its bit 0), 'GPIO_0_TX' (a single pin)."""
+def _spec(spec: str, pins: Dict[str, List[int]]):
     m = re.fullmatch(r"(\w+)(?:\[(\d+)(?::(\d+))?\])?", spec.strip())
     if not m or m.group(1) not in pins:
         raise ValueError(f"No DE0-Nano pin {spec!r} (pins: {', '.join(sorted(pins))})")
-    name, a, b = m.group(1), m.group(2), m.group(3)
-    size = pins[name]
-    if size == 0:                                      # (a single pin)
+    return m.group(1), m.group(2), m.group(3)
+
+
+def pin_width(spec: str) -> int:
+    """How many pins a pin attr names: 'LED[7:0]' 8, 'LED[2]' 1, 'LED' its group's
+    8, 'GPIO_0_TX' 1."""
+    name, a, b = _spec(spec, board_pins())
+    if a is None:
+        return max(1, len(board_pins()[name]))
+    return 1 if b is None else abs(int(a) - int(b)) + 1
+
+
+def parse_pin(spec: str, width: int, pins: Dict[str, List[int]]) -> List[str]:
+    """A port's pin attr as one pin a bit, its bit 0 first: 'LED[0]', 'LED[3:0]' (bit 0
+    on LED[0]), 'LED' (the group from its first pin), 'GPIO_0_TX' (a single pin)."""
+    name, a, b = _spec(spec, pins)
+    have = pins[name]
+    if not have:                                       # (a single pin)
         if a is not None or width != 1:
             raise ValueError(f"{name} is a single pin: a port of 1 bit")
         return [name]
     if a is None:
-        lo, hi = 0, width - 1
+        lo, hi = have[0], have[0] + width - 1
     elif b is None:
         lo = hi = int(a)
     else:
@@ -68,8 +84,12 @@ def parse_pin(spec: str, width: int, pins: Dict[str, int]) -> List[str]:
         raise ValueError(f"{spec}: [high:low]")
     if hi - lo + 1 != width:
         raise ValueError(f"{spec}: {hi - lo + 1} pins for a port of {width} bits")
-    if hi >= size:
-        raise ValueError(f"{spec}: {name} has {size} pins")
+    missing = [i for i in range(lo, hi + 1) if i not in have]
+    if missing:
+        singles = [k for k, v in pins.items() if not v and k.startswith(name + "_")]
+        raise ValueError(f"{spec}: the board has no {name}[{missing[0]}] ({name} is "
+                         f"{name}[{have[-1]}:{have[0]}]"
+                         + (f"; its other pins: {', '.join(singles)}" if singles else "") + ")")
     return [f"{name}[{i}]" for i in range(lo, hi + 1)]
 
 
@@ -120,11 +140,11 @@ class PinsMixin:
                            else set()))
         decl = ["    input CLOCK_50"]
         for g in groups:
-            size = pins[g]
-            rng = f"[{size - 1}:0] " if size else ""
+            idx = pins[g]
+            rng = f"[{idx[-1]}:{idx[0]}] " if idx else ""
             kind = ("output" if g in _OUT_GROUPS else "input" if g in _IN_GROUPS
-                    else "output" if size == 0 and any(g in ps for ps in outs.values())
-                    else "input" if size == 0 else "inout")
+                    else "output" if not idx and any(g in ps for ps in outs.values())
+                    else "input" if not idx else "inout")
             decl.append(f"    {kind} {rng}{g}")
         own_key = "KEY[0]" in {p for ps in ins.values() for p in ps}
         lines = ["// The DE0-Nano with the design between its pins (py2ver PINS())",
@@ -159,9 +179,9 @@ class PinsMixin:
         driven = {pin for ps in outs.values() for pin in ps}
         for g in groups:
             if g.startswith("GPIO") and g not in _IN_GROUPS and pins[g]:
-                free = [i for i in range(pins[g]) if f"{g}[{i}]" not in driven]
-                if len(free) == pins[g]:
-                    lines.append(f"    assign {g} = {pins[g]}'bz;")
+                free = [i for i in pins[g] if f"{g}[{i}]" not in driven]
+                if len(free) == len(pins[g]):
+                    lines.append(f"    assign {g} = {len(pins[g])}'bz;")
                 else:
                     lines += [f"    assign {g}[{i}] = 1'bz;" for i in free]
         lines += [f"    {self.t_name} u_design(", "        " + ",\n        ".join(conns) + ");",

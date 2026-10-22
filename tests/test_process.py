@@ -219,11 +219,12 @@ def test_a_parameter_is_a_constant_a_partial_its_value():
 
 def test_processes_together_echo_what_they_hear():
     line = _line(b"echo") + [{"rx": 1}] * (12 * U.BIT)
-    gen = process.simulate(U.echo(), line, U.ECHO)
+    gen = process.simulate(U.echo(), line)
     assert _received(process.simulate(U.uart_rx, [{"rx": r["tx"]} for r in gen], U.RX)) == b"echo"
-    p = _quiet(U.echo(), U.ECHO)
+    p = _quiet(U.echo(), None)                 # (each process's attr its own: none here)
     assert [q.name for q in p.ir.inputs] == ["rx", "clk", "rst", "ce"]
-    assert [q.name for q in p.ir.outputs] == ["valid", "data", "error", "tx", "busy"]
+    assert {q.name: q.width for q in p.ir.outputs} == {"valid": 1, "data": 8, "error": 1,
+                                                        "tx": 1, "busy": 1}
     assert p.PY_process()(line) == gen
 
 
@@ -231,8 +232,8 @@ def test_processes_together_echo_what_they_hear():
 def test_processes_together_in_hardware(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     line = _line(b"A") + [{"rx": 1}] * (11 * U.BIT)
-    p = _quiet(U.echo(), U.ECHO)
-    assert p.TB_process()(line) == process.simulate(U.echo(), line, U.ECHO)
+    p = _quiet(U.echo(), None)
+    assert p.TB_process()(line) == process.simulate(U.echo(), line)
 
 
 def selfish(port):
@@ -262,6 +263,40 @@ def test_what_steps_and_wires_can_t_be_says_so():
         process.connect(rx=U.uart_rx, tx=U.uart_tx, wires={"tx.date": "rx.data"})
     with pytest.raises(process.ProcessError, match="rx.rx isn't an output of rx"):
         process.connect(rx=U.uart_rx, tx=U.uart_tx, wires={"tx.data": "rx.rx"})
+
+
+# ----------------------------- what was built, and how it ran -----------------------------
+
+def test_a_process_says_what_it_built():
+    text = _quiet(U.uart_rx, U.RX).explain()
+    assert text.startswith("uart_rx: 7 states")
+    assert "yield bit // 2" in text and "uart.py:" in text            # (each state: its yield)
+    assert "(in wait_until)" in text and "(in read_byte)" in text     # (a step's)
+    assert "outputs  valid 1, data 8, error 1" in text                # (followed: no attr)
+    echo = _quiet(U.echo(), None).explain()
+    assert "rx: uart_rx: 7 states" in echo and "tx: uart_tx: 6 states" in echo
+
+
+def test_waveforms_and_where_two_runs_differ(tmp_path):
+    p = _quiet(U.uart_tx, U.TX)
+    clocks = U.frames(b"\x01")
+    rows = p.GEN_process(vcd=str(tmp_path / "tx.vcd"))(clocks)
+    vcd = (tmp_path / "tx.vcd").read_text()
+    assert "$var wire 8 " in vcd and " data $end" in vcd and " clk $end" in vcd
+    assert f"#{20 * len(clocks) - 10}" in vcd                     # (every clock's)
+    assert process.difference(rows, p.PY_process()(clocks)) is None
+    other = [dict(r) for r in rows]
+    other[500]["tx"] ^= 1
+    assert process.difference(rows, other) == f"clock 500: tx {rows[500]['tx']} / {other[500]['tx']}"
+
+
+def test_an_error_says_where_in_the_source():
+    with pytest.raises(process.ProcessError, match=r"test_process\.py:\d+: a while loop that"):
+        process.compile_process(spins, {"a": 1})
+    with pytest.raises(process.ProcessError, match=r"test_process\.py:\d+: 'k': its values grow"):
+        process.compile_process(counts, {"a": 1})
+    with pytest.raises(process.ProcessError, match=r"test_process\.py:\d+: selfish uses itself"):
+        process.compile_process(selfish, {})
 
 
 def test_what_a_process_can_t_be_says_so():

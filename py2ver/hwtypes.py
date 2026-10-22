@@ -228,5 +228,24 @@ def strip_helper_annotations(fd: ast.FunctionDef) -> ast.FunctionDef:
 
 
 def normalize_attr(attr: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """attr values may be dicts or hardware types."""
-    return {k: v.attr() if isinstance(v, HwType) else v for k, v in (attr or {}).items()}
+    """attr values may be dicts, hardware types, a width (8: {'width': 8}) or a
+    board's pin ('LED[7:0]': {'pin': 'LED[7:0]'}); a pin without a width gives
+    its port its own (the pins': LED[7:0] 8 bits, LED the group's 8). A keyword's
+    is a setting, no name's (attr['while'] = 24: as given)."""
+    import keyword
+    out = {}
+    for k, v in (attr or {}).items():
+        if isinstance(k, str) and keyword.iskeyword(k):
+            out[k] = v
+            continue
+        if isinstance(v, HwType):
+            v = v.attr()
+        elif isinstance(v, int) and not isinstance(v, bool):
+            v = {"width": v}
+        elif isinstance(v, str):
+            v = {"pin": v}
+        if isinstance(v, dict) and "pin" in v and "width" not in v:
+            from .pins import pin_width
+            v = dict(v, width=pin_width(v["pin"]))
+        out[k] = v
+    return out

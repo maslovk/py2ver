@@ -68,7 +68,8 @@ simulation or a project needs it: the Verilog is in `p.verilog` (every file for
 
 ### Attributes
 
-Each name maps to `{'signed': 0|1, 'width': <bits>, 'type': 'wire'|'reg'}`, plus
+Each name maps to `{'signed': 0|1, 'width': <bits>, 'type': 'wire'|'reg'}` (or
+`8`, short for `{'width': 8}`; a string, a board's pin: see `PINS()`), plus
 `'next'` and `'init'` for state registers, `'length'` and `'memory'` for lists
 and memories, and `'frac'`, `'round'` and `'saturate'` for fixed point (see
 below). `type: 'reg'` registers the signal; the testbench accounts for the
@@ -338,8 +339,8 @@ def uart_tx(port):
         port.tx = 1                    # stop bit
         yield BIT
 
-attr = {'start': {'width': 1}, 'data': {'width': 8},
-        'tx': {'width': 1, 'init': 1}, 'busy': {'width': 1}}
+attr = {'start': 1, 'data': 8,         # the inputs' widths; the outputs' followed
+        'tx': {'init': 1}}             # (the line high after reset)
 p = Py2ver(uart_tx, attr)              # a state machine: 6 states, 82 LUTs, 198 MHz
 clocks = [{'start': 1, 'data': 0x55}] + [{'start': 0}] * 5000
 assert p.TB_process()(clocks) == p.PY_process()(clocks) == p.GEN_process()(clocks)
@@ -352,9 +353,10 @@ clock pass, `yield n` n clocks (n an expression: a counter loaded with it); the
 code between two yields runs in one clock. Locals keep their values from
 clock to clock. A loop or an `if` that yields (`while`, `for ... in range`,
 with `break` and `continue`) becomes states; one that doesn't is logic within
-a clock. attr gives the pins their widths (an output's `'init'`: its value
-after reset); a local's width is followed from what's assigned to it (a
-`range`'s variable: its ends), else given in attr too.
+a clock. attr gives the inputs their widths (`8` is short for
+`{'width': 8}`); an output's and a local's width is followed from what's
+written to it (a `range`'s variable: its ends; an output's `'init'`, its value
+after reset, too), else given in attr as well.
 
 py2ver builds it as a function of one clock with its state (`process.py`:
 the state's number, the clocks left to wait, the locals, the outputs, each a
@@ -363,7 +365,8 @@ synthesized as any design with state. The generator itself is the
 reference: `GEN_process()` runs it a clock at a time, each clock's inputs a
 dict, each clock's outputs a dict, as `PY_process()` (the machine's model) and
 `TB_process()` (its Verilog) do. A `while` that waits without a yield, or a
-value that grows without end, is an error saying so.
+value that grows without end, is an error saying so and where
+(`examples/uart.py:47: ...`).
 The module's ports are the pins (`uart_tx(data, start, clk, rst, ce) -> tx,
 busy`): the state's registers and their next values have none (`'internal'`).
 `examples/uart.py` is a UART's transmitter and receiver (the receiver samples
@@ -411,28 +414,55 @@ returns one local (`data`) has that local as its target, no copy of it.
 `getattr(port, 'name')` and `setattr(port, 'name', v)` with a constant name
 are the pin's. A step can't use itself.
 
-`connect()` puts processes together as one design, an input of one wired
-to an output of another:
+`connect()` puts processes together as one design, each with its own attr,
+an input of one wired to an output of another:
 
 ```python
 from py2ver import connect
 
-echo = connect(rx=uart_rx, tx=uart_tx, name="uart_echo",
-               wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
-p = Py2ver(echo, dict(RX, tx={'width': 1, 'init': 1}, busy={'width': 1}))
+echo = connect(rx=(uart_rx, {'rx': 1}), tx=(uart_tx, {'start': 1, 'data': 8, 'tx': {'init': 1}}),
+               name="uart_echo", wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
+p = Py2ver(echo)
 p.ir.inputs, p.ir.outputs     # rx (clk, rst, ce) -> valid, data, error, tx, busy
 p.TB_process()(line) == p.GEN_process()(line)    # each byte received sent back
 ```
 
 A wire carries what the output's register holds, as a pin does: what its
 process wrote before this clock (so processes can't loop back on each other
-within a clock, and their order doesn't matter). The design's pins are the
-inputs not wired and all the outputs, each by its own name (two of one name:
-`rx_data`, the process's first). attr is by those names, and `'tx.k'` for a
-process's own (a local's width); a wired input takes its output's format.
-`GEN_process()` runs the generators together, a clock at a time. The echo on
-the board's pins (`examples/uart.py --pins`: in on `GPIO_0[0]`, back out on
-`GPIO_0[1]`, the byte on the LEDs): 141 LUTs, 58 registers, 224 MHz.
+within a clock, and their order doesn't matter), and its format (an input
+wired needs no width). The design's pins are the inputs not wired and all the
+outputs, each by its own name (two of one name: `rx_data`, the process's
+first). The design's attr is by those names, over each process's own, and
+`'tx.k'` for a process's own name (a local's width). `GEN_process()` runs the
+generators together, a clock at a time. The echo on the board's serial pins
+(`examples/uart.py --pins`, `{'rx': 'GPIO_0_RX', 'tx': 'GPIO_0_TX', 'data':
+'LED'}`: each byte from the USB-UART adapter sent back, the last on the LEDs):
+143 LUTs, 58 registers, 182 MHz.
+
+#### Seeing what was built, and how it ran
+
+```python
+print(p.explain())       # each state: where in the generator it waits; the registers
+# uart_rx: 7 states (a state waits at its yield: a clock, or yield n's n)
+#   0  examples/uart.py:59  def uart_rx(port, bit=BIT):  (the start)
+#   1  examples/uart.py:29  yield  (in wait_until)
+#   2  examples/uart.py:65  yield bit // 2                 # to the start bit's middle
+#   3  examples/uart.py:36  yield bit                      # to the next bit's middle  (in read_byte)
+#   ...
+# bits (the outputs, the locals and the state: registers):
+#   inputs   rx 1
+#   outputs  valid 1, data 8, error 1
+#   locals   data_v 8, read_byte_i 4
+#   state    __pc 3, __wait 9
+
+rows = p.TB_process(vcd="uart_rx.vcd")(line)      # the pins' waveforms (GTKWave, Surfer)
+process.difference(rows, p.GEN_process()(line))   # None, or 'clock 2,317: data 65 / 64'
+```
+
+`vcd=` (`GEN_process`, `PY_process`, `TB_process`) writes the clock, the
+inputs and the outputs, a clock's values from its rising edge.
+`process.difference(a, b)` says at which clock two runs first differ and how
+(each pin's two values), where `a == b` only says that they do.
 
 ### Automatic pipelining
 
@@ -1374,19 +1404,20 @@ Options: `QUARTUS_DIR` (default: `quartus_sh` on `PATH`), `CLK_PERIOD_NS`
 
 A port's `'pin'` attr puts it on a DE0-Nano pin, named as the board's pin
 assignments (`templates/hw/de0_nano_qsf.txt`) name it: `'LED[7:0]'` (the
-port's bit 0 on `LED[0]`), `'LED'` (from `LED[0]` up), `'GPIO_0[5]'`,
-`'GPIO_0_IN[1]'`, `'KEY[1]'`, `'SW[3:0]'`:
+port's bit 0 on `LED[0]`), `'LED'` (the group from its first pin),
+`'GPIO_0[5]'`, `'GPIO_0_IN[1]'`, `'KEY[1]'`, `'SW[3:0]'`, `'GPIO_0_RX'` and
+`'GPIO_0_TX'` (the serial pins, where the USB-UART adapter goes: `GPIO_0`'s
+first two, so `GPIO_0` itself is `GPIO_0[33:2]`). A string is short for
+`{'pin': ...}`, its width the pins' if none is given:
 
 ```python
-attr = dict(RX, rx={'width': 1, 'pin': 'GPIO_0[0]'},       # examples/uart.py's receiver
-                data={'width': 8, 'pin': 'LED[7:0]'})
-p = Py2ver(uart_rx, attr)
+p = Py2ver(echo(), {'rx': 'GPIO_0_RX', 'tx': 'GPIO_0_TX', 'data': 'LED'})   # examples/uart.py
 print(p.board_top())                 # the board's top, the design inside
 p.PINS({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
 # Device:          EP4CE22F17C6
-# Combinational:   75
-# Registers:       32
-# Fmax:            250.0 MHz ...
+# Combinational:   143
+# Registers:       58
+# Fmax:            181.59 MHz ...
 ```
 
 The board's top (`DE0_Nano`) clocks the design with `CLOCK_50`, holds it in
@@ -1395,8 +1426,9 @@ reset at power-up and while `KEY[0]` is pressed (unless a port takes
 registers (a pin changes whenever it likes; the second register's value is
 settled, two clocks late), an output port drives its pin, a GPIO pin no
 output drives floats. A port without a pin: an input 0, an output
-unconnected. A pin given twice, an input on an LED or an output on a key, a
-switch or a `GPIO_*_IN` pin is an error saying so.
+unconnected. A pin given twice, a pin the board doesn't have (`GPIO_0[0]`), an
+input on an LED or an output on a key, a switch or a `GPIO_*_IN` pin is an
+error saying so.
 
 `PINS()` compiles it with Quartus and reports as `SYN()` does (the area the
 whole board project's); nothing is programmed. The project

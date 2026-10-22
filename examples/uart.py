@@ -8,11 +8,12 @@
 # significant first; a stop bit, high; each bit BIT clocks.
 #
 #   python examples/uart.py              # loopback: bytes sent, the line, bytes received
+#   python examples/uart.py --explain    # the receiver's states, each a line of uart_rx
+#   python examples/uart.py --vcd        # the receiver's pins as waveforms: uart_rx.vcd
 #   python examples/uart.py --sim        # both simulated (Verilog), the same as the Python
 #   python examples/uart.py --syn        # both in Quartus: 82 and 81 LUTs, 198 and 250 MHz
-#   python examples/uart.py --pins       # the echo on the DE0-Nano's pins: in on GPIO_0[0],
-#                                        # back out on GPIO_0[1], the byte on the LEDs
-#                                        # (compiled only)
+#   python examples/uart.py --pins       # the echo on the DE0-Nano's serial pins (GPIO_0_RX,
+#                                        # GPIO_0_TX), the byte on the LEDs (compiled only)
 import os
 import sys
 
@@ -74,17 +75,16 @@ def uart_rx(port, bit=BIT):
 def echo():
     """The receiver and the transmitter together: each byte received sent back."""
     from py2ver import connect
-    return connect(rx=uart_rx, tx=uart_tx, name="uart_echo",
+    return connect(rx=(uart_rx, RX), tx=(uart_tx, TX), name="uart_echo",
                    wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
 
 
-TX = {"start": {"width": 1}, "data": {"width": 8}, "tx": {"width": 1, "init": 1},
-      "busy": {"width": 1}}
-RX = {"rx": {"width": 1}, "data": {"width": 8}, "valid": {"width": 1}, "error": {"width": 1}}
-ECHO = dict(RX, tx=TX["tx"], busy=TX["busy"])         # (the echo's pins)
-# (on the board: the line in on GPIO_0[0], back out on GPIO_0[1], the byte on the LEDs)
-ECHO_PINS = dict(ECHO, rx=dict(ECHO["rx"], pin="GPIO_0[0]"), tx=dict(ECHO["tx"], pin="GPIO_0[1]"),
-                 data=dict(ECHO["data"], pin="LED[7:0]"))
+# The inputs' widths (the outputs': followed from what's written; the line idle high)
+TX = {"start": 1, "data": 8, "tx": {"init": 1}}
+RX = {"rx": 1}
+# (the echo on the board: the line in on GPIO_0_RX, back out on GPIO_0_TX, the board's
+# serial pins, the byte on the LEDs)
+ECHO_PINS = {"rx": "GPIO_0_RX", "tx": "GPIO_0_TX", "data": "LED"}
 
 
 def frames(data, gap=3):
@@ -114,6 +114,11 @@ if __name__ == "__main__":
     print(f"the machines: {tx.process.states} and {rx.process.states} states; their models the "
           f"generators clock for clock: {tx.PY_process()(clocks) == tx.GEN_process()(clocks)}, "
           f"{rx.PY_process()(line) == rx.GEN_process()(line)}")
+    if "--explain" in sys.argv[1:]:
+        print(rx.explain())
+    if "--vcd" in sys.argv[1:]:
+        rx.GEN_process(vcd="uart_rx.vcd")(line)
+        print("the receiver's pins, a clock at a time: uart_rx.vcd (GTKWave, Surfer)")
     if "--sim" in sys.argv[1:]:
         sent = tx.TB_process()(clocks)
         back = rx.TB_process()([{"rx": r["tx"]} for r in sent])
@@ -123,7 +128,7 @@ if __name__ == "__main__":
     if "--syn" in sys.argv[1:]:
         for name, p in (("transmitter", tx), ("receiver", rx)):
             print(name, p.SYN(quartus))
-    sent = process.simulate(echo(), line + [{"rx": 1}] * (12 * BIT), ECHO)
+    sent = process.simulate(echo(), line + [{"rx": 1}] * (12 * BIT))
     back = process.simulate(uart_rx, [{"rx": r["tx"]} for r in sent], RX)
     print(f"the echo (the receiver and the transmitter connected): sent back "
           f"{bytes(r['data'] for r in back if r['valid'])!r}")

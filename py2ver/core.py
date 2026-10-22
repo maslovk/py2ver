@@ -243,6 +243,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         from . import numpy_fe
         from .numpy_loops import _callable
         func = _callable(func)                       # (a torch module: its forward)
+        if attr is not None:                         # (8: a width; 'LED[7:0]': a pin)
+            attr = normalize_attr(attr)
         # (the board's pins of the ports, attr 'pin': PINS(), see pins.py)
         self._pins = {k: v["pin"] for k, v in (attr or {}).items()
                       if isinstance(v, dict) and "pin" in v}
