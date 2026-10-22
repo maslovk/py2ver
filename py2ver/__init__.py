@@ -7,8 +7,9 @@ Quartus synthesis.
 from .auto import auto_fixed
 from .core import DEFAULT_TEMPLATE_DIR, Py2ver
 from .hwtypes import Array, HwType, Ram, Reg, S, State, U
+from .process import connect
 from .syn_report import SynReport
 
 __all__ = ["Py2ver", "SynReport", "DEFAULT_TEMPLATE_DIR",
-           "U", "S", "Reg", "Array", "State", "Ram", "HwType", "auto_fixed"]
+           "U", "S", "Reg", "Array", "State", "Ram", "HwType", "auto_fixed", "connect"]
 __version__ = "0.1.0"

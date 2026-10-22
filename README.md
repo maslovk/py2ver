@@ -372,6 +372,68 @@ registers, 250 MHz); `tests/test_process.py` sends frames through both, the
 generators, the models and the Verilog the same. A process's pins go on
 the board's with `'pin'` (see "On the board's own pins").
 
+#### Steps, parameters, processes together
+
+A step a protocol takes more than once is a generator of its own, used with
+`yield from`; its `return`ed value is `x = yield from ...`'s. Parameters
+after the port are constants, their defaults or a `functools.partial`'s:
+
+```python
+def wait_until(port, name, value=1):
+    while getattr(port, name) != value:
+        yield
+
+def read_byte(port, bit):
+    data = 0
+    for i in range(8):
+        yield bit                      # to the next bit's middle
+        data = data | (port.rx << i)
+    return data
+
+def uart_rx(port, bit=BIT):
+    while True:
+        port.valid = 0
+        yield from wait_until(port, "rx", 0)     # the start bit's edge
+        yield bit // 2
+        if port.rx:                    # (a glitch)
+            continue
+        data = yield from read_byte(port, bit)
+        ...
+
+fast = Py2ver(functools.partial(uart_rx, bit=217), RX)   # twice the baud
+```
+
+A step is built in the process that uses it (no clock lost going in or out).
+Its arguments are the port, constants, or expressions (evaluated where it's
+used), its locals registers named after it (`read_byte_i`), one set of them
+however many places use it, since only one runs at a time. A step that
+returns one local (`data`) has that local as its target, no copy of it.
+`getattr(port, 'name')` and `setattr(port, 'name', v)` with a constant name
+are the pin's. A step can't use itself.
+
+`connect()` puts processes together as one design, an input of one wired
+to an output of another:
+
+```python
+from py2ver import connect
+
+echo = connect(rx=uart_rx, tx=uart_tx, name="uart_echo",
+               wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
+p = Py2ver(echo, dict(RX, tx={'width': 1, 'init': 1}, busy={'width': 1}))
+p.ir.inputs, p.ir.outputs     # rx (clk, rst, ce) -> valid, data, error, tx, busy
+p.TB_process()(line) == p.GEN_process()(line)    # each byte received sent back
+```
+
+A wire carries what the output's register holds, as a pin does: what its
+process wrote before this clock (so processes can't loop back on each other
+within a clock, and their order doesn't matter). The design's pins are the
+inputs not wired and all the outputs, each by its own name (two of one name:
+`rx_data`, the process's first). attr is by those names, and `'tx.k'` for a
+process's own (a local's width); a wired input takes its output's format.
+`GEN_process()` runs the generators together, a clock at a time. The echo on
+the board's pins (`examples/uart.py --pins`: in on `GPIO_0[0]`, back out on
+`GPIO_0[1]`, the byte on the LEDs): 141 LUTs, 58 registers, 224 MHz.
+
 ### Automatic pipelining
 
 `Py2ver(func, attr, pipeline=N)` splits a combinational design into `N + 1`
@@ -1316,7 +1378,7 @@ port's bit 0 on `LED[0]`), `'LED'` (from `LED[0]` up), `'GPIO_0[5]'`,
 `'GPIO_0_IN[1]'`, `'KEY[1]'`, `'SW[3:0]'`:
 
 ```python
-attr = dict(RX, rx={'width': 1, 'pin': 'GPIO_0[0]'},       # examples/uart.py
+attr = dict(RX, rx={'width': 1, 'pin': 'GPIO_0[0]'},       # examples/uart.py's receiver
                 data={'width': 8, 'pin': 'LED[7:0]'})
 p = Py2ver(uart_rx, attr)
 print(p.board_top())                 # the board's top, the design inside
@@ -1594,7 +1656,7 @@ dropout, its forward pass and its training step, a PyTorch MNIST network's
 forward pass and a step of its training loop (autograd, AdamW, a one-cycle
 schedule), a decimate-by-4 filter fed one sample per handshake, a receiver chain built from plain Python functions,
 a histogram in block RAM, pipelined SHA-256 rounds, and a UART's transmitter
-and receiver written as generators). Each checks the
+and receiver written as generators, connected as an echo). Each checks the
 hardware against Python in simulation, and optionally on the virtual board, in
 Quartus, or on the real board:
 

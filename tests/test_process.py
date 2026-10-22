@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import io
 import random
 import shutil
@@ -147,6 +148,120 @@ def counts(port):
         k = k + port.a           # (grows without end)
         port.x = k & 1
         yield
+
+
+# ----------------------------- steps, parameters, processes together -----------------------------
+
+def first_high(port, limit):
+    """Clocks until port.a, limit at most: how many."""
+    for k in range(limit):
+        if port.a:
+            return k                         # (a return out of a loop: the step's value)
+        yield
+    return limit
+
+
+def pulse(port, n):
+    port.out = 1
+    yield n
+    port.out = 0
+
+
+def measures(port):
+    while True:
+        k = yield from first_high(port, 6)
+        port.count = k
+        yield from pulse(port, k + 1)        # (an expression: the step's local, set here)
+        yield from pulse(port, 2)            # (one step's locals for both)
+        if port.stop:                        # (a return without a yield: the end)
+            return
+        yield
+
+
+MEASURES = {"a": {"width": 1}, "stop": {"width": 1}, "out": {"width": 1}, "count": {"width": 3}}
+
+
+def _measured():
+    r = random.Random(5)
+    return [{"a": int(r.random() < 0.2), "stop": int(k > 250 and r.random() < 0.1)}
+            for k in range(400)]
+
+
+def test_a_step_is_a_generator_of_its_own():
+    p = _quiet(measures, MEASURES)
+    clocks = _measured()
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    assert {r["count"] for r in gen} >= {0, 1, 6} and gen[-1] == gen[-2]   # (ended)
+    assert sorted(p.process.locals) == ["first_high_k", "k", "pulse_n"]
+
+
+@pytest.mark.sim
+def test_a_step_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = _quiet(measures, MEASURES)
+    clocks = _measured()
+    assert p.TB_process()(clocks) == p.GEN_process()(clocks)
+
+
+def test_a_parameter_is_a_constant_a_partial_its_value():
+    half = U.BIT // 2
+    tx = _quiet(functools.partial(U.uart_tx, bit=half), U.TX)
+    clocks = U.frames(b"ok")
+    sent = tx.PY_process()(clocks)
+    assert sent == tx.GEN_process()(clocks)
+    line = [r["tx"] for r in sent]
+    start = line.index(0)
+    assert line[start:start + half + 1] == [0] * half + [1]       # ('o': its bit 0 high)
+    rx = _quiet(functools.partial(U.uart_rx, bit=half), U.RX)
+    assert _received(rx.PY_process()([{"rx": b} for b in line])) == b"ok"
+
+
+def test_processes_together_echo_what_they_hear():
+    line = _line(b"echo") + [{"rx": 1}] * (12 * U.BIT)
+    gen = process.simulate(U.echo(), line, U.ECHO)
+    assert _received(process.simulate(U.uart_rx, [{"rx": r["tx"]} for r in gen], U.RX)) == b"echo"
+    p = _quiet(U.echo(), U.ECHO)
+    assert [q.name for q in p.ir.inputs] == ["rx", "clk", "rst", "ce"]
+    assert [q.name for q in p.ir.outputs] == ["valid", "data", "error", "tx", "busy"]
+    assert p.PY_process()(line) == gen
+
+
+@pytest.mark.sim
+def test_processes_together_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    line = _line(b"A") + [{"rx": 1}] * (11 * U.BIT)
+    p = _quiet(U.echo(), U.ECHO)
+    assert p.TB_process()(line) == process.simulate(U.echo(), line, U.ECHO)
+
+
+def selfish(port):
+    port.x = 1
+    yield from selfish(port)
+
+
+def needs(port, n):
+    port.x = 1
+    yield n
+
+
+def ranges(port):
+    port.x = 1
+    yield from range(3)
+
+
+def test_what_steps_and_wires_can_t_be_says_so():
+    one = {"x": {"width": 1}}
+    with pytest.raises(process.ProcessError, match="uses itself"):
+        process.compile_process(selfish, one)
+    with pytest.raises(process.ProcessError, match="'n' has no value"):
+        process.compile_process(needs, one)
+    with pytest.raises(process.ProcessError, match="a generator function's call"):
+        process.compile_process(ranges, one)
+    with pytest.raises(process.ProcessError, match="tx.date isn't an input of tx"):
+        process.connect(rx=U.uart_rx, tx=U.uart_tx, wires={"tx.date": "rx.data"})
+    with pytest.raises(process.ProcessError, match="rx.rx isn't an output of rx"):
+        process.connect(rx=U.uart_rx, tx=U.uart_tx, wires={"tx.data": "rx.rx"})
 
 
 def test_what_a_process_can_t_be_says_so():

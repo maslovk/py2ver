@@ -61,6 +61,12 @@ def test_the_board_s_top_takes_the_design_between_its_pins():
     assert "|| !KEY[0]" in top                                       # (KEY[0] resets)
 
 
+def test_processes_together_take_the_board_s_pins():
+    top = _quiet(U.echo(), U.ECHO_PINS).board_top()
+    assert "rx_s1 <= GPIO_0[0]" in top and "assign GPIO_0[1] = tx_w;" in top
+    assert "assign GPIO_0[0] = 1'bz;" in top and "uart_echo u_design(" in top
+
+
 _TB = """
 `timescale 1ns/1ps
 module tb;
