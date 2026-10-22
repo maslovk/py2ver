@@ -215,6 +215,13 @@ class _Sim:
         # (each open-drain pin: its line's input, by the design's names)
         self.opens = {self.ext[(p, o)]: self.ext[(p, f"{o}_in")]
                       for p, r in self.runs.items() for o in r.opens}
+        # (each input's source, once: a wire's output, or the design's input and the
+        # value it has if not given: 0, a line 1)
+        lines = set(self.opens.values())
+        self.feeds = [(r, [(n, self.wires.get((p, n)),
+                            None if (p, n) in self.wires else self.ext[(p, n)],
+                            1 if self.ext.get((p, n)) in lines else 0) for n in r.ins])
+                      for p, r in self.runs.items()]
 
     def row(self) -> Dict[str, int]:
         """The outputs during this clock."""
@@ -222,16 +229,13 @@ class _Sim:
 
     def clock(self, values: Dict[str, int], k: int) -> None:
         """A clock with these inputs (one not in values: 0; a line: 1, let go)."""
-        now = {p: {o: r.out(o) for o in r.outs} for p, r in self.runs.items()}
-        lines = set(self.opens.values())
-        for p, r in self.runs.items():
-            for n in r.ins:
-                q = self.wires.get((p, n))
-                if q:
-                    setattr(r.port, n, now[q[0]][q[1]])
-                    continue
-                name = self.ext[(p, n)]
-                setattr(r.port, n, values.get(name, 1 if name in lines else 0))
+        # (the outputs a wire carries: as they are before this clock)
+        now = {p: {o: r.out(o) for o in r.outs} for p, r in self.runs.items()} if self.wires \
+            else None
+        for r, feeds in self.feeds:
+            port = r.port
+            for n, q, name, default in feeds:
+                setattr(port, n, now[q[0]][q[1]] if q else values.get(name, default))
         for r in self.runs.values():
             r.clock(k)
 

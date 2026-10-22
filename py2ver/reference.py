@@ -257,10 +257,14 @@ class ReferenceMixin:
 
         return wrapped
 
-    def _flatten_args(self, in_arg: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    def _input_groups(self) -> List[Tuple[str, Any]]:
+        """The arguments that are input ports (state lives in registers)."""
+        return [(p, ports) for p, ports in self.arg_groups
+                if (ports or [p])[0] in self.input_args_list]
+
+    def _flatten_args(self, in_arg: Tuple[Any, ...], groups=None) -> Tuple[Any, ...]:
         """Function arguments (a list argument as a list) -> one value per input port."""
-        groups = [(p, ports) for p, ports in self.arg_groups
-                  if (ports or [p])[0] in self.input_args_list]   # state lives in registers
+        groups = self._input_groups() if groups is None else groups
         in_arg = self._expand(tuple(in_arg))
         out: List[Any] = []
         for value, (param, ports) in zip(in_arg, groups):
@@ -274,19 +278,18 @@ class ReferenceMixin:
             out.extend(value)
         return tuple(out)
 
-    def _input_vector(self, in_arg: Tuple[Any, ...]) -> Tuple[int, ...]:
+    def _input_vector(self, in_arg: Tuple[Any, ...], groups=None) -> Tuple[int, ...]:
         # Missing trailing arguments default to 0
-        flat = self._flatten_args(tuple(in_arg))
-        return tuple(
-            int(flat[i]) if i < len(flat) else 0
-            for i in range(len(self.input_args_list))
-        )
+        flat = self._flatten_args(tuple(in_arg), groups)
+        n = len(self.input_args_list)
+        return tuple(int(flat[i]) if i < len(flat) else 0 for i in range(n))
 
     def _stream_vectors(self, samples: List[Any]) -> List[Tuple[int, ...]]:
         if not (self.state_map or self.rams or self.schedule):
             raise ValueError("Streams need state ('next' or 'memory' in attr); use TB_batch().")
         # A sample is a tuple of arguments; anything else is the only argument
-        return [self._input_vector(s if isinstance(s, tuple) else (s,)) for s in samples]
+        groups = self._input_groups()                    # (once: a stream is long)
+        return [self._input_vector(s if isinstance(s, tuple) else (s,), groups) for s in samples]
 
     def py_stream_fun(self, samples: List[Any]) -> List[Tuple[int, ...]]:
         """
@@ -323,6 +326,17 @@ class ReferenceMixin:
             return [keep(port, value_of(port)) for port in ports]
 
         state = {p: _state_value(p, self.state_init.__getitem__) for p in self.state_params}
+        # (what each clock needs, worked out once: each value's wrap, each state's
+        # source, the call's names; a long stream is mostly this bookkeeping)
+        def _wrap_of(name: str) -> Tuple[int, int]:
+            w, sgn = _meta(name)
+            return (1 << w) - 1, (1 << (w - 1)) if sgn else 0
+        value_names = self._value_names()
+        value_wraps = [_wrap_of(n) for n in value_names]
+        state_plan = [(p, groups[p] is None,
+                       [(self.state_map[port], _wrap_of(port)) for port in (groups[p] or [p])])
+                      for p in self.state_params]
+        out_names = list(self.output_args_list)
         # Memories: the function updates the list in place; values wrap like the RAM
         rams = {}
         for mem, ram in self.rams.items():
@@ -332,6 +346,7 @@ class ReferenceMixin:
             rams[mem] = [self._wrap(int(v), w, sgn) for v in vals]
         # (a sequenced design's memories: their raw 'init', wrapped as kept)
         mems = {mem: list(m["init"]) for mem, m in self._seq_mems.items()}
+        call_names = {k: py(k) for k in [*inputs, *state, *rams, *mems]}
         outs: List[Tuple[Any, ...]] = []
         for sample in samples:
             args = self._expand(sample if isinstance(sample, tuple) else (sample,))
@@ -339,17 +354,27 @@ class ReferenceMixin:
             for p in inputs[len(args):]:                     # missing trailing args: 0
                 kwargs[p] = 0 if groups[p] is None else [0] * len(groups[p])
             kwargs = {p: self._py_value(p, v) for p, v in kwargs.items()}
-            call = {py(k): v for k, v in {**kwargs, **state, **rams, **mems}.items()}
-            ret = _flatten_outputs(func(**call))
+            call = {call_names[k]: v for k, v in {**kwargs, **state, **rams, **mems}.items()}
+            ret = func(**call)
+            if not (type(ret) is tuple and all(type(v) is int for v in ret)):
+                ret = _flatten_outputs(ret)                  # (complex values, lists)
             for mem, ram in self.rams.items():
                 w, sgn = int(ram["elem"]["width"]), int(ram["elem"]["signed"]) == 1
                 rams[mem][:] = [self._wrap(int(v), w, sgn) for v in rams[mem]]
             for mem, m in self._seq_mems.items():
                 mems[mem][:] = [self._wrap(int(v), m["width"], bool(m["signed"]))
                                 for v in mems[mem]]
-            row = {name: keep(name, v) for name, v in zip(self._value_names(), ret)}
-            outs.append(tuple(row[n] for n in self.output_args_list))
-            state = {p: _state_value(p, lambda port: row[self.state_map[port]])
-                     for p in self.state_params}
+            row = {}
+            for name, v, (mask, sign) in zip(value_names, ret, value_wraps):
+                v = int(v) & mask
+                row[name] = (v ^ sign) - sign if sign else v
+            outs.append(tuple(row[n] for n in out_names))
+            state = {}
+            for p, scalar, sources in state_plan:
+                vals = []
+                for src, (mask, sign) in sources:
+                    v = row[src] & mask
+                    vals.append((v ^ sign) - sign if sign else v)
+                state[p] = vals[0] if scalar else vals
         self._last_memories = {mem: list(v) for mem, v in mems.items()}
         return outs
