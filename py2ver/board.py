@@ -221,7 +221,7 @@ class BoardMixin:
         """The board HW() built, a list of input vectors at a time (like
         TB_batch()). Over the JTAG UART the vectors go out together, the board
         taking each once it has answered the one before: the replies as fast as
-        the link carries them, not a round trip (about 0.2 s there) each."""
+        the link carries them, not a round trip (about 25 ms there) each."""
         return self._fx_rows(self.hw_batch_fun)
 
     BATCH_BYTES = 2048          # (the JTAG UART: input bytes sent before their replies are read)
@@ -324,11 +324,11 @@ class BoardMixin:
         return replies
 
     def _jtag_link(self):
-        """The JTAG UART to the board, kept open from the first call (juart-terminal
-        takes a second to start); closed when the board's programmed again, or
-        this Py2ver is gone."""
+        """The JTAG UART to the board, kept open from the first call (opening it
+        takes 0.15 s, juart-terminal's way a second); closed when the board's
+        programmed again, or this Py2ver is gone."""
         link = getattr(self, "_jtag", None)
-        if link is None or link.proc.poll() is not None:
+        if link is None or not link.alive():
             from .jtag_uart import JtagUart
             link = self._jtag = JtagUart(self.syn_attr.get("QUARTUS_DIR"),
                                          self.syn_attr.get("JTAG_CABLE"))

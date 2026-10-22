@@ -1374,7 +1374,7 @@ the SDRAM goes on the board with `HW()` instead. A pin marked
 `{'open_drain': True}` (I2C's SCL and SDA) is pulled low or left floating,
 its line read back from the same pin. The JTAG UART's pins (`JTAG_RX_DATA`,
 `JTAG_RX_VALID`, `JTAG_TX_DATA`, `JTAG_TX_VALID`, ...) carry bytes to and
-from the PC over the USB-Blaster cable (`juart-terminal`, no serial adapter;
+from the PC over the USB-Blaster cable (`juart-terminal` or `jtag_uart()`, no serial adapter;
 `examples/jtag_echo.py`; a debug console with `py2ver.protocol`'s
 `jtag_print`: `examples/jtag_console.py`; from Python: `PROGRAM()`, `jtag_uart()`, and
 `jtag_reference()` for what the generator answers). `PINS(q, signaltap=True)` builds
@@ -1400,14 +1400,16 @@ default, or `'jtag'`: below), `UART_PORT` (default
 `ALLOW_TIMING_FAILURE` (run anyway).
 
 With `'LINK': 'jtag'` the same words go over the board's JTAG UART, through
-the USB-Blaster that programs it (Quartus's `juart-terminal`), so no USB-UART
-adapter is needed; `JTAG_CABLE` picks the USB-Blaster if there are several. A
-call there is a round trip of about 0.2 s (the terminal polls the cable every
-100 ms), so `p.HW_batch()(vectors)`, after `HW()`, sends the vectors together:
-the board takes each once it has answered the one before, and the replies
-come as fast as the link carries them (about 1.3 KB/s of inputs: 1000 vectors
-of 2 bytes in under 2 s). With the UART link `HW_batch()` makes a call each.
-The SDRAM board's commands (below) work over it too.
+the USB-Blaster that programs it (Quartus's JTAG library, `libjtag_atlantic`),
+so no USB-UART adapter is needed; `JTAG_CABLE` picks the USB-Blaster if there
+are several. A call there is a round trip of about 25 ms (sometimes 125: the
+library's scans), so `p.HW_batch()(vectors)`, after `HW()`, sends the vectors
+together: the board takes each once it has answered the one before, and the
+replies come as fast as the link carries them (an adder's 1000 vectors in
+0.1 s; about 44 KB/s of inputs, 88 of outputs). With the UART link
+`HW_batch()` makes a call each. The SDRAM board's commands (below) work over
+it too. (Where Quartus has no such library, `juart-terminal` instead: a round
+trip of about 0.2 s, 1.3 KB/s to the board.)
 
 `HW_sim()` needs no board or Quartus: it simulates the whole board project
 and talks to it over its UART pins with the exact bytes `HW()` would send,

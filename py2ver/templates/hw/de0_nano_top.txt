@@ -231,7 +231,7 @@ assign {{ input.name }}_int = {{ input.name }}_seg[{{input.width - 1}}:0];
 
 {% if link == "jtag" %}
 // ---------------- JTAG UART core transceiver -----------
-// The words over the USB-Blaster (juart-terminal); the UART's pins idle
+// The words over the USB-Blaster (py2ver's JtagUart); the UART's pins idle
 jtag_transceiver #(
     .TX_WIDTH (TX_WIDTH),
     .RX_WIDTH (RX_WIDTH)

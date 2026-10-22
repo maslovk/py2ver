@@ -1,6 +1,7 @@
 // -----------------------------------------------------------------------------
-// jtag_bytes.sv: the JTAG UART (Intel's alt_jtag_atlantic, juart-terminal on the
-// PC, over the USB-Blaster) as a byte link in place of uart_rx_8n1/uart_tx_8n1:
+// jtag_bytes.sv: the JTAG UART (Intel's alt_jtag_atlantic; on the PC, Quartus's
+// JTAG library or juart-terminal, over the USB-Blaster) as a byte link in place
+// of uart_rx_8n1/uart_tx_8n1:
 //
 //   from the PC: rx_byte with rx_byte_ready high a clock, taken that clock (only
 //                while rx_accept: the bytes after wait, in the FIFO and the PC's)
@@ -9,11 +10,12 @@
 //
 // alt_jtag_atlantic's handshake as the JTAG UART IP's: a byte to the PC on r_dat
 // with r_val the clock after r_ena; one from the PC on t_dat while t_ena, t_dav
-// saying there's room.
+// saying there's room. Its FIFOs a scan's bytes at least (the PC's library moves
+// them in bursts): smaller, the board would stop the link while it answers.
 // -----------------------------------------------------------------------------
 module jtag_bytes #(
-    parameter int RX_FIFO = 8,
-    parameter int TX_FIFO = 16
+    parameter int RX_FIFO = 256,
+    parameter int TX_FIFO = 256
 )(
     input  logic       clk,
     input  logic       rst_n,

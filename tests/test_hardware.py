@@ -150,9 +150,18 @@ def test_an_echo_on_the_board_answers_as_its_generator(quartus):
     p = _quiet(J.jtag_echo, J.PINS)
     p.PINS(quartus)
     p.PROGRAM(quartus)
-    sent = bytes(range(32, 127)) + b"\x00\xff"
+    sent = bytes(range(32, 127)) + b"\x00\x04\xff"
     expected = p.jtag_reference(sent)
     assert expected == sent
     with p.jtag_uart(quartus) as link:
         link.write(sent)
         assert link.read(len(expected), timeout=5) == expected
+        many = bytes(range(256)) * 200                  # (more than the library holds at once)
+        link.write(many)
+        assert link.read(len(many), timeout=10) == many
+    from py2ver.jtag_uart import JtagUart
+    with JtagUart(quartus["QUARTUS_DIR"], terminal=True) as link:   # (juart-terminal's way)
+        link.write(sent)
+        assert link.read(len(expected), timeout=5) == expected
+    with pytest.raises(ConnectionError, match="no such cable"):
+        JtagUart(quartus["QUARTUS_DIR"], cable="No-Such-Blaster [9-9]")

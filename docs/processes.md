@@ -628,7 +628,7 @@ against its generator:
 board.PINS(q)                                  # compile for the board
 board.PROGRAM(q)                               # load it into the FPGA (its RAM: the flash is left alone)
 expected = board.jtag_reference(b"hello")      # what the generator sends back: b'hello'
-with board.jtag_uart(q) as link:               # juart-terminal, through pipes
+with board.jtag_uart(q) as link:               # Quartus's JTAG library (or juart-terminal)
     link.write(b"hello")
     assert link.read(len(expected), timeout=5) == expected
 ```
@@ -638,6 +638,10 @@ like the board's JTAG UART: a byte is given while the design is ready,
 every byte sent back is taken, and there's always room. It returns what the
 board must answer. `PROGRAM()` and `jtag_uart()` find Quartus's tools in
 `QUARTUS_DIR`, on `PATH`, or in `/opt/intelFPGA/22.1std/quartus/bin`.
+`jtag_uart()` talks through Quartus's own JTAG library (`libjtag_atlantic`,
+the one its terminals use): a round trip in about 25 ms, hundreds of KB/s.
+Where Quartus has no such library it runs `juart-terminal` instead, with a
+round trip of about 0.2 s and 1.3 KB/s to the board.
 `tests/test_hardware.py` does all this on a board plugged in: run
 `pytest --hardware`.
 
