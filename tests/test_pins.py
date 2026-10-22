@@ -152,10 +152,10 @@ def test_the_jtag_uart_s_pins():
     assert "jtag_rx_data_s1" not in top                    # (its clock: no two registers)
     with pytest.raises(ValueError, match="JTAG_TX_DATA is for an output of the design's"):
         _quiet(J.jtag_echo, dict(J.PINS, byte="JTAG_TX_DATA", out="GPIO_0[9:2]"))
-    one_bit = {k: v for k, v in J.PINS.items() if k != "out"}
-    with pytest.raises(ValueError, match=r"the port 'ready' \(1 bit\): JTAG_TX_DATA: 8 bits "
+    # (from the PC: its 8 bits exactly; to it, a narrower port is fine: text's 7)
+    with pytest.raises(ValueError, match=r"the port 'valid' \(1 bit\): JTAG_RX_DATA: 8 bits "
                                          r"for a port of 1"):
-        _quiet(J.jtag_echo, dict(one_bit, ready="JTAG_TX_DATA"))
+        _quiet(J.jtag_echo, dict(J.PINS, valid={"width": 1, "pin": "JTAG_RX_DATA"}, byte="SW"))
     assert pin_width("JTAG_RX_DATA") == 8 and pin_width("JTAG_TX_VALID") == 1
 
 

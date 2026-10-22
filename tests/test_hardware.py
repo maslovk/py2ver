@@ -25,7 +25,27 @@ def test_the_generator_says_what_the_board_must_answer():
     assert p.jtag_reference(b"hello") == b"hello"
 
 
+import jtag_console as C  # noqa: E402
+
 FIELDS = [("byte_", 0, 8), ("valid", 8, 1), ("ready", 9, 1)]
+
+
+def test_a_console_prints_what_it_does():
+    text = _quiet(C.board_console(bounce=4), C.PINS).check(C.session(), verilog=False).value
+    assert text == C.BANNER + b"presses: 0x01\npresses: 0x02\nswitches: 0xA\n"
+
+
+@pytest.mark.hardware
+def test_a_console_on_the_board(quartus):
+    p = _quiet(C.board_console(), C.PINS)
+    p.PINS(quartus)
+    p.PROGRAM(quartus)
+    with p.jtag_uart(quartus) as link:
+        assert link.read(len(C.BANNER), timeout=5) == C.BANNER    # (printed at reset, kept)
+        link.write(b"s")
+        line = link.read(len(b"switches: 0x0\n"), timeout=5)
+    assert line.startswith(b"switches: 0x") and line.endswith(b"\n")
+    assert line[12:13] in b"0123456789ABCDEF"                  # (the board's SW[3:0])
 
 
 def test_a_trigger_condition_bit_by_bit():

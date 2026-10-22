@@ -45,6 +45,32 @@ def debounced(port, clocks):
         yield
 
 
+def jtag_send(port, byte, data="tx_data", send="tx_send", room="tx_room"):
+    """One byte to the PC over the JTAG UART: once there's room (the pin room,
+    on JTAG_TX_READY), data (on JTAG_TX_DATA) and send (JTAG_TX_VALID) high a
+    clock."""
+    yield from wait_until(port, room)
+    setattr(port, data, byte)
+    setattr(port, send, 1)
+    yield
+    setattr(port, send, 0)
+
+
+def jtag_print(port, text, data="tx_data", send="tx_send", room="tx_room"):
+    """A message to the PC over the JTAG UART (a debug console): text a constant,
+    bytes (b"presses: "), a byte at a time."""
+    for i in range(len(text)):
+        yield from jtag_send(port, text[i], data, send, room)
+
+
+def jtag_print_hex(port, value, digits, data="tx_data", send="tx_send", room="tx_room"):
+    """A number to the PC over the JTAG UART, in hexadecimal: digits of it, the
+    most significant first."""
+    for i in range(digits):
+        d = (value >> (4 * (digits - 1 - i))) & 15
+        yield from jtag_send(port, d + 48 if d < 10 else d + 55, data, send, room)
+
+
 def wait_cycles(n):
     """n clocks pass."""
     yield n

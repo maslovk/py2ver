@@ -135,6 +135,9 @@ constant string):
 | `shift_in(port, pin, bits, clocks, msb_first=False)` | reads `bits` bits from the pin, one every `clocks` clocks, and returns the value |
 | `uart_send(port, pin, byte, bit)` | sends a UART frame |
 | `uart_receive(port, pin, bit)` | receives a UART frame and returns its byte |
+| `jtag_send(port, byte)` | sends a byte to the PC over the JTAG UART (section 9) |
+| `jtag_print(port, b"text")` | sends a constant message to the PC: a debug console |
+| `jtag_print_hex(port, value, digits)` | sends a number to the PC in hexadecimal |
 | `together(*steps)` | in testbenches only: runs steps at the same time, and returns when every one has returned, with a list of their values (section 5) |
 
 `debounced(port, clocks)` is a whole process rather than a step: connect it
@@ -611,6 +614,41 @@ board must answer. `PROGRAM()` and `jtag_uart()` find Quartus's tools in
 `QUARTUS_DIR`, on `PATH`, or in `/opt/intelFPGA/22.1std/quartus/bin`.
 `tests/test_hardware.py` does all this on a board plugged in: run
 `pytest --hardware`.
+
+### A debug console
+
+A design can tell the PC what it is doing, like `printf`, with the
+`jtag_print` steps. They use the ports `tx_data`, `tx_send` and `tx_room`,
+on the pins `JTAG_TX_DATA`, `JTAG_TX_VALID` and `JTAG_TX_READY`.
+`examples/jtag_console.py` prints a banner at reset, counts each press of
+`KEY[1]` (through `debounced`), and prints the switches when you type `s`:
+
+```py
+def console(port):
+    port.rx_ready = 0
+    yield from jtag_print(port, b"py2ver console: press KEY1, or type s\n")
+    count = 0
+    was = 0
+    while True:
+        port.rx_ready = 1
+        key = port.key
+        if was == 1 and key == 0:                    # pressed (a key reads 0)
+            port.rx_ready = 0
+            count = (count + 1) & 255
+            yield from jtag_print(port, b"presses: 0x")
+            yield from jtag_print_hex(port, count, 2)
+            yield from jtag_print(port, b"\n")
+        elif port.rx_valid and port.rx_data == KEY_S:
+            ...
+        was = key
+        yield
+```
+
+A message is a bytes constant, built as a table of its bytes. Printing takes
+a clock or two per byte, so like `printf` it slows the design while it
+prints. Text sent at reset waits in the JTAG UART until the PC connects (up
+to about 80 bytes), so `juart-terminal` started later still shows the banner.
+A port to `JTAG_TX_DATA` may be narrower than 8 bits; text only needs 7.
 
 ### Debugging on the board with SignalTap
 

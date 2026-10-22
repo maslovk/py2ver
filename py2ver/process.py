@@ -643,11 +643,13 @@ class _Expander:
         pre: List[ast.stmt] = []
         consts: Dict[str, Any] = {}
         for name, v in values.items():
-            if not isinstance(v, (int, str)):
+            if isinstance(v, (bytes, bytearray)):
+                v = tuple(v)                          # (a message: a table of its bytes)
+            if not isinstance(v, (int, str, tuple)):
                 raise ProcessError(f"{fd.name}: the parameter '{name}' is {v!r}: a constant (an "
-                                   f"int) or the port")
+                                   f"int, bytes) or the port")
             if name in stored:                       # (a parameter changed: a local)
-                pre.append(_assign(rename.get(name, name), ast.Constant(v)))
+                pre.append(_assign(rename.get(name, name), _value_node(v)))
             else:
                 consts[name] = v
         env = _env(base)
@@ -659,14 +661,21 @@ class _Expander:
                     n.id = rename[n.id]
                 elif isinstance(n.ctx, ast.Load):
                     if n.id in consts:
-                        return ast.copy_location(ast.Constant(consts[n.id]), n)
+                        return ast.copy_location(_value_node(consts[n.id]), n)
                     v = env.get(n.id)
-                    if n.id not in stored and isinstance(v, int):
-                        return ast.copy_location(ast.Constant(v), n)
+                    if n.id not in stored and isinstance(v, (int, bytes)):
+                        return ast.copy_location(_value_node(v), n)
                 return n
 
             def visit_Call(self, n: ast.Call):
                 self.generic_visit(n)
+                # (len of a constant: its length)
+                if isinstance(n.func, ast.Name) and n.func.id == "len" and len(n.args) == 1:
+                    a = n.args[0]
+                    if isinstance(a, ast.Tuple) and all(isinstance(e, ast.Constant) for e in a.elts):
+                        return ast.copy_location(ast.Constant(len(a.elts)), n)
+                    if isinstance(a, ast.Constant) and isinstance(a.value, (str, bytes)):
+                        return ast.copy_location(ast.Constant(len(a.value)), n)
                 # (getattr(port, 'start'): port.start)
                 if isinstance(n.func, ast.Name) and n.func.id == "getattr" and len(n.args) == 2 \
                         and _is_port(n.args[0], ex.port) and _is_str(n.args[1]):
@@ -755,8 +764,10 @@ class _Expander:
                 values[name] = v                         # (a default)
             elif _is_port(v, self.port) and name not in stored:
                 rename[name] = self.port
-            elif isinstance(v, ast.Constant) and isinstance(v.value, (int, str)):
+            elif isinstance(v, ast.Constant) and isinstance(v.value, (int, str, bytes)):
                 values[name] = v.value
+            elif isinstance(v, ast.Tuple) and all(isinstance(e, ast.Constant) for e in v.elts):
+                values[name] = tuple(e.value for e in v.elts)   # (a constant table, passed on)
             elif isinstance(v, ast.Name) and name not in stored:
                 rename[name] = v.id                      # (a local's: read as it is)
             else:                                        # (an expression: a local)
@@ -781,6 +792,14 @@ class _Expander:
         node = ast.copy_location(_Inline(body=pre + body, target=target), at)
         node._file = getattr(at, "_file", None)
         return node
+
+
+def _value_node(v: Any) -> ast.expr:
+    """A constant as code: an int or a string as itself; bytes, a tuple: a table of
+    ints (text[i] a table read)."""
+    if isinstance(v, (bytes, bytearray, tuple)):
+        return ast.Tuple(elts=[ast.Constant(int(b)) for b in v], ctx=ast.Load())
+    return ast.Constant(v)
 
 
 def _is_port(e: ast.expr, port: str) -> bool:

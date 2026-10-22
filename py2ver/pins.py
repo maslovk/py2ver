@@ -85,8 +85,9 @@ def parse_pin(spec: str, width: int, pins: Dict[str, List[int]]) -> List[str]:
     on LED[0]), 'LED' (the group from its first pin), 'GPIO_0_TX' (a single pin);
     a JTAG UART pin (JTAG_RX_DATA, ...) as itself."""
     if spec.strip() in _JTAG:
-        need = _JTAG[spec.strip()][0]
-        if width != need:
+        need, kind, _ = _JTAG[spec.strip()]
+        # (to the PC a narrower port is fine: its byte's high bits 0, text's 7 bits)
+        if width != need and not (kind == "output" and width < need):
             raise ValueError(f"{spec}: {need} bit{'s' if need > 1 else ''} for a port of {width}")
         return [spec.strip()]
     name, a, b = _spec(spec, pins)

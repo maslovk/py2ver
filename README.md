@@ -1368,7 +1368,8 @@ the SDRAM goes on the board with `HW()` instead. A pin marked
 its line read back from the same pin. The JTAG UART's pins (`JTAG_RX_DATA`,
 `JTAG_RX_VALID`, `JTAG_TX_DATA`, `JTAG_TX_VALID`, ...) carry bytes to and
 from the PC over the USB-Blaster cable (`juart-terminal`, no serial adapter;
-`examples/jtag_echo.py`; from Python: `PROGRAM()`, `jtag_uart()`, and
+`examples/jtag_echo.py`; a debug console with `py2ver.protocol`'s
+`jtag_print`: `examples/jtag_console.py`; from Python: `PROGRAM()`, `jtag_uart()`, and
 `jtag_reference()` for what the generator answers). `PINS(q, signaltap=True)` builds
 SignalTap in too, recording the pins (with `Py2ver(..., probes=True)`, the
 process's state as well) on the board; `syn/<name>_pins/signaltap.txt` says
