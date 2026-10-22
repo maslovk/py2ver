@@ -105,6 +105,7 @@ class Process:
     where: List[str] = field(default_factory=list)      # (each state: where in the source)
     parts: Dict[str, "Process"] = field(default_factory=dict)  # (a System's processes)
     notes: List[str] = field(default_factory=list)      # (the locals renamed)
+    opens: Dict[str, str] = field(default_factory=dict)  # (an open-drain pin: its line's input)
 
     def explain(self) -> str:
         """Its states, each where in the generator it waits, and its registers."""
@@ -130,16 +131,51 @@ class Process:
 
 # ==================================================================== the reference
 
+def _opens(attr: Optional[Dict[str, Any]]) -> Set[str]:
+    """The open-drain pins attr names ({'sda': {'open_drain': True}})."""
+    return {k for k, v in (attr or {}).items() if isinstance(v, dict) and v.get("open_drain")}
+
+
+class _Port:
+    """A process's port as the reference runs it: an open-drain pin written as
+    what it drives (0: the line low; 1: let go) and read as the line (its
+    <pin>_in input, what every driver on it leaves)."""
+
+    def __init__(self, values: Dict[str, int], opens: Set[str], drives: Dict[str, int]) -> None:
+        object.__setattr__(self, "_opens", opens)
+        object.__setattr__(self, "_drive", dict(drives))
+        self.__dict__.update(values)
+
+    def __setattr__(self, name: str, value: int) -> None:
+        if name in self._opens:
+            self._drive[name] = value
+        else:
+            object.__setattr__(self, name, value)
+
+    def __getattr__(self, name: str) -> int:
+        if name in self.__dict__.get("_opens", ()):
+            return self.__dict__.get(f"{name}_in", 1)
+        raise AttributeError(name)
+
+
 class _Runner:
     """A generator run a clock at a time on its port."""
 
     def __init__(self, func: Callable, attr: Dict[str, Any]) -> None:
-        self.ins, self.outs = _pins(func)
+        self.opens = _opens(attr)
+        self.ins, self.outs = _pins(func, self.opens)
+        self.opens &= set(self.outs)
         init = {o: attr.get(o) if isinstance(attr.get(o), dict) else {} for o in self.outs}
-        self.port = SimpleNamespace(**{n: 0 for n in self.ins},
-                                    **{o: int(init[o].get("init", 0)) for o in self.outs})
+        start = {o: int(init[o].get("init", 1 if o in self.opens else 0)) for o in self.outs}
+        self.port = _Port({**{n: 0 for n in self.ins}, **{f"{o}_in": 1 for o in self.opens},
+                           **{o: v for o, v in start.items() if o not in self.opens}},
+                          self.opens, {o: start[o] for o in self.opens})
         self.gen = func(self.port)
         self.wait, self.done = 0, False
+
+    def out(self, o: str) -> int:
+        """An output's value this clock (an open-drain pin's: what it drives)."""
+        return self.port._drive[o] if o in self.opens else getattr(self.port, o)
 
     def clock(self, k: int) -> None:
         if self.done:
@@ -176,18 +212,26 @@ class _Sim:
             self.runs = {"": r}
             self.ins, self.outs = r.ins, r.outs
             self.ext, self.wires = {("", n): n for n in r.ins + r.outs}, {}
+        # (each open-drain pin: its line's input, by the design's names)
+        self.opens = {self.ext[(p, o)]: self.ext[(p, f"{o}_in")]
+                      for p, r in self.runs.items() for o in r.opens}
 
     def row(self) -> Dict[str, int]:
         """The outputs during this clock."""
-        return {self.ext[(p, o)]: getattr(r.port, o) for p, r in self.runs.items() for o in r.outs}
+        return {self.ext[(p, o)]: r.out(o) for p, r in self.runs.items() for o in r.outs}
 
     def clock(self, values: Dict[str, int], k: int) -> None:
-        """A clock with these inputs (one not in values: 0)."""
-        now = {p: {o: getattr(r.port, o) for o in r.outs} for p, r in self.runs.items()}
+        """A clock with these inputs (one not in values: 0; a line: 1, let go)."""
+        now = {p: {o: r.out(o) for o in r.outs} for p, r in self.runs.items()}
+        lines = set(self.opens.values())
         for p, r in self.runs.items():
             for n in r.ins:
                 q = self.wires.get((p, n))
-                setattr(r.port, n, now[q[0]][q[1]] if q else values.get(self.ext[(p, n)], 0))
+                if q:
+                    setattr(r.port, n, now[q[0]][q[1]])
+                    continue
+                name = self.ext[(p, n)]
+                setattr(r.port, n, values.get(name, 1 if name in lines else 0))
         for r in self.runs.values():
             r.clock(k)
 
@@ -260,14 +304,32 @@ def _raised_at(e: BaseException) -> str:
 
 class _Pins:
     """The design's pins as a testbench sees them: its inputs to write (each kept
-    until written again), its outputs to read (this clock's)."""
+    until written again), its outputs to read (this clock's). An open-drain pin
+    the testbench drives too (0: low; 1, at first: let go) and reads as its
+    line: low if either side pulls it low (a pull-up's bus)."""
 
     def __init__(self, sim: _Sim) -> None:
-        object.__setattr__(self, "_ins", {n: 0 for n in sim.ins})
+        lines = set(sim.opens.values())
+        object.__setattr__(self, "_opens", sim.opens)
+        object.__setattr__(self, "_ins", {**{n: 0 for n in sim.ins if n not in lines},
+                                          **{o: 1 for o in sim.opens}})
         object.__setattr__(self, "_outs", sim.outs)
         object.__setattr__(self, "_row", sim.row())
 
+    # (its methods' names begin with _: a pin may be called anything)
+    def _line(self, o: str) -> int:
+        """An open-drain pin's line: the design's drive and the testbench's."""
+        return self._row[o] & self._ins[o]
+
+    def _inputs(self) -> Dict[str, int]:
+        """The design's inputs this clock (an open-drain pin's: its line)."""
+        values = {n: v for n, v in self._ins.items() if n not in self._opens}
+        values.update({i: self._line(o) for o, i in self._opens.items()})
+        return values
+
     def __getattr__(self, name: str) -> int:
+        if name in self._opens:
+            return self._line(name)
         if name in self._row:
             return self._row[name]
         if name in self._ins:
@@ -315,7 +377,7 @@ def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
             if wait < 1:
                 raise ProcessError(f"the testbench's yield {n} at clock {len(rows)}: a clock at "
                                    f"least")
-        values = dict(pins._ins)
+        values = pins._inputs()
         inputs.append(values)
         rows.append(row)
         sim.clock(values, len(rows) - 1)
@@ -338,7 +400,9 @@ class ProcessMixin:
             raise ValueError("Not a process (a generator function): use PY_stream / TB_stream")
 
         def run(clocks: Sequence[Dict[str, int]]) -> List[Dict[str, int]]:
-            rows = run_stream([tuple(int(c.get(p, 0)) for p in pr.inputs) for c in clocks])
+            lines = set(pr.opens.values())             # (a line not given: let go, 1)
+            rows = run_stream([tuple(int(c.get(p, 1 if p in lines else 0)) for p in pr.inputs)
+                               for c in clocks])
             rows = [dict(zip(pr.outputs, r[:len(pr.outputs)])) for r in rows]
             if vcd:
                 write_vcd(vcd, pr, clocks, rows)
@@ -722,19 +786,22 @@ def _is_str(e: ast.expr) -> bool:
     return isinstance(e, ast.Constant) and isinstance(e.value, str)
 
 
-def _pins(func: Any) -> Tuple[List[str], List[str]]:
+def _pins(func: Any, opens: Set[str] = frozenset()) -> Tuple[List[str], List[str]]:
     """(inputs, outputs) of the generator's port: its attributes read and never
-    written, and written, in the order they first appear."""
-    return _pins_of(*_expand(func))
+    written, and written, in the order they first appear; an open-drain pin
+    (opens) written: an output (its drive) and an input <pin>_in (its line)."""
+    return _pins_of(*_expand(func), opens)
 
 
-def _pins_of(fd: ast.FunctionDef, port: str) -> Tuple[List[str], List[str]]:
+def _pins_of(fd: ast.FunctionDef, port: str,
+             opens: Set[str] = frozenset()) -> Tuple[List[str], List[str]]:
     read: Dict[str, None] = {}
     written: Dict[str, None] = {}
     for n in ast.walk(fd):
         if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == port:
             (written if isinstance(n.ctx, ast.Store) else read)[n.attr] = None
-    return [a for a in read if a not in written], list(written)
+    return ([a for a in read if a not in written] + [f"{a}_in" for a in written if a in opens],
+            list(written))
 
 
 # ==================================================================== the machine
@@ -913,13 +980,16 @@ def _assign_bare(name: str, value: ast.expr) -> ast.Assign:
     return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=copy.deepcopy(value))
 
 
-def _desugar(fd: ast.FunctionDef, port: str, inputs: Set[str], outputs: Set[str]) -> None:
-    """In place: port.x as the pin's name (an output's working value: x__n),
-    augmented assignments written out."""
+def _desugar(fd: ast.FunctionDef, port: str, inputs: Set[str], outputs: Set[str],
+             opens: Set[str] = frozenset()) -> None:
+    """In place: port.x as the pin's name (an output's working value: x__n; an
+    open-drain pin's read, its line x_in), augmented assignments written out."""
     class _T(ast.NodeTransformer):
         def visit_Attribute(self, n: ast.Attribute):
             self.generic_visit(n)
             if isinstance(n.value, ast.Name) and n.value.id == port:
+                if n.attr in opens and isinstance(n.ctx, ast.Load):
+                    return ast.Name(id=f"{n.attr}_in", ctx=n.ctx)
                 name = n.attr if n.attr in inputs else f"{n.attr}__n"
                 return ast.Name(id=name, ctx=n.ctx)
             return n
@@ -951,7 +1021,16 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
         return _compile_system(func, attr)
     base, _ = _unwrap(func)
     fd, port = _expand(func)
-    inputs, outputs = _pins_of(fd, port)
+    opens = _opens(attr)
+    inputs, outputs = _pins_of(fd, port, opens)
+    opens &= set(outputs)
+    # (an open-drain pin: a bit; its drive let go after reset; its line an input)
+    for o in opens:
+        if int(attr[o].get("width", 1)) != 1:
+            raise ProcessError(f"{_at(fd)}: {fd.name}: the open-drain pin '{o}' is a bit")
+        attr[o].setdefault("width", 1)
+        attr[o].setdefault("init", 1)
+        attr[f"{o}_in"] = {"width": 1}
     from .hwtypes import pin_widths
     pin_widths(attr, inputs)               # (an input on the board's pins: theirs)
     for pin in inputs:                     # (an output's: followed from what's written)
@@ -963,7 +1042,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
         if isinstance(n, ast.Name) and n.id in set(inputs) | set(outputs):
             n.id = f"{n.id}_v"
     used |= {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)}
-    _desugar(fd, port, set(inputs), set(outputs))
+    _desugar(fd, port, set(inputs), set(outputs), opens)
     counter = [0]
 
     def fresh(base: str) -> str:
@@ -1145,7 +1224,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
              for v in local_names if v.endswith("_v") and v[:-2] in inputs + outputs]
     return Process(func=func, step=step, attr=out_attr, inputs=inputs, outputs=outputs,
                    locals=local_names, states=n_states, source=source, widths=widths,
-                   tree=step_fd, where=where, notes=notes)
+                   tree=step_fd, where=where, notes=notes, opens={o: f"{o}_in" for o in opens})
 
 
 def _pin_test(test: ast.expr, pins: Set[str]) -> Optional[Tuple[str, Optional[bool], int]]:
@@ -1573,7 +1652,8 @@ def connect(name: str = "system", wires: Optional[Dict[str, str]] = None,
         if isinstance(f, System) or not inspect.isgeneratorfunction(f):
             raise ProcessError(f"connect: {p} isn't a process (a generator function, or (it, "
                                f"its attr))")
-    pins = {p: _pins(f) for p, f in processes.items()}
+    opens = {p: _opens(attrs.get(p)) for p in processes}
+    pins = {p: _pins(f, opens[p]) for p, f in processes.items()}
 
     def pin(spec: str, kind: str) -> Tuple[str, str]:
         p, _, n = spec.partition(".")
@@ -1584,6 +1664,9 @@ def connect(name: str = "system", wires: Optional[Dict[str, str]] = None,
         if n not in have:
             raise ProcessError(f"connect: {spec} isn't an {kind} of {p} (its {kind}s: "
                                f"{', '.join(have)})")
+        if n in opens[p] or n.removesuffix("_in") in opens[p]:
+            raise ProcessError(f"connect: {spec} is an open-drain pin: a bus of them isn't "
+                               f"wired yet (play the other side in a testbench)")
         return p, n
     return System(name, dict(processes),
                   {pin(dst, "input"): pin(src, "output") for dst, src in (wires or {}).items()},
@@ -1593,7 +1676,7 @@ def connect(name: str = "system", wires: Optional[Dict[str, str]] = None,
 def _layout(s: System):
     """(each process's (inputs, outputs), each pin's name in the design, the
     design's inputs, its outputs)."""
-    pins = {p: _pins(f) for p, f in s.processes.items()}
+    pins = {p: _pins(f, _opens(s.attrs.get(p))) for p, f in s.processes.items()}
     ext_in = [(p, n) for p, (ins, _) in pins.items() for n in ins if (p, n) not in s.wires]
     ext_out = [(p, n) for p, (_, outs) in pins.items() for n in outs]
     count: Dict[str, int] = {}
@@ -1715,4 +1798,6 @@ def _compile_system(s: System, attr: Dict[str, Any]) -> Process:
     step, tree, source = _function(s.name, params, copies + clocks, returned, ns, s.name)
     return Process(func=s, step=step, attr=out_attr, inputs=[ext[k] for k in ext_in],
                    outputs=[ext[k] for k in ext_out], locals=state, states=states,
-                   source=source, tree=tree, parts={p: built[p] for p in s.processes})
+                   source=source, tree=tree, parts={p: built[p] for p in s.processes},
+                   opens={ext[(p, o)]: ext[(p, i)] for p, pr in built.items()
+                          for o, i in pr.opens.items()})

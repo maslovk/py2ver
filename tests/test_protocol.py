@@ -1,6 +1,8 @@
 import contextlib
 import functools
 import io
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from py2ver.protocol import (debounced, shift_in, shift_out, together, uart_rece
 # generators too (drive(), check()); SPI and WS2812 written from their specs.
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
+import i2c as I2C  # noqa: E402
 import spi as S  # noqa: E402
 import uart as U  # noqa: E402
 import ws2812 as W  # noqa: E402
@@ -323,6 +326,104 @@ def test_a_check_says_which_simulator(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PY2VER_SIM", "icarus")
     assert _quiet(U.echo()).check(host(b"Z")).simulator == "icarus"
+
+
+# ----------------------------- open-drain pins: I2C -----------------------------
+
+def pulls(port):
+    """An open-drain line pulled low two clocks of four; port.seen: the line as
+    read (low when the other side pulls it too)."""
+    while True:
+        port.sda = 0
+        port.seen = port.sda
+        yield 2
+        port.sda = 1                           # (let go: high, unless someone pulls it)
+        port.seen = port.sda
+        yield 2
+
+
+def test_an_open_drain_pin_reads_its_line():
+    p = _quiet(pulls, {"sda": {"open_drain": True}})
+    assert [q.name for q in p.ir.inputs][:1] == ["sda_in"]
+    assert {q.name for q in p.ir.outputs} == {"sda", "seen"}
+
+    def tb(dut):
+        lines = []
+        for k in range(16):
+            dut.sda = 0 if 8 <= k < 12 else 1  # (the testbench pulls it low a while)
+            lines.append((dut.sda, dut.seen))
+            yield
+        return lines
+    run = p.check(tb, verilog=False)
+    # (the line: low when either side pulls it; the process reads it so)
+    assert [line for line, _ in run.value] == [1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1]
+    assert run.inputs[9]["sda_in"] == 0 and run.inputs[3]["sda_in"] == 1
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_an_i2c_master_writes_and_reads_a_memory(sim, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    ops = [(0x50, 0x12, 0, 0xAB), (0x50, 0x12, 1, 0), (0x51, 0x00, 0, 0x55)]
+    p = _quiet(functools.partial(I2C.i2c_master, q=4), I2C.ATTR)
+    run = p.check(I2C.with_memory(ops, {}, 2, stretch=12), verilog=sim)
+    done, log = run.value
+    assert log == [("write", 0x12, 0xAB), ("read", 0x12, 0xAB)]
+    assert [nack for _, nack in done] == [0, 0, 1] and done[1][0] == 0xAB   # (no 0x51: no ack)
+
+
+def test_open_drain_pins_on_the_board():
+    attr = dict(I2C.ATTR, scl=dict(I2C.ATTR["scl"], pin="GPIO_0[2]"),
+                sda=dict(I2C.ATTR["sda"], pin="I2C_SDAT"))
+    top = _quiet(I2C.i2c_master, attr).board_top()
+    assert "assign GPIO_0[2] = scl_w ? 1'bz : 1'b0;" in top and "scl_in_s1 <= GPIO_0[2]" in top
+    assert "inout I2C_SDAT" in top and "assign I2C_SDAT = sda_w ? 1'bz : 1'b0;" in top
+    assert "reg sda_in_s1 = 1, sda_in_s2 = 1;" in top               # (a line: high, let go)
+    with pytest.raises(ValueError, match="can't float"):
+        _quiet(I2C.i2c_master, dict(I2C.ATTR, sda=dict(I2C.ATTR["sda"], pin="LED[0]")))
+    with pytest.raises(process.ProcessError, match="open-drain pin: a bus of them isn't wired"):
+        process.connect(a=(pulls, {"sda": {"open_drain": True}}), b=(U.uart_rx, U.RX),
+                        wires={"b.rx": "a.sda"})
+
+
+_OD_TB = """
+`timescale 1ns/1ps
+module tb;
+    reg clk = 0;
+    always #10 clk = !clk;
+    wire [33:2] gpio;
+    pullup(gpio[2]);                               // (the bus's pull-up)
+    reg pull = 0;
+    assign gpio[2] = pull ? 1'b0 : 1'bz;           // (another device on the line)
+    wire [7:0] led;
+    DE0_Nano board(.CLOCK_50(clk), .GPIO_0(gpio), .KEY(2'b11), .LED(led));
+    integer k;
+    initial begin
+        repeat (40) @(posedge clk);
+        for (k = 0; k < 16; k = k + 1) begin
+            @(posedge clk); #1 $display("LINE %0d", gpio[2]);
+        end
+        pull = 1;
+        repeat (8) @(posedge clk);
+        #1 $display("PULLED %0d SEEN %0d", gpio[2], led[0]);
+        $finish;
+    end
+endmodule
+"""
+
+
+@pytest.mark.sim
+@pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
+def test_an_open_drain_pin_floats_or_pulls_low_on_the_board(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    d = _quiet(pulls, {"sda": {"open_drain": True, "pin": "GPIO_0[2]"},
+                       "seen": "LED[0]"}).gen_pins_project()
+    (d / "tb.v").write_text(_OD_TB, encoding="utf-8")
+    subprocess.run(["iverilog", "-o", "tb.vvp", "tb.v", "DE0_Nano.v", "pulls.v"], cwd=d, check=True)
+    out = subprocess.run(["vvp", "-n", "tb.vvp"], cwd=d, check=True, capture_output=True,
+                         text=True).stdout.splitlines()
+    lines = [int(l.split()[1]) for l in out if l.startswith("LINE")]
+    assert set(lines) == {0, 1} and lines.count(0) == lines.count(1)   # (low two of four clocks)
+    assert "PULLED 0 SEEN 0" in out                       # (pulled by the other: seen low)
 
 
 def bouncing_switch(port):

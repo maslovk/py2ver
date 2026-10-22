@@ -255,6 +255,11 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
             self._process_attr = normalize_attr(attr)
             self.process = compile_process(func, self._process_attr)
             func, attr = self.process.step, self.process.attr
+            # (an open-drain pin: its line read from the same board pin)
+            self._opens = dict(self.process.opens)
+            for o, line in self._opens.items():
+                if o in self._pins:
+                    self._pins[line] = self._pins[o]
         elif self._pins:                             # (an input on the board's pins: theirs)
             import inspect as _inspect
             from .hwtypes import pin_widths

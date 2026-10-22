@@ -370,7 +370,77 @@ assert [q.name for q in e.ir.outputs] == ["valid", "data", "error", "tx", "busy"
 - **The design's attr.** `Py2ver(design, attr)` takes those pin names. Use
   `"process.name"` for a process's own local (`{"enc.count": 16}`).
 
-## 8. Put it on the board
+## 8. Open-drain pins: I2C and other shared lines
+
+Some buses share a line between several devices. Each device either pulls
+the line low or lets go of it, and a pull-up resistor holds it high when
+nobody pulls. I2C works this way (both SCL and SDA), and so do 1-Wire and a
+PS/2 host. Mark such a pin `open_drain` in attr:
+
+- writing `port.sda = 0` pulls the line low, and `port.sda = 1` lets go;
+- reading `port.sda` gives the line's level, which is low while anyone pulls
+  it, this process included.
+
+```python
+def pulls(port):
+    """Pull the line low two clocks out of four; port.seen is the line as read."""
+    while True:
+        port.sda = 0
+        port.seen = port.sda
+        yield 2
+        port.sda = 1                         # let go: high, unless someone else pulls it
+        port.seen = port.sda
+        yield 2
+
+
+od = Py2ver(pulls, {"sda": {"open_drain": True}})
+assert [q.name for q in od.ir.outputs] == ["sda", "seen"]   # sda: what it drives
+assert "sda_in" in [q.name for q in od.ir.inputs]          # sda_in: the line
+
+
+def other_device(dut):
+    """A testbench: it pulls the line low too, for clocks 8 to 11."""
+    seen = []
+    for k in range(16):
+        dut.sda = 0 if 8 <= k < 12 else 1
+        seen.append(dut.sda)                 # the line: low if either side pulls it
+        yield
+    return seen
+
+
+assert od.check(other_device, verilog=False).value == [1, 0, 0, 1, 1, 0, 0, 1,
+                                                       0, 0, 0, 0, 1, 0, 0, 1]
+```
+
+In hardware, an open-drain pin is an output `sda` (what this design drives;
+1 after reset, let go) and an input `sda_in` (the line). In a testbench the
+pin works like the real bus. The testbench writes its own drive with
+`dut.sda = 0` or `1`, and reading `dut.sda` gives the line: low if either
+side pulls it. `check()` replays the line's values to the model and the
+Verilog.
+
+On the board, the pin is pulled low or left floating. Its input comes from
+the same pin, through the usual two registers. Use a GPIO pin, or the
+board's own `I2C_SCLK` and `I2C_SDAT`. The FPGA's pull-ups aren't enabled,
+so a GPIO bus needs its pull-up resistors (a few kΩ to 3.3 V).
+
+`examples/i2c.py` is an I2C master written from the bus's spec:
+
+- start and stop conditions;
+- bits set while SCL is low and taken while it's high;
+- acknowledges;
+- a slave that holds SCL low makes it wait (clock stretching).
+
+It writes and reads one register of a device. Its testbench plays a
+24LC02-style memory chip on the same two lines, acknowledging its own
+address and stretching the clock, and the master's write, read-back and
+missing acknowledge all check against the generator, the model and the
+Verilog. At 100 kHz it compiles to 285 LUTs and 79 registers (166 MHz).
+
+Open-drain pins can't be wired between processes in `connect()` yet: play
+the other devices on the bus in a testbench.
+
+## 9. Put it on the board
 
 A port's attr can name a DE0-Nano pin. A string is short for `{"pin": ...}`:
 
@@ -470,14 +540,14 @@ line.
 - The GPIO pins are 3.3-V LVTTL. They are not 5-V tolerant: a 5-V device
   such as a PS/2 keyboard needs a level shifter.
 - No pull-ups are enabled.
-- A GPIO pin that no output drives is left floating. A pin can't yet switch
-  between driving and floating, as I2C and 1-Wire need.
+- A GPIO pin that no output drives is left floating. An open-drain pin
+  (section 8) is pulled low or left floating.
 
 **Fmax.** Quartus reports the *restricted* Fmax. On this device it is at
 most 250 MHz (the I/O toggle rate), even when the logic alone could run
 faster.
 
-## 9. Error messages
+## 10. Error messages
 
 | message | meaning, and what to do |
 |---|---|
@@ -487,6 +557,8 @@ faster.
 | `a while loop that doesn't yield (it would wait without a clock passing)` | a `while` without a `yield` in it can't wait; add a `yield` |
 | `the port 'data' (8 bits): LED[7:1]: 7 pins for a port of 8 bits` | give 8 pins, or give the port 7 bits in attr |
 | `the board has no GPIO_0[0]` | see the pin names above |
+| `LED[0] can't float: not for the open-drain pin sda` | an open-drain pin needs a GPIO pin, or `I2C_SCLK` / `I2C_SDAT` |
+| `a.sda is an open-drain pin: a bus of them isn't wired yet` | play the other devices on the bus in a testbench |
 | `yield from a generator function's call` | `yield from` takes a call of a step, `yield from step(port, ...)` |
 | `the testbench at clock 1,234 (tb.py:20): ...` | the testbench's `assert` failed at that clock and line |
 | `the model differs from the generator at clock ...` | a width given in attr too small for the values (Python's numbers don't wrap; the hardware's do), or a py2ver bug: please report it, with the waveforms it wrote |

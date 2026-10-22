@@ -363,6 +363,7 @@ the board. It covers:
   generator, the model and the Verilog against each other in one call;
 - `explain()`: each state, the line where it waits, and every register's width;
 - `connect()`, which makes one design from several processes;
+- open-drain pins for shared lines such as I2C's (`{"sda": {"open_drain": True}}`);
 - the DE0-Nano's pins (`{"rx": "GPIO_0_RX", "data": "LED"}`) and `PINS()`;
 - the error messages and what to do about each.
 
@@ -375,6 +376,7 @@ in the generator, the model and the Verilog (on the EP4CE22, each meets
 | `examples/uart.py` | UART transmitter, receiver; the echo | 82, 81 | 26, 34 | 198, 250 MHz |
 | `examples/spi.py` | SPI master and slave (mode 0) on one bus, exchanging bytes | 76, 70 | 38, 33 | 250, 243 MHz |
 | `examples/ws2812.py` | WS2812 LED driver; its testbench reads the line as an LED does | 201 | 49 | 135 MHz |
+| `examples/i2c.py` | I2C master (100 kHz, clock stretching) writing and reading a register; its testbench plays a memory chip | 285 | 79 | 166 MHz |
 
 (250 MHz is the device's limit, Quartus's *restricted* Fmax.)
 
@@ -1361,7 +1363,9 @@ GPIO pin that no output drives floats. The GPIO pins are 3.3-V LVTTL (not
 `PINS()` compiles the project with Quartus and reports its area and timing
 as `SYN()` does. It does not program the board: load
 `syn/<name>_pins/DE0_Nano.sof` with Quartus's programmer. A design that uses
-the SDRAM goes on the board with `HW()` instead. See section 8 of
+the SDRAM goes on the board with `HW()` instead. A pin marked
+`{'open_drain': True}` (I2C's SCL and SDA) is pulled low or left floating,
+its line read back from the same pin. See sections 8 and 9 of
 [docs/processes.md](docs/processes.md) for more.
 
 ### On the board (`HW()`) and the virtual board (`HW_sim()`)
@@ -1618,7 +1622,7 @@ forward pass and a step of its training loop (autograd, AdamW, a one-cycle
 schedule), a decimate-by-4 filter fed one sample per handshake, a receiver chain built from plain Python functions,
 a histogram in block RAM, pipelined SHA-256 rounds, a UART's transmitter
 and receiver written as generators, connected as an echo, an SPI master and
-slave, and a WS2812 LED driver). Each checks the
+slave, a WS2812 LED driver, and an I2C master). Each checks the
 hardware against Python in simulation, and optionally on the virtual board, in
 Quartus, or on the real board:
 

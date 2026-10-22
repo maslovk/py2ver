@@ -123,16 +123,21 @@ class PinsMixin:
         if unknown:
             raise ValueError(f"A pin for no port: {sorted(unknown)} (ports: "
                              f"{[p.name for p in self.ir.inputs + self.ir.outputs]})")
+        opens = getattr(self, "_opens", {})
         taken: Dict[str, str] = {}
         for port, ps in {**ins, **outs}.items():
             for pin in ps:
-                if pin in taken:
+                # (an open-drain pin: its drive and its line on one pin)
+                if pin in taken and opens.get(taken[pin]) != port and opens.get(port) != taken[pin]:
                     raise ValueError(f"{pin} is both {taken[pin]}'s and {port}'s")
                 taken[pin] = port
         for port, ps in outs.items():
             for pin in ps:
                 if pin.split("[")[0] in _IN_GROUPS:
                     raise ValueError(f"{pin} is an input pin: not for the output {port}")
+                if port in opens and pin.split("[")[0] in _OUT_GROUPS:
+                    raise ValueError(f"{pin} can't float: not for the open-drain pin {port} (a "
+                                     f"GPIO pin, or I2C_SDAT / I2C_SCLK)")
         for port, ps in ins.items():
             for pin in ps:
                 if pin.split("[")[0] in _OUT_GROUPS:
@@ -148,11 +153,14 @@ class PinsMixin:
         groups = sorted({pin.split("[")[0] for ps in [*ins.values(), *outs.values()] for pin in ps}
                         | ({"KEY"} if "KEY[0]" not in {p for ps in ins.values() for p in ps}
                            else set()))
+        opens = getattr(self, "_opens", {})
+        open_pins = {pin for o in opens for pin in outs.get(o, [])}
         decl = ["    input CLOCK_50"]
         for g in groups:
             idx = pins[g]
             rng = f"[{idx[-1]}:{idx[0]}] " if idx else ""
             kind = ("output" if g in _OUT_GROUPS else "input" if g in _IN_GROUPS
+                    else "inout" if not idx and g in open_pins
                     else "output" if not idx and any(g in ps for ps in outs.values())
                     else "input" if not idx else "inout")
             decl.append(f"    {kind} {rng}{g}")
@@ -172,8 +180,9 @@ class PinsMixin:
             if p.name in ins:
                 bits = ins[p.name]
                 cat = bits[0] if len(bits) == 1 else "{" + ", ".join(reversed(bits)) + "}"
+                idle = 1 if p.name in opens.values() else 0      # (a line: high, let go)
                 lines += [f"    // {p.name} from {self._pins[p.name]}, through two registers",
-                          f"    reg {rng}{p.name}_s1 = 0, {p.name}_s2 = 0;",
+                          f"    reg {rng}{p.name}_s1 = {idle}, {p.name}_s2 = {idle};",
                           f"    always @(posedge clk) begin {p.name}_s1 <= {cat}; "
                           f"{p.name}_s2 <= {p.name}_s1; end"]
                 conns.append(f".{p.name}({p.name}_s2)")
@@ -184,6 +193,9 @@ class PinsMixin:
             lines.append(f"    wire {rng}{p.name}_w;")
             conns.append(f".{p.name}({p.name}_w)")
             for i, pin in enumerate(outs.get(p.name, [])):
+                if p.name in opens:                 # (open drain: low, or let go)
+                    lines.append(f"    assign {pin} = {p.name}_w ? 1'bz : 1'b0;")
+                    continue
                 lines.append(f"    assign {pin} = {p.name}_w" + (f"[{i}];" if p.width > 1 else ";"))
         # (a GPIO pin no output drives: floating; an LED: off)
         driven = {pin for ps in outs.values() for pin in ps}
