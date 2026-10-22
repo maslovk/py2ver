@@ -83,7 +83,8 @@ def parse_pin(spec: str, width: int, pins: Dict[str, List[int]]) -> List[str]:
     if hi < lo:
         raise ValueError(f"{spec}: [high:low]")
     if hi - lo + 1 != width:
-        raise ValueError(f"{spec}: {hi - lo + 1} pins for a port of {width} bits")
+        raise ValueError(f"{spec}: {hi - lo + 1} pins for a port of {width} bits (give it "
+                         f"{width} pins, or the port its width in attr)")
     missing = [i for i in range(lo, hi + 1) if i not in have]
     if missing:
         singles = [k for k, v in pins.items() if not v and k.startswith(name + "_")]
@@ -105,10 +106,15 @@ class PinsMixin:
     def _pin_map(self) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
         """({input port: its pins}, {output port: its pins})."""
         pins = board_pins()
-        ins = {p.name: parse_pin(self._pins[p.name], p.width, pins) for p in self.ir.inputs
+
+        def parse(p) -> List[str]:
+            try:
+                return parse_pin(self._pins[p.name], p.width, pins)
+            except ValueError as e:
+                raise ValueError(f"the port '{p.name}' ({p.width} bits): {e}") from None
+        ins = {p.name: parse(p) for p in self.ir.inputs
                if p.kind == "input" and p.name in self._pins}
-        outs = {p.name: parse_pin(self._pins[p.name], p.width, pins) for p in self.ir.outputs
-                if p.name in self._pins}
+        outs = {p.name: parse(p) for p in self.ir.outputs if p.name in self._pins}
         unknown = set(self._pins) - set(ins) - set(outs)
         if unknown:
             raise ValueError(f"A pin for no port: {sorted(unknown)} (ports: "

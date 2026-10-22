@@ -229,9 +229,9 @@ def strip_helper_annotations(fd: ast.FunctionDef) -> ast.FunctionDef:
 
 def normalize_attr(attr: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """attr values may be dicts, hardware types, a width (8: {'width': 8}) or a
-    board's pin ('LED[7:0]': {'pin': 'LED[7:0]'}); a pin without a width gives
-    its port its own (the pins': LED[7:0] 8 bits, LED the group's 8). A keyword's
-    is a setting, no name's (attr['while'] = 24: as given)."""
+    board's pin ('LED[7:0]': {'pin': 'LED[7:0]'}; an input without a width takes
+    its pins', see pin_widths). A keyword's is a setting, no name's
+    (attr['while'] = 24: as given)."""
     import keyword
     out = {}
     for k, v in (attr or {}).items():
@@ -244,8 +244,15 @@ def normalize_attr(attr: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             v = {"width": v}
         elif isinstance(v, str):
             v = {"pin": v}
-        if isinstance(v, dict) and "pin" in v and "width" not in v:
-            from .pins import pin_width
-            v = dict(v, width=pin_width(v["pin"]))
         out[k] = v
     return out
+
+
+def pin_widths(attr: Dict[str, Dict[str, Any]], inputs) -> None:
+    """In place: each input with a pin and no width, the pins' (an output's is
+    its own, its pins checked against it)."""
+    from .pins import pin_width
+    for k in inputs:
+        v = attr.get(k)
+        if isinstance(v, dict) and "pin" in v and "width" not in v:
+            attr[k] = dict(v, width=pin_width(v["pin"]))

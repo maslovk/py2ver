@@ -7,12 +7,41 @@ A step's pin is given by its name, a constant:
     yield from uart_send(dut, "rx", 0x41, BIT)         # a testbench, to the design
 
     byte = yield from uart_receive(port, "rx", BIT)
+
+debounced() is a process of its own, to connect() before a switch or a slow
+line: connect(db=(functools.partial(debounced, clocks=50_000), {'raw': 1}), ...).
 """
 
 
 def wait_until(port, pin, value=1):
     """Clocks pass until the pin is value (none, if it already is)."""
     while getattr(port, pin) != value:
+        yield
+
+
+def wait_edge(port, pin, rising=True):
+    """Clocks pass until the pin's next edge: rising (low, then high) or, with
+    rising=False, falling. A clock-following receiver's step (PS/2, SPI)."""
+    yield from wait_until(port, pin, 0 if rising else 1)
+    yield from wait_until(port, pin, 1 if rising else 0)
+
+
+def debounced(port, clocks):
+    """A process (connect() it before what reads the pin): port.clean follows
+    port.raw once raw has kept its new value clocks clocks (a switch's bounces,
+    a slow edge's: none get through)."""
+    level = 0
+    n = 0
+    port.clean = 0
+    while True:
+        if port.raw == level:
+            n = 0
+        else:
+            n = n + 1
+            if n == clocks:
+                level = port.raw
+                n = 0
+                port.clean = level
         yield
 
 

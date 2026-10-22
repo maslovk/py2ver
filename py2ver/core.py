@@ -255,6 +255,13 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
             self._process_attr = normalize_attr(attr)
             self.process = compile_process(func, self._process_attr)
             func, attr = self.process.step, self.process.attr
+        elif self._pins:                             # (an input on the board's pins: theirs)
+            import inspect as _inspect
+            from .hwtypes import pin_widths
+            try:
+                pin_widths(attr, list(_inspect.signature(func).parameters))
+            except (TypeError, ValueError):
+                pass
         # (returned values that are 'internal': a register's next value, no port)
         self._internal = {k for k, v in (attr or {}).items()
                           if isinstance(v, dict) and v.get("internal")}
@@ -537,6 +544,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         self._stages: Dict[str, Any] | None = None
         if stages:
             self._build_stages(stage_options or {}, const_bits, template_dir)
+        if self._pins:                               # (the board's pins checked now, not at PINS())
+            self._pin_map()
         if write:
             self.write_hdl()
 

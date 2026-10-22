@@ -269,12 +269,15 @@ def test_what_steps_and_wires_can_t_be_says_so():
 
 def test_a_process_says_what_it_built():
     text = _quiet(U.uart_rx, U.RX).explain()
-    assert text.startswith("uart_rx: 7 states")
+    assert text.startswith("uart_rx: 6 states")                       # (no end: it never returns)
+    assert "(the end" not in text
     assert "yield bit // 2" in text and "uart.py:" in text            # (each state: its yield)
-    assert "(in wait_until)" in text and "(in read_byte)" in text     # (a step's)
+    # (a step's: which, and where it's used)
+    assert "(in wait_until from examples/uart.py:" in text and "(in read_byte from " in text
     assert "outputs  valid 1, data 8, error 1" in text                # (followed: no attr)
+    assert "data_v: the local data (named apart from the pin port.data)" in text
     echo = _quiet(U.echo(), None).explain()
-    assert "rx: uart_rx: 7 states" in echo and "tx: uart_tx: 6 states" in echo
+    assert "rx: uart_rx: 6 states" in echo and "tx: uart_tx: 5 states" in echo
 
 
 def test_waveforms_and_where_two_runs_differ(tmp_path):

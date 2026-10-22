@@ -104,6 +104,7 @@ class Process:
     tree: Optional[ast.FunctionDef] = None              # (the clock's function)
     where: List[str] = field(default_factory=list)      # (each state: where in the source)
     parts: Dict[str, "Process"] = field(default_factory=dict)  # (a System's processes)
+    notes: List[str] = field(default_factory=list)      # (the locals renamed)
 
     def explain(self) -> str:
         """Its states, each where in the generator it waits, and its registers."""
@@ -121,7 +122,9 @@ class Process:
                   f"  inputs   {bits(self.inputs)}" if self.inputs else "  inputs   -",
                   f"  outputs  {bits(self.outputs)}",
                   f"  locals   {bits(self.locals)}" if self.locals else "  locals   -",
-                  f"  state    {bits([PC, WAIT])}"]
+                  f"  state    {bits([PC, WAIT])}  ({PC}: the state; {WAIT}: the clocks a "
+                  f"yield n has left)"]
+        lines += [f"  ({n})" for n in self.notes]
         return "\n".join(lines)
 
 
@@ -214,6 +217,40 @@ class Run:
     inputs: List[Dict[str, int]]
     outputs: List[Dict[str, int]]
     value: Any = None
+    simulator: Optional[str] = None             # (check(): the Verilog's, icarus or verilator)
+
+
+class TestbenchFailed(AssertionError):
+    """A testbench's assert (drive(), check()): at which clock, where."""
+
+
+def _short(path: str) -> str:
+    """A source file's name to show: py2ver's as py2ver/..., one below here relative."""
+    package = os.path.dirname(os.path.abspath(__file__))
+    if os.path.abspath(path).startswith(package + os.sep):
+        return os.path.join("py2ver", os.path.relpath(path, package))
+    try:
+        rel = os.path.relpath(path)
+        return rel if not rel.startswith("..") else path
+    except ValueError:
+        return path
+
+
+def _waiting(gen) -> str:
+    """Where a testbench is waiting: each generator of its yield from chain."""
+    out = []
+    while gen is not None and getattr(gen, "gi_frame", None) is not None:
+        f = gen.gi_frame
+        out.append(f"{_short(f.f_code.co_filename)}:{f.f_lineno} ({f.f_code.co_name})")
+        gen = gen.gi_yieldfrom
+    return " -> ".join(out) or "?"
+
+
+def _raised_at(e: BaseException) -> str:
+    tb = e.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    return f"{_short(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}" if tb else "?"
 
 
 class _Pins:
@@ -266,6 +303,9 @@ def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
             except StopIteration as e:
                 value = e.value
                 break
+            except AssertionError as e:
+                raise TestbenchFailed(f"the testbench at clock {len(rows):,} ({_raised_at(e)}): "
+                                      f"{e}") from e
             wait = 1 if n is None else int(n)
             if wait < 1:
                 raise ProcessError(f"the testbench's yield {n} at clock {len(rows)}: a clock at "
@@ -276,8 +316,8 @@ def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
         sim.clock(values, len(rows) - 1)
         wait -= 1
         if len(rows) > limit:
-            raise ProcessError(f"the testbench ran {limit:,} clocks without returning (drive(..., "
-                               f"limit=) for more)")
+            raise ProcessError(f"the testbench ran {limit:,} clocks without returning, waiting at "
+                               f"{_waiting(gen)} (limit= for more)")
     return Run(inputs, rows, value)
 
 
@@ -330,13 +370,18 @@ class ProcessMixin:
     def check(self, tb: Callable, verilog: bool = True, vcd: Optional[str] = None,
               limit: int = 10_000_000) -> Run:
         """
-        Run the testbench tb (see drive()) against the generator, then its
-        clocks' inputs through the machine's model and (verilog=True) its
-        Verilog: each the generator's outputs, clock for clock, else a
-        CheckFailed saying at which clock and pin, the waveforms of both runs
-        written beside (<name>_generator.vcd, <name>_<other>.vcd). vcd: the
-        generator's run's waveforms. Returns the Run (its value: what tb
-        returned).
+        Check the design with the testbench tb (see drive()), in three steps:
+        1. tb runs against the generator, a clock at a time (its asserts: a
+           TestbenchFailed at their clock);
+        2. the inputs of each clock of that run go through the machine's model;
+        3. and (verilog=True) through its Verilog: Icarus, or Verilator for a
+           long run (PY2VER_SIM=icarus|verilator chooses; Run.simulator says).
+        Each must give the generator's outputs, clock for clock, else a
+        CheckFailed saying at which clock and pin, both runs' waveforms written
+        beside (<name>_generator.vcd, <name>_model.vcd or _verilog.vcd).
+        vcd: the generator's run's waveforms; limit: the clocks tb may run.
+        Returns the Run: each clock's inputs and outputs, what tb returned
+        (value, as the generator's run gave it).
         """
         pr = self.process
         if pr is None:
@@ -344,18 +389,22 @@ class ProcessMixin:
         run = drive(pr.func, tb, self._process_attr, limit)
         if vcd:
             write_vcd(vcd, pr, run.inputs, run.outputs)
-        others = [("model", self.PY_process())] + ([("verilog", self.TB_process())] if verilog
-                                                    else [])
+        others = [("model", self.PY_process())]
+        if verilog:
+            from .native import choose_simulator
+            run.simulator = choose_simulator(self, len(run.inputs))    # (as TB_stream chooses)
+            others.append((f"verilog ({run.simulator})", self.TB_process()))
         for what, runner in others:
             rows = runner(run.inputs)
             d = difference(run.outputs, rows)
             if d:
                 base = self.outdir / self.t_name
+                file = what.split()[0]
                 write_vcd(f"{base}_generator.vcd", pr, run.inputs, run.outputs)
-                write_vcd(f"{base}_{what}.vcd", pr, run.inputs, rows)
+                write_vcd(f"{base}_{file}.vcd", pr, run.inputs, rows)
                 raise CheckFailed(f"{self.t_name}: the {what} differs from the generator at "
-                                  f"{d} (generator / {what}; the waveforms: "
-                                  f"{base}_generator.vcd, {base}_{what}.vcd)")
+                                  f"{d} (generator / {file}; the waveforms: "
+                                  f"{base}_generator.vcd, {base}_{file}.vcd)")
         return run
 
 
@@ -436,12 +485,7 @@ def _at(n: ast.AST) -> str:
     f = getattr(n, "_file", None)
     if f is None:
         return f"line {getattr(n, 'lineno', '?')}"
-    try:
-        rel = os.path.relpath(f)
-        f = rel if not rel.startswith("..") else f
-    except ValueError:
-        pass
-    return f"{f}:{n.lineno}"
+    return f"{_short(f)}:{n.lineno}"
 
 
 def _unwrap(func: Any) -> Tuple[Callable, inspect.Signature]:
@@ -643,7 +687,7 @@ class _Expander:
                 rename[name] = v.id                      # (a local's: read as it is)
             else:                                        # (an expression: a local)
                 rename[name] = names[name]
-                pre.append(_assign(names[name], v))
+                pre.append(_assign(names[name], v, at))
         for name in values:
             if name in stored:
                 rename[name] = names[name]
@@ -657,10 +701,9 @@ class _Expander:
         self.stack.append(base)
         body = self.body(base, fd, rename, values)
         self.stack.pop()
-        for s in body:                                   # (where each yield is: in which step)
+        for s in body:            # (where each yield is: in which steps, used from where)
             for n in ast.walk(s):
-                if not hasattr(n, "_in"):
-                    n._in = base.__name__
+                n._in = getattr(n, "_in", ()) + ((base.__name__, _at(at)),)
         node = ast.copy_location(_Inline(body=pre + body, target=target), at)
         node._file = getattr(at, "_file", None)
         return node
@@ -696,9 +739,12 @@ class _Code:
 
     def __init__(self) -> None:
         self.ins: List[Tuple] = []
+        self.where: List[Optional[ast.AST]] = []      # (each one's statement in the source)
+        self.at: Optional[ast.AST] = None
 
     def emit(self, *x) -> int:
         self.ins.append(x)
+        self.where.append(self.at)
         return len(self.ins) - 1
 
     def here(self) -> int:
@@ -725,15 +771,20 @@ class _Lower:
         self.loops: List[Tuple[List[int], List[int]]] = []   # (breaks, continues) to patch
         self.steps: List[Tuple[Optional[str], List[int]]] = []  # (an inlined step's target, its returns)
         self.fresh = fresh
-        self.ranges: Dict[str, Tuple[ast.expr, ast.expr]] = {}  # a for loop's var: (start, stop)
-        # (a for loop's body: its var, its instructions [first, end), start, stop, step)
-        self.bodies: List[Tuple[str, int, int, ast.expr, ast.expr, int]] = []
 
     def body(self, stmts: List[ast.stmt]) -> None:
         for s in stmts:
             self.stmt(s)
 
     def stmt(self, s: ast.stmt) -> None:
+        c = self.code
+        outer, c.at = c.at, (s if getattr(s, "_file", None) else c.at)
+        try:
+            self._stmt(s)
+        finally:
+            c.at = outer
+
+    def _stmt(self, s: ast.stmt) -> None:
         c = self.code
         if isinstance(s, ast.Expr) and isinstance(s.value, ast.Yield):
             c.emit("yield", s.value.value, s)
@@ -751,7 +802,7 @@ class _Lower:
             target, returns = self.steps[-1]
             if target is not None and s.value is not None \
                     and not (isinstance(s.value, ast.Name) and s.value.id == target):
-                c.emit("stmt", _assign(target, s.value))
+                c.emit("stmt", _assign(target, s.value, s))
             returns.append(c.emit("jump", -1))
             return
         if isinstance(s, ast.Return):
@@ -805,18 +856,15 @@ class _Lower:
             if not isinstance(step, int) or step == 0:
                 raise ProcessError(f"{_at(s)}: a range's step is a constant, not 0")
             v = s.target.id
-            self.ranges[v] = (start, stop)
-            c.emit("stmt", _assign(v, start))
+            c.emit("stmt", _assign(v, start, s))
             top = c.here()
             skip = c.emit("jump_unless", ast.Compare(
                 left=ast.Name(id=v, ctx=ast.Load()), ops=[ast.Lt() if step > 0 else ast.Gt()],
                 comparators=[copy.deepcopy(stop)]), -1)
             self.loops.append(([], []))
-            first = c.here()
             self.body(s.body)
             breaks, continues = self.loops.pop()
             nxt = c.here()
-            self.bodies.append((v, first, nxt, start, stop, step))
             for at in continues:
                 c.patch(at, nxt)
             c.emit("stmt", _assign(v, ast.BinOp(left=ast.Name(id=v, ctx=ast.Load()), op=ast.Add(),
@@ -847,7 +895,16 @@ def _escapes(s: ast.stmt) -> bool:
     return walk(s, False)
 
 
-def _assign(name: str, value: ast.expr) -> ast.Assign:
+def _assign(name: str, value: ast.expr, like: Optional[ast.AST] = None) -> ast.Assign:
+    """name = value (where like is in the source, if given)."""
+    out = _assign_bare(name, value)
+    if like is not None and hasattr(like, "lineno"):
+        ast.copy_location(out, like)
+        out._file = getattr(like, "_file", None)
+    return out
+
+
+def _assign_bare(name: str, value: ast.expr) -> ast.Assign:
     return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=copy.deepcopy(value))
 
 
@@ -890,6 +947,8 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     base, _ = _unwrap(func)
     fd, port = _expand(func)
     inputs, outputs = _pins_of(fd, port)
+    from .hwtypes import pin_widths
+    pin_widths(attr, inputs)               # (an input on the board's pins: theirs)
     for pin in inputs:                     # (an output's: followed from what's written)
         if "width" not in attr.get(pin, {}):
             raise ProcessError(f"{_at(fd)}: {fd.name}: give the input '{pin}' its width in attr")
@@ -927,8 +986,26 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     origin: Dict[int, ast.stmt] = {}                  # (a state: the yield it comes after)
 
     pins_in = set(inputs)
+    one_bit = {n for n in inputs if int(attr[n]["width"]) == 1 and not attr[n].get("signed")}
+    where_of = low.code.where
 
-    def segment(i: int, seen: Set, known: Dict[str, int]) -> List[ast.stmt]:
+    def no_clock(path: Tuple, here) -> ProcessError:
+        """The loop come round without a yield: where, and the way it goes."""
+        loop = [k for k, _ in path[path.index(here):]] + [here[0]]
+        lines: List[str] = []
+        for k in loop:
+            w = where_of[k]
+            if w is not None and (not lines or lines[-1] != _at(w)):
+                lines.append(_at(w))
+        start = where_of[here[0]]
+        return ProcessError(
+            f"{_at(start) if start is not None else _at(fd)}: {fd.name}: a loop that doesn't "
+            f"yield: in one clock it can go {' -> '.join(lines)} (each test on the way passed "
+            f"without a clock passing). A yield on the way, or tests the inputs' values rule "
+            f"out (an input keeps its value through a clock: wait_until(port, 'clk', 1) then "
+            f"wait_until(port, 'clk', 0) waits for an edge)")
+
+    def segment(i: int, seen: Tuple, known: Dict[str, int]) -> List[ast.stmt]:
         """The clock from instruction i on; known: the inputs' values the tests
         passed on the way say (an input keeps its value through the clock: a
         branch it rules out isn't taken, wait_until(sclk, 1) then wait_until(sclk,
@@ -938,9 +1015,8 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
         while True:
             here = (i, tuple(sorted(known.items())))
             if here in seen:
-                raise ProcessError(f"{_at(fd)}: {fd.name}: a loop that doesn't yield (a clock "
-                                   f"without end)")
-            seen = seen | {here}
+                raise no_clock(seen, here)
+            seen = seen + (here,)
             kind, *rest = code[i]
             if kind == "stmt":
                 s = rest[0]
@@ -960,7 +1036,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
                 if decided is not None:
                     i = i + 1 if decided else target
                     continue
-                when_true, when_false = _facts(test, pins_in)
+                when_true, when_false = _facts(test, pins_in, one_bit)
                 out.append(ast.If(test=copy.deepcopy(test),
                                   body=segment(i + 1, seen, {**known, **when_true}) or [ast.Pass()],
                                   orelse=segment(target, seen, {**known, **when_false})
@@ -984,15 +1060,17 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     segments: List[List[ast.stmt]] = []
     k = 0
     while k < len(order):                             # (states found as segments are built)
-        segments.append(segment(order[k], set(), {}))
+        segments.append(segment(order[k], (), {}))
         k += 1
     done = len(order)
+    ends = False                                      # (a generator that can return)
     for seg in segments:                              # (the end: the state after the last)
         for n in ast.walk(ast.Module(body=seg, type_ignores=[])):
             if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) \
                     and n.targets[0].id == PC and isinstance(n.value, ast.Constant) \
                     and n.value.value == DONE:
                 n.value = ast.Constant(done)
+                ends = True
 
     # The locals: every name assigned, but the pins'
     pins = set(inputs) | {f"{o}__n" for o in outputs}
@@ -1029,8 +1107,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     # Its attr: the pins as given, the outputs registers (their working values the
     # same format; without a width, followed from what's written), the locals'
     # widths followed from what's assigned to them
-    widths = _local_widths(code, local_names, low.ranges, inputs, outputs, attr, ns, fd.name,
-                           low.bodies)
+    widths = _flow_widths(segments, done, local_names, inputs, outputs, attr, ns, fd.name)
     out_attr: Dict[str, Dict[str, Any]] = {}
     for p in inputs:
         out_attr[p] = dict(attr[p])
@@ -1045,7 +1122,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
         out_attr[f"{o}__n"] = dict(m, internal=True)
     for v in local_names:
         out_attr[v] = dict(widths[v], next=v, internal=True)
-    n_states = done + 1
+    n_states = done + 1 if ends else done             # (the end a state if it's reached)
     out_attr[PC] = {"signed": 0, "width": max(1, (n_states - 1).bit_length()), "next": PC,
                     "internal": True}
     longest = max([_bound(n, widths, attr, ns)[1] for n in waits] + [1])
@@ -1054,12 +1131,16 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     where = [f"{_at(fd)}  {_line(fd)}  (the start)"]
     for st in range(1, done):
         y = origin[st]
-        step_in = f"  (in {y._in})" if getattr(y, "_in", None) else ""
-        where.append(f"{_at(y)}  {_line(y)}{step_in}")
-    where.append("(the end: the generator returned)")
+        # (a step's: which, used from where: wait_until from ps2.py:21, in falling_edge ...)
+        chain = ", ".join(f"in {name} from {site}" for name, site in getattr(y, "_in", ()))
+        where.append(f"{_at(y)}  {_line(y)}" + (f"  ({chain})" if chain else ""))
+    if ends:
+        where.append("(the end: the generator returned)")
+    notes = [f"{v}: the local {v[:-2]} (named apart from the pin port.{v[:-2]})"
+             for v in local_names if v.endswith("_v") and v[:-2] in inputs + outputs]
     return Process(func=func, step=step, attr=out_attr, inputs=inputs, outputs=outputs,
                    locals=local_names, states=n_states, source=source, widths=widths,
-                   tree=step_fd, where=where)
+                   tree=step_fd, where=where, notes=notes)
 
 
 def _pin_test(test: ast.expr, pins: Set[str]) -> Optional[Tuple[str, Optional[bool], int]]:
@@ -1132,15 +1213,26 @@ def _value(e: ast.expr, known: Dict[str, int]) -> Optional[int]:
     return None
 
 
-def _facts(test: ast.expr, pins: Set[str]) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """What the test says of an input's value: (if it's true, if it's false)."""
+def _facts(test: ast.expr, pins: Set[str],
+           one_bit: Set[str] = frozenset()) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """What the test says of an input's value: (if it's true, if it's false). A
+    1-bit input not 0 is 1 (while port.clk == 0: left, clk is 1)."""
+    if isinstance(test, ast.BoolOp):              # (an and true, an or false: each part so)
+        parts = [_facts(v, pins, one_bit) for v in test.values]
+        k = 0 if isinstance(test.op, ast.And) else 1
+        merged: Dict[str, int] = {}
+        for p in parts:
+            merged.update(p[k])
+        return (merged, {}) if k == 0 else ({}, merged)
     t = _pin_test(test, pins)
     if t is None:
         return {}, {}
     name, eq, c = t
+    bit = name in one_bit and c in (0, 1)
+    other = {name: 1 - c} if bit else {}
     if eq is None:
-        return {}, {name: 0}
-    return ({name: c}, {}) if eq else ({}, {name: c})
+        return ({name: 1} if name in one_bit else {}), {name: 0}
+    return ({name: c}, other) if eq else (other, {name: c})
 
 
 def _function(name: str, params: List[str], body: List[ast.stmt], returned: List[str],
@@ -1185,96 +1277,263 @@ def _constants(e: ast.expr, ns: Dict[str, Any]) -> ast.expr:
     return _C().visit(copy.deepcopy(e))
 
 
-def _local_widths(code, names: List[str], ranges, inputs, outputs, attr, ns,
-                  fname: str, bodies=()) -> Dict[str, Dict[str, Any]]:
-    """Each local's format: attr's, or the hull of what's assigned to it (a for
-    loop's variable: its range's ends; in the loop's body, short of its stop),
-    followed until it settles; an output's without a width in attr so too (from
-    its 'init'), as out[o]."""
-    from .share import NotShareable, _fmt_of, _fmt_range, _hull, _interval
-    rng: Dict[str, Tuple[int, int]] = {}
-    followed = [o for o in outputs if "width" not in attr.get(o, {})]
-    for p in inputs + outputs:
-        if p in followed:
-            init = int(attr.get(p, {}).get("init", 0))
-            rng[p] = rng[f"{p}__n"] = (init, init)
-        else:
-            rng[p] = rng[f"{p}__n"] = _fmt_range(attr[p])
-    given = {v for v in names if "width" in attr.get(v, {})}
-    for v in names:
-        rng[v] = _fmt_range(attr[v]) if v in given else (0, 0)
-    assigns = [(k, n) for k, x in enumerate(code) if x[0] == "stmt" for n in ast.walk(x[1])
-               if isinstance(n, ast.Assign) and len(n.targets) == 1
-               and isinstance(n.targets[0], ast.Name)]
-    for v, (start, stop) in ranges.items():           # (a range: from its start to its stop)
-        if v in given:
-            continue
-        try:
-            a = _interval(_constants(start, ns), rng, {})
-            b = _interval(_constants(stop, ns), rng, {})
-            rng[v] = _hull(rng[v], a, b)
-        except NotShareable:
-            pass
-    # (in a loop's body its variable is short of its stop: range(8)'s i 0..7)
-    scopes = []
-    for v, lo_k, hi_k, start, stop, step in bodies:
-        if v in given:
-            continue
-        try:
-            a = _interval(_constants(start, ns), rng, {})
-            b = _interval(_constants(stop, ns), rng, {})
-        except NotShareable:
-            continue
-        inner = (a[0], b[1] - 1) if step > 0 else (b[0] + 1, a[1])
-        if inner[0] <= inner[1]:
-            scopes.append((lo_k, hi_k, v, inner))
-    first: Dict[str, ast.Assign] = {}
-    for _, n in assigns:
-        first.setdefault(n.targets[0].id, n)
+Range = Tuple[int, int]
+_NEGATE = {ast.Lt: ast.GtE, ast.LtE: ast.Gt, ast.Gt: ast.LtE, ast.GtE: ast.Lt,
+           ast.Eq: ast.NotEq, ast.NotEq: ast.Eq}
+_FLIP = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Gt: ast.Lt, ast.GtE: ast.LtE,
+         ast.Eq: ast.Eq, ast.NotEq: ast.NotEq}
+WIDEN_AFTER = 12              # a state's ranges changed this often: widened to its tests' constants
+GIVE_UP_AFTER = 64            # and this often: a range still growing grows without end
 
-    def where(v: str) -> str:
-        """Where v is first assigned, and its name in attr (an output's: the pin's)."""
-        shown = v[:-3] if v.endswith("__n") and v[:-3] in outputs else v
-        return f"{_at(first[v]) if v in first else fname}: '{shown}'"
-    growing: Set[str] = set()
-    for _ in range(64):
-        growing = set()
-        for k, n in assigns:
-            v = n.targets[0].id
-            if v not in rng or v in given or v in ranges or v in inputs:
-                continue
-            seen = rng
-            inside = [(u, r) for lo_k, hi_k, u, r in scopes if lo_k <= k < hi_k]
-            if inside:
-                seen = dict(rng)
-                for u, r in inside:
-                    seen[u] = r
+
+def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], inputs, outputs,
+                 attr, ns, fname: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Each local's format: attr's, or every value assigned to it, as followed
+    through each state's clock: a state's registers' ranges at its start, the
+    clock's statements in order, an if's branches each with what its test says
+    (`if pos < 255: pos = pos + 1`: pos at most 254 there), each `__pc = k`
+    passing its ranges on to state k, until they settle. A range that keeps
+    growing is widened to the constants it's tested against (ca reset at
+    DEBOUNCE: 0..DEBOUNCE); one that grows past them, an error naming every such
+    local. An output without a width in attr so too (from its 'init'), as out[o].
+    """
+    from .share import NotShareable, _fmt_of, _fmt_range, _hull, _interval
+    followed = [o for o in outputs if "width" not in attr.get(o, {})]
+    given = {v: _fmt_range(attr[v]) for v in names if "width" in attr.get(v, {})}
+    for o in outputs:
+        if o not in followed:
+            given[f"{o}__n"] = _fmt_range(attr[o])
+    fixed: Dict[str, Range] = {p: _fmt_range(attr[p]) for p in inputs}
+    fixed[WAIT] = (0, 1 << 62)
+    fixed[PC] = (0, done)
+
+    def user_name(v: str) -> str:
+        """A register's name as written (o__q: the output o)."""
+        return v[:-3] if v.endswith("__q") else v
+
+    def where_of(v: str) -> str:
+        """Where a register is first assigned (o__q: o__n)."""
+        a = f"{v[:-3]}__n" if v.endswith("__q") else v
+        return _at(first[a]) if a in first else fname
+
+    def tests_of(v: str) -> List[int]:
+        """The constants a register is tested against, and one either side."""
+        b = user_name(v)
+        return sorted(thresholds.get(b, set()) | thresholds.get(f"{b}__n", set()))
+
+    def start_of(env: Dict[str, Range]) -> Dict[str, Range]:
+        """A clock's registers from the env at its end (o__q: o__n)."""
+        return {**{v: env[v] for v in names}, **{f"{o}__q": env[f"{o}__n"] for o in outputs}}
+    init = {v: given.get(v, (0, 0)) for v in names}
+    for o in outputs:
+        v = int(attr.get(o, {}).get("init", 0))
+        init[f"{o}__q"] = _fmt_range(attr[o]) if o not in followed else (v, v)
+    assigned: Dict[str, Range] = {}                  # (every value each name took)
+    first: Dict[str, ast.AST] = {}
+    thresholds: Dict[str, Set[int]] = {}
+    for seg in segments:
+        for n in ast.walk(ast.Module(body=seg, type_ignores=[])):
+            if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name):
+                first.setdefault(n.targets[0].id, n)
+                # (the constants in what's assigned, too: min(pos + 1, 255))
+                for c in ast.walk(_constants(n.value, ns)):
+                    if isinstance(c, ast.Constant) and type(c.value) is int:
+                        thresholds.setdefault(n.targets[0].id, set()).update(
+                            {c.value - 1, c.value, c.value + 1})
+            if isinstance(n, ast.Compare):
+                for a, b in ((n.left, n.comparators[0]), (n.comparators[0], n.left)):
+                    b = _constants(b, ns)
+                    if isinstance(a, ast.Name) and isinstance(b, ast.Constant) \
+                            and isinstance(b.value, int):
+                        thresholds.setdefault(a.id, set()).update(
+                            {b.value - 1, b.value, b.value + 1})
+
+    def shown(v: str) -> str:
+        return v[:-3] if v.endswith("__n") and v[:-3] in outputs else v
+
+    def value(e: ast.expr, env, s) -> Range:
+        try:
+            return _interval(_constants(e, ns), env, {})
+        except NotShareable as x:
+            t = s.targets[0].id if isinstance(s, ast.Assign) and isinstance(s.targets[0], ast.Name) \
+                else "it"
+            raise ProcessError(f"{_at(s)}: can't follow the values of '{shown(t)}' ({x}): give "
+                               f"its width in attr") from None
+
+    def join(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return {k: _hull(a[k], b[k]) if k in a and k in b else a.get(k, b.get(k)) for k in {*a, *b}}
+
+    def narrow(env, name: str, op, c: Range):
+        if name not in env or name in given:
+            return env
+        lo, hi = env[name]
+        if op is ast.Lt:
+            hi = min(hi, c[1] - 1)
+        elif op is ast.LtE:
+            hi = min(hi, c[1])
+        elif op is ast.Gt:
+            lo = max(lo, c[0] + 1)
+        elif op is ast.GtE:
+            lo = max(lo, c[0])
+        elif op is ast.Eq:
+            lo, hi = max(lo, c[0]), min(hi, c[1])
+        elif op is ast.NotEq and c[0] == c[1]:
+            lo += lo == c[0]
+            hi -= hi == c[0]
+        if lo > hi:
+            return None
+        return {**env, name: (lo, hi)}
+
+    def refine(env, test: ast.expr, truth: bool):
+        """env where test is truth (None: it can't be)."""
+        if env is None:
+            return None
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return refine(env, test.operand, not truth)
+        if isinstance(test, ast.BoolOp):
+            if isinstance(test.op, ast.And) == truth:     # (and true, or false: each so)
+                for v in test.values:
+                    env = refine(env, v, truth)
+                return env
+            out = None                                     # (one of them so)
+            for v in test.values:
+                out = join(out, refine(env, v, truth))
+            return out
+        if isinstance(test, ast.Compare) and len(test.ops) == 1 and type(test.ops[0]) in _NEGATE:
+            op = type(test.ops[0]) if truth else _NEGATE[type(test.ops[0])]
+            left, right = test.left, test.comparators[0]
             try:
-                r = _interval(_constants(n.value, ns), seen, {})
-            except NotShareable as e:
-                raise ProcessError(f"{_at(n)}: can't follow the values of {where(v).split(': ')[-1]} "
-                                   f"({e}): give its width in attr") from None
-            new = _hull(rng[v], r)
-            if new != rng[v]:
-                rng[v] = new
-                growing.add(v)
-        for o in followed:                          # (the pin: its register's values)
-            rng[o] = rng[f"{o}__n"]
-        if not growing:
-            break
-    if growing:                                     # (a counter of its own, say: unbounded)
-        raise ProcessError(f"{where(sorted(growing)[0])}: its values grow without end as "
-                           f"followed: give its width in attr")
+                lv = _interval(_constants(left, ns), env, {})
+                rv = _interval(_constants(right, ns), env, {})
+            except NotShareable:
+                return env
+            if isinstance(left, ast.Name):
+                env = narrow(env, left.id, op, rv)
+            if env is not None and isinstance(right, ast.Name):
+                env = narrow(env, right.id, _FLIP[op], lv)
+            return env
+        if isinstance(test, ast.Name):
+            return narrow(env, test.id, ast.NotEq if truth else ast.Eq, (0, 0))
+        return env
+
+    def assign(env, name: str, r: Range):
+        if name in (PC, WAIT):
+            return env
+        r = given.get(name, r)
+        assigned[name] = _hull(assigned.get(name, r), r)
+        return {**env, name: r}
+
+    arrivals: Dict[int, Dict[str, Range]] = {}
+
+    def walk(stmts, env):
+        for s in stmts:
+            if env is None:
+                return None
+            if isinstance(s, ast.Assign):
+                t = s.targets[0]
+                if isinstance(t, ast.Name) and t.id == PC and isinstance(s.value, ast.Constant):
+                    k = int(s.value.value)               # (the state after this clock)
+                    arrivals[k] = join(arrivals.get(k), start_of(env))
+                    continue
+                if isinstance(t, ast.Name):
+                    env = assign(env, t.id, value(s.value, env, s))
+                elif isinstance(t, ast.Tuple) and isinstance(s.value, ast.Tuple):
+                    vals = [value(v, env, s) for v in s.value.elts]
+                    for x, r in zip(t.elts, vals):
+                        env = assign(env, x.id, r)
+                else:
+                    raise ProcessError(f"{_at(s)}: can't follow what's assigned: one name at a time")
+            elif isinstance(s, ast.If):
+                env = join(walk(s.body, refine(env, s.test, True)),
+                           walk(s.orelse, refine(env, s.test, False)))
+            elif isinstance(s, ast.For) and isinstance(s.target, ast.Name):
+                # (a loop within a clock, of constant bounds: its variable over them)
+                args = [value(a, env, s) for a in s.iter.args]
+                lo, hi = (0, args[0][1] - 1) if len(args) == 1 else (args[0][0], args[1][1] - 1)
+                inner = env
+                for _ in range(16):
+                    out = walk(s.body, assign(inner, s.target.id, (min(lo, hi), max(lo, hi))))
+                    nxt = join(inner, out)
+                    if nxt == inner:
+                        break
+                    inner = nxt
+                env = inner
+            elif isinstance(s, (ast.Pass, ast.Expr)):
+                pass
+            else:
+                raise ProcessError(f"{_at(s)}: can't follow the widths through "
+                                   f"{type(s).__name__}")
+        return env
+
+    # (each state's registers at its start; the first's: their initial values)
+    start: Dict[int, Optional[Dict[str, Range]]] = {k: None for k in range(len(segments))}
+    start[0] = dict(init)
+    changes = {k: 0 for k in start}
+    todo = [0]
+    while todo:
+        k = todo.pop(0)
+        arrivals.clear()
+        o = {f"{x}__q": start[k][f"{x}__q"] for x in outputs}
+        env = {**fixed, **start[k], **{x: o[f"{x}__q"] for x in outputs},
+               **{f"{x}__n": o[f"{x}__q"] for x in outputs}}
+        walk(segments[k], env)
+        for j, arrived in arrivals.items():
+            if j >= len(segments):
+                continue                                  # (the end)
+            new = join(start[j], arrived)
+            if new == start[j]:
+                continue
+            changes[j] += 1
+            if changes[j] > WIDEN_AFTER and start[j] is not None:
+                # (still growing: to the constants it's tested against; one growing past
+                # them, or without any, long after: without end)
+                widened, unbounded = {}, []
+                for v, r in new.items():
+                    old = start[j][v]
+                    ts = tests_of(v)
+                    hi = r[1] if r[1] == old[1] else next((t for t in ts if t >= r[1]), r[1])
+                    lo = r[0] if r[0] == old[0] else next((t for t in reversed(ts) if t <= r[0]),
+                                                          r[0])
+                    widened[v] = (lo, hi)
+                    if r != old and changes[j] > GIVE_UP_AFTER:
+                        unbounded.append(v)
+                if len(unbounded) == 1:
+                    v = unbounded[0]
+                    raise ProcessError(f"{where_of(v)}: '{user_name(v)}': its values grow without "
+                                       f"end as followed: give its width in attr")
+                if unbounded:
+                    each = ", ".join(f"'{user_name(v)}' ({where_of(v)})" for v in sorted(unbounded))
+                    raise ProcessError(f"{fname}: {each}: their values grow without end as "
+                                       f"followed: give their widths in attr")
+                new = widened
+            start[j] = new
+            if j not in todo:
+                todo.append(j)
     out = {}
-    for v in names + followed:
+    for v in names:
         if v in given:
             out[v] = {"signed": int(attr[v].get("signed", 0)), "width": int(attr[v]["width"])}
             continue
-        lo, hi = rng[v]
-        if max(abs(lo), abs(hi)) >> MAX_BITS:
-            raise ProcessError(f"{where(v)}: its values grow without end as followed: give "
-                               f"its width in attr")
-        out[v] = dict(_fmt_of((lo, hi)))
+        r = assigned.get(v, (0, 0))
+        for s in start.values():
+            if s:
+                r = _hull(r, s[v])
+        if max(abs(r[0]), abs(r[1])) >> MAX_BITS:
+            raise ProcessError(f"{_at(first[v]) if v in first else fname}: '{v}': its values "
+                               f"grow without end as followed: give its width in attr")
+        out[v] = dict(_fmt_of(r))
+    for o in followed:
+        v = int(attr.get(o, {}).get("init", 0))
+        r = _hull(assigned.get(f"{o}__n", (v, v)), (v, v))
+        if max(abs(r[0]), abs(r[1])) >> MAX_BITS:
+            raise ProcessError(f"{fname}: the output '{o}': its values grow without end as "
+                               f"followed: give its width in attr")
+        out[o] = dict(_fmt_of(r))
     return out
 
 
@@ -1412,13 +1671,17 @@ def _compile_system(s: System, attr: Dict[str, Any]) -> Process:
     states = 0
     for p, f in s.processes.items():
         pr = built[p]
+        # (its own names: its parameters, what it assigns, its attr's; min, max, ...: as
+        # they are)
+        own = {a.arg for a in pr.tree.args.args} | set(pr.attr) | {
+            n.id for n in ast.walk(pr.tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
 
-        def name_of(n: str, p=p, pr=pr) -> str:
+        def name_of(n: str, p=p, pr=pr, own=own) -> str:
             if n in pr.inputs:
                 return ext[s.wires[(p, n)]] if (p, n) in s.wires else ext[(p, n)]
             if n in pr.outputs:
                 return ext[(p, n)]
-            return f"{p}_{n}"
+            return f"{p}_{n}" if n in own else n
         fd = copy.deepcopy(pr.tree)
         for n in ast.walk(fd):
             if isinstance(n, ast.Name):

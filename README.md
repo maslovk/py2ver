@@ -341,7 +341,7 @@ def uart_tx(port):
 
 attr = {'start': 1, 'data': 8,         # the inputs' widths; the outputs' followed
         'tx': {'init': 1}}             # (the line high after reset)
-p = Py2ver(uart_tx, attr)              # a state machine: 6 states, 82 LUTs, 198 MHz
+p = Py2ver(uart_tx, attr)              # a state machine: 5 states, 82 LUTs, 198 MHz
 clocks = [{'start': 1, 'data': 0x55}] + [{'start': 0}] * 5000
 assert p.TB_process()(clocks) == p.PY_process()(clocks) == p.GEN_process()(clocks)
 ```
@@ -443,17 +443,18 @@ generators together, a clock at a time. The echo on the board's serial pins
 
 ```python
 print(p.explain())       # each state: where in the generator it waits; the registers
-# uart_rx: 7 states (a state waits at its yield: a clock, or yield n's n)
-#   0  examples/uart.py:59  def uart_rx(port, bit=BIT):  (the start)
-#   1  examples/uart.py:29  yield  (in wait_until)
-#   2  examples/uart.py:65  yield bit // 2                 # to the start bit's middle
-#   3  examples/uart.py:36  yield bit                      # to the next bit's middle  (in read_byte)
+# uart_rx: 6 states (a state waits at its yield: a clock, or yield n's n)
+#   0  examples/uart.py:58  def uart_rx(port, bit=BIT):  (the start)
+#   1  examples/uart.py:28  yield  (in wait_until from examples/uart.py:63)
+#   2  examples/uart.py:64  yield bit // 2                 # to the start bit's middle
+#   3  examples/uart.py:35  yield bit                      # to the next bit's middle  (in read_byte from examples/uart.py:67)
 #   ...
 # bits (the outputs, the locals and the state: registers):
 #   inputs   rx 1
 #   outputs  valid 1, data 8, error 1
 #   locals   data_v 8, read_byte_i 4
-#   state    __pc 3, __wait 9
+#   state    __pc 3, __wait 9  (__pc: the state; __wait: the clocks a yield n has left)
+#   (data_v: the local data (named apart from the pin port.data))
 
 rows = p.TB_process(vcd="uart_rx.vcd")(line)      # the pins' waveforms (GTKWave, Surfer)
 process.difference(rows, p.GEN_process()(line))   # None, or 'clock 2,317: data 65 / 64'
@@ -496,20 +497,36 @@ As the design's outputs are registers, a testbench that answers them (waits
 for `busy`, reads back) runs the same against the model and the Verilog as
 against the generator: its clocks' inputs, replayed, check them exactly.
 `process.drive(design, tb)` runs a testbench against the generator alone.
+A testbench's failed `assert` is a `TestbenchFailed` saying at which clock and
+line; `run.simulator` says which simulator ran the Verilog (Icarus, or
+Verilator for a long run; `PY2VER_SIM=icarus` chooses).
 
 `py2ver.protocol` has steps of protocols for both, processes (built in them)
 and testbenches (run as Python), each pin by its name: `wait_until(port,
-pin, value=1)`, `wait_cycles(n)`, `shift_out(port, pin, value, bits, clocks,
-msb_first=False)`, `shift_in(port, pin, bits, clocks, msb_first=False)`,
-`uart_send(port, pin, byte, bit)`, `uart_receive(port, pin, bit)`, and for
-testbenches `together(*steps)`. A step's setting given as a constant
+pin, value=1)`, `wait_edge(port, pin, rising=True)`, `wait_cycles(n)`,
+`shift_out(port, pin, value, bits, clocks, msb_first=False)`, `shift_in(port,
+pin, bits, clocks, msb_first=False)`, `uart_send(port, pin, byte, bit)`,
+`uart_receive(port, pin, bit)`, and for testbenches `together(*steps)` (the
+steps run at once, a clock at a time; their values once all have returned).
+`debounced(port, clocks)` is a process to `connect()` in front of a switch
+or a slow line (`port.clean` follows `port.raw` once it has kept its value
+`clocks` clocks). A step's setting given as a constant
 (`msb_first=True`) leaves only the branch it takes; a step's argument that is
 a local is read as it is (no register of its own).
 
 An input keeps its value through a clock, so a branch the inputs already
 rule out isn't taken: `wait_until(port, "sclk", 1)` then `wait_until(port,
 "sclk", 0)` is an edge followed, and a loop of such waits isn't a loop
-without a clock.
+without a clock. A 1-bit input that isn't 0 is 1, so `while port.clk == 0:`
+and `while port.clk != 1:` say the same. A loop that can go round without a
+clock is an error showing the way it goes (`ps2.py:46 -> ps2.py:34 ->
+ps2.py:46`).
+
+Widths are followed through each state's clock, with what its `if` tests
+say: `if pos < 255: pos = pos + 1` stays 8 bits, as does `pos = min(pos + 1,
+255)`; a counter reset at a bound (`ca = ca + 1; if ca == DEBOUNCE: ca = 0`)
+is as wide as the bound. Every local whose values still grow without end is
+named in one error, each with its line: give those widths in attr.
 
 Written from their specs (on the EP4CE22, each at 50 MHz):
 
@@ -1463,7 +1480,10 @@ port's bit 0 on `LED[0]`), `'LED'` (the group from its first pin),
 `'GPIO_0[5]'`, `'GPIO_0_IN[1]'`, `'KEY[1]'`, `'SW[3:0]'`, `'GPIO_0_RX'` and
 `'GPIO_0_TX'` (the serial pins, where the USB-UART adapter goes: `GPIO_0`'s
 first two, so `GPIO_0` itself is `GPIO_0[33:2]`). A string is short for
-`{'pin': ...}`, its width the pins' if none is given:
+`{'pin': ...}`. An input without a width takes as many bits as it has pins;
+an output keeps its own width, and pins that don't match it are an error
+when the design is built (8-bit `data` on `'LED[7:1]'`: 7 pins for a port of
+8 bits):
 
 ```python
 p = Py2ver(echo(), {'rx': 'GPIO_0_RX', 'tx': 'GPIO_0_TX', 'data': 'LED'})   # examples/uart.py
