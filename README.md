@@ -464,6 +464,61 @@ inputs and the outputs, a clock's values from its rising edge.
 `process.difference(a, b)` says at which clock two runs first differ and how
 (each pin's two values), where `a == b` only says that they do.
 
+#### Testbenches as generators, a library of steps
+
+A testbench is a protocol too: a generator of one argument, the design's
+pins, writing its inputs (each kept until written again) and reading its
+outputs (this clock's), a `yield` a clock. `check()` runs it against the
+generator, then its clocks' inputs through the model and the Verilog, each
+the generator's clock for clock, else a `CheckFailed` saying at which clock
+and pin, with both runs' waveforms beside (`uart_echo_generator.vcd`,
+`uart_echo_verilog.vcd`):
+
+```python
+from py2ver.protocol import together, uart_receive, uart_send
+
+def host(dut):
+    dut.rx = 1                                       # the line idle
+    yield 10
+    got = []
+    for b in b"hi":                                  # each byte sent while the echo is heard
+        _, back = yield from together(uart_send(dut, "rx", b, BIT),
+                                      uart_receive(dut, "tx", BIT))
+        got.append(back)
+    return bytes(got)
+
+run = Py2ver(echo()).check(host)         # verilog=False: the generator and the model only
+run.value                                # b'hi': what host returned
+run.inputs, run.outputs                  # each clock's
+```
+
+As the design's outputs are registers, a testbench that answers them (waits
+for `busy`, reads back) runs the same against the model and the Verilog as
+against the generator: its clocks' inputs, replayed, check them exactly.
+`process.drive(design, tb)` runs a testbench against the generator alone.
+
+`py2ver.protocol` has steps of protocols for both, processes (built in them)
+and testbenches (run as Python), each pin by its name: `wait_until(port,
+pin, value=1)`, `wait_cycles(n)`, `shift_out(port, pin, value, bits, clocks,
+msb_first=False)`, `shift_in(port, pin, bits, clocks, msb_first=False)`,
+`uart_send(port, pin, byte, bit)`, `uart_receive(port, pin, bit)`, and for
+testbenches `together(*steps)`. A step's setting given as a constant
+(`msb_first=True`) leaves only the branch it takes; a step's argument that is
+a local is read as it is (no register of its own).
+
+An input keeps its value through a clock, so a branch the inputs already
+rule out isn't taken: `wait_until(port, "sclk", 1)` then `wait_until(port,
+"sclk", 0)` is an edge followed, and a loop of such waits isn't a loop
+without a clock.
+
+Written from their specs (on the EP4CE22, each at 50 MHz):
+
+| example | what | LUTs | registers | Fmax |
+|---|---|---|---|---|
+| `examples/uart.py` | UART transmitter, receiver; the echo | 82, 81 | 26, 34 | 198, 250 MHz |
+| `examples/spi.py` | SPI master and slave (mode 0) on one bus, checked exchanging bytes | 76, 70 | 38, 33 | 250, 243 MHz |
+| `examples/ws2812.py` | WS2812 LED driver, checked by a testbench that reads its line as an LED does | 201 | 49 | 135 MHz |
+
 ### Automatic pipelining
 
 `Py2ver(func, attr, pipeline=N)` splits a combinational design into `N + 1`
@@ -1687,8 +1742,9 @@ training step with Adam (simulated), a convolutional network with pooling and
 dropout, its forward pass and its training step, a PyTorch MNIST network's
 forward pass and a step of its training loop (autograd, AdamW, a one-cycle
 schedule), a decimate-by-4 filter fed one sample per handshake, a receiver chain built from plain Python functions,
-a histogram in block RAM, pipelined SHA-256 rounds, and a UART's transmitter
-and receiver written as generators, connected as an echo). Each checks the
+a histogram in block RAM, pipelined SHA-256 rounds, a UART's transmitter
+and receiver written as generators, connected as an echo, an SPI master and
+slave, and a WS2812 LED driver). Each checks the
 hardware against Python in simulation, and optionally on the virtual board, in
 Quartus, or on the real board:
 

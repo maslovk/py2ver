@@ -154,26 +154,131 @@ class _Runner:
             raise ProcessError(f"yield {n} at clock {k}: a yield is a clock at least")
 
 
+class _Sim:
+    """A process, or a System's processes together, a clock at a time: its pins
+    by the design's names."""
+
+    def __init__(self, func: Any, attr: Optional[Dict[str, Any]]) -> None:
+        from .hwtypes import normalize_attr
+        attr = normalize_attr(attr)
+        if isinstance(func, System):
+            layout = _layout(func)
+            _, ext, ext_in, ext_out = layout
+            sub = _sub_attrs(func, attr, layout)
+            self.runs = {p: _Runner(f, sub[p]) for p, f in func.processes.items()}
+            self.ins, self.outs = [ext[k] for k in ext_in], [ext[k] for k in ext_out]
+            self.ext, self.wires = ext, func.wires
+        else:
+            r = _Runner(func, attr)
+            self.runs = {"": r}
+            self.ins, self.outs = r.ins, r.outs
+            self.ext, self.wires = {("", n): n for n in r.ins + r.outs}, {}
+
+    def row(self) -> Dict[str, int]:
+        """The outputs during this clock."""
+        return {self.ext[(p, o)]: getattr(r.port, o) for p, r in self.runs.items() for o in r.outs}
+
+    def clock(self, values: Dict[str, int], k: int) -> None:
+        """A clock with these inputs (one not in values: 0)."""
+        now = {p: {o: getattr(r.port, o) for o in r.outs} for p, r in self.runs.items()}
+        for p, r in self.runs.items():
+            for n in r.ins:
+                q = self.wires.get((p, n))
+                setattr(r.port, n, now[q[0]][q[1]] if q else values.get(self.ext[(p, n)], 0))
+        for r in self.runs.values():
+            r.clock(k)
+
+
 def simulate(func: Any, inputs: Sequence[Any], attr: Optional[Dict[str, Any]] = None,
              outputs: Optional[Sequence[str]] = None) -> List[Dict[str, int]]:
     """Run the generator a clock at a time: inputs, a clock's input pins each (a
     dict, an input not in it 0; or a tuple in the port's order of inputs);
     returns each clock's outputs (a dict), the values its pins have during that
     clock (written before it). A System: its processes so, together."""
-    from .hwtypes import normalize_attr
-    attr = normalize_attr(attr)
-    if isinstance(func, System):
-        return _simulate_system(func, inputs, attr, outputs)
-    r = _Runner(func, attr)
-    outputs = list(outputs or r.outs)
+    sim = _Sim(func, attr)
+    outputs = list(outputs or sim.outs)
     rows = []
     for k, vec in enumerate(inputs):
-        rows.append({o: getattr(r.port, o) for o in outputs})
-        values = vec if isinstance(vec, dict) else dict(zip(r.ins, vec))
-        for name in r.ins:
-            setattr(r.port, name, values.get(name, 0))
-        r.clock(k)
+        row = sim.row()
+        rows.append({o: row[o] for o in outputs})
+        sim.clock(vec if isinstance(vec, dict) else dict(zip(sim.ins, vec)), k)
     return rows
+
+
+# ==================================================================== testbenches
+
+@dataclass
+class Run:
+    """A testbench's run (drive()): each clock's inputs and outputs, and what the
+    testbench returned."""
+    inputs: List[Dict[str, int]]
+    outputs: List[Dict[str, int]]
+    value: Any = None
+
+
+class _Pins:
+    """The design's pins as a testbench sees them: its inputs to write (each kept
+    until written again), its outputs to read (this clock's)."""
+
+    def __init__(self, sim: _Sim) -> None:
+        object.__setattr__(self, "_ins", {n: 0 for n in sim.ins})
+        object.__setattr__(self, "_outs", sim.outs)
+        object.__setattr__(self, "_row", sim.row())
+
+    def __getattr__(self, name: str) -> int:
+        if name in self._row:
+            return self._row[name]
+        if name in self._ins:
+            return self._ins[name]
+        raise AttributeError(f"the design has no pin '{name}' (its inputs: "
+                             f"{', '.join(self._ins)}; its outputs: {', '.join(self._outs)})")
+
+    def __setattr__(self, name: str, value: int) -> None:
+        if name not in self._ins:
+            what = "an output" if name in self._outs else "no pin"
+            raise AttributeError(f"'{name}' is {what} of the design: a testbench writes its "
+                                 f"inputs ({', '.join(self._ins)})")
+        self._ins[name] = int(value)
+
+
+def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
+          limit: int = 10_000_000) -> Run:
+    """
+    Run a testbench against the generator (or a System's): tb is a generator of
+    one argument, the design's pins. It writes the inputs (kept until written
+    again), reads the outputs (this clock's: what was written before it), and
+    `yield` lets a clock pass, `yield n` n clocks; when it returns, the run
+    ends (its value: the Run's). The steps of a protocol (yield from
+    uart_send(dut, 'rx', b, BIT)) drive and read pins as well.
+    """
+    sim = _Sim(func, attr)
+    pins = _Pins(sim)
+    gen = tb(pins)
+    inputs: List[Dict[str, int]] = []
+    rows: List[Dict[str, int]] = []
+    wait, value = 0, None
+    while True:
+        row = sim.row()
+        object.__setattr__(pins, "_row", row)
+        if wait == 0:
+            try:
+                n = next(gen)
+            except StopIteration as e:
+                value = e.value
+                break
+            wait = 1 if n is None else int(n)
+            if wait < 1:
+                raise ProcessError(f"the testbench's yield {n} at clock {len(rows)}: a clock at "
+                                   f"least")
+        values = dict(pins._ins)
+        inputs.append(values)
+        rows.append(row)
+        sim.clock(values, len(rows) - 1)
+        wait -= 1
+        if len(rows) > limit:
+            raise ProcessError(f"the testbench ran {limit:,} clocks without returning (drive(..., "
+                               f"limit=) for more)")
+    return Run(inputs, rows, value)
 
 
 class ProcessMixin:
@@ -221,6 +326,41 @@ class ProcessMixin:
         if self.process is None:
             raise ValueError("Not a process (a generator function)")
         return self.process.explain()
+
+    def check(self, tb: Callable, verilog: bool = True, vcd: Optional[str] = None,
+              limit: int = 10_000_000) -> Run:
+        """
+        Run the testbench tb (see drive()) against the generator, then its
+        clocks' inputs through the machine's model and (verilog=True) its
+        Verilog: each the generator's outputs, clock for clock, else a
+        CheckFailed saying at which clock and pin, the waveforms of both runs
+        written beside (<name>_generator.vcd, <name>_<other>.vcd). vcd: the
+        generator's run's waveforms. Returns the Run (its value: what tb
+        returned).
+        """
+        pr = self.process
+        if pr is None:
+            raise ValueError("Not a process (a generator function)")
+        run = drive(pr.func, tb, self._process_attr, limit)
+        if vcd:
+            write_vcd(vcd, pr, run.inputs, run.outputs)
+        others = [("model", self.PY_process())] + ([("verilog", self.TB_process())] if verilog
+                                                    else [])
+        for what, runner in others:
+            rows = runner(run.inputs)
+            d = difference(run.outputs, rows)
+            if d:
+                base = self.outdir / self.t_name
+                write_vcd(f"{base}_generator.vcd", pr, run.inputs, run.outputs)
+                write_vcd(f"{base}_{what}.vcd", pr, run.inputs, rows)
+                raise CheckFailed(f"{self.t_name}: the {what} differs from the generator at "
+                                  f"{d} (generator / {what}; the waveforms: "
+                                  f"{base}_generator.vcd, {base}_{what}.vcd)")
+        return run
+
+
+class CheckFailed(AssertionError):
+    """A design that doesn't do what its generator does (check())."""
 
 
 def difference(a: Sequence[Dict[str, int]], b: Sequence[Dict[str, int]]) -> Optional[str]:
@@ -437,7 +577,23 @@ class _Expander:
                         raise ProcessError(f"{_at(n)}: x = yield from ..., x a name")
                     return ex.inline(n.value, n.targets[0], env, n)
                 return n
-        out = [_T().visit(s) for s in copy.deepcopy(fd.body)]
+
+            # (a constant's if, msb_first's: the branch it takes)
+            def visit_If(self, n: ast.If):
+                self.generic_visit(n)
+                if isinstance(n.test, ast.Constant):
+                    return (n.body if n.test.value else n.orelse) or [ast.Pass()]
+                return n
+
+            def visit_IfExp(self, n: ast.IfExp):
+                self.generic_visit(n)
+                if isinstance(n.test, ast.Constant):
+                    return n.body if n.test.value else n.orelse
+                return n
+        out: List[ast.stmt] = []
+        for s in copy.deepcopy(fd.body):
+            r = _T().visit(s)
+            out += r if isinstance(r, list) else [r]
         return pre + out
 
     def inline(self, y: ast.YieldFrom, target: Optional[ast.Name], env: Dict[str, Any],
@@ -483,6 +639,8 @@ class _Expander:
                 rename[name] = self.port
             elif isinstance(v, ast.Constant) and isinstance(v.value, (int, str)):
                 values[name] = v.value
+            elif isinstance(v, ast.Name) and name not in stored:
+                rename[name] = v.id                      # (a local's: read as it is)
             else:                                        # (an expression: a local)
                 rename[name] = names[name]
                 pre.append(_assign(names[name], v))
@@ -493,7 +651,8 @@ class _Expander:
         rets = [n.value for n in ast.walk(fd) if isinstance(n, ast.Return)]
         if target is not None and rets and all(isinstance(r, ast.Name) and r.id == rets[0].id
                                                for r in rets) \
-                and rets[0].id in stored and rets[0].id not in sig.parameters:
+                and rets[0].id in stored and rets[0].id not in sig.parameters \
+                and target.id not in rename.values():    # (x = yield from f(port, x): a copy)
             rename[rets[0].id] = target.id
         self.stack.append(base)
         body = self.body(base, fd, rename, values)
@@ -767,23 +926,45 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     waits: List[ast.expr] = []
     origin: Dict[int, ast.stmt] = {}                  # (a state: the yield it comes after)
 
-    def segment(i: int, seen: Set[int]) -> List[ast.stmt]:
+    pins_in = set(inputs)
+
+    def segment(i: int, seen: Set, known: Dict[str, int]) -> List[ast.stmt]:
+        """The clock from instruction i on; known: the inputs' values the tests
+        passed on the way say (an input keeps its value through the clock: a
+        branch it rules out isn't taken, wait_until(sclk, 1) then wait_until(sclk,
+        0) waits), and the locals set to constants. An instruction come to again
+        knowing the same: a loop without a clock passing."""
         out: List[ast.stmt] = []
         while True:
-            if i in seen:
+            here = (i, tuple(sorted(known.items())))
+            if here in seen:
                 raise ProcessError(f"{_at(fd)}: {fd.name}: a loop that doesn't yield (a clock "
                                    f"without end)")
-            seen = seen | {i}
+            seen = seen | {here}
             kind, *rest = code[i]
             if kind == "stmt":
-                out.append(copy.deepcopy(rest[0]))
+                s = rest[0]
+                out.append(copy.deepcopy(s))
+                # (a local set to a constant: known for the rest of the clock)
+                known = {k: v for k, v in known.items() if k not in _stored([s])}
+                if isinstance(s, ast.Assign) and len(s.targets) == 1 \
+                        and isinstance(s.targets[0], ast.Name) and isinstance(s.value, ast.Constant) \
+                        and isinstance(s.value.value, int) and "width" not in attr.get(s.targets[0].id, {}):
+                    known[s.targets[0].id] = s.value.value
                 i += 1
             elif kind == "jump":
                 i = rest[0]
             elif kind == "jump_unless":
                 test, target = rest
-                out.append(ast.If(test=copy.deepcopy(test), body=segment(i + 1, seen) or [ast.Pass()],
-                                  orelse=segment(target, seen) or [ast.Pass()]))
+                decided = _decide(test, known, pins_in)
+                if decided is not None:
+                    i = i + 1 if decided else target
+                    continue
+                when_true, when_false = _facts(test, pins_in)
+                out.append(ast.If(test=copy.deepcopy(test),
+                                  body=segment(i + 1, seen, {**known, **when_true}) or [ast.Pass()],
+                                  orelse=segment(target, seen, {**known, **when_false})
+                                  or [ast.Pass()]))
                 return out
             elif kind == "yield":
                 n = rest[0]
@@ -803,7 +984,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     segments: List[List[ast.stmt]] = []
     k = 0
     while k < len(order):                             # (states found as segments are built)
-        segments.append(segment(order[k], set()))
+        segments.append(segment(order[k], set(), {}))
         k += 1
     done = len(order)
     for seg in segments:                              # (the end: the state after the last)
@@ -879,6 +1060,87 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     return Process(func=func, step=step, attr=out_attr, inputs=inputs, outputs=outputs,
                    locals=local_names, states=n_states, source=source, widths=widths,
                    tree=step_fd, where=where)
+
+
+def _pin_test(test: ast.expr, pins: Set[str]) -> Optional[Tuple[str, Optional[bool], int]]:
+    """A test of an input against a constant: (the input, True for ==, False for !=,
+    the constant); a test of an input alone, (it, None, 0): true unless 0."""
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        t = _pin_test(test.operand, pins)
+        if t and t[1] is None:
+            return t[0], True, 0                     # (not x: x == 0)
+        if t:
+            return t[0], not t[1], t[2]
+        return None
+    if isinstance(test, ast.Name) and test.id in pins:
+        return test.id, None, 0
+    if isinstance(test, ast.Compare) and len(test.ops) == 1 \
+            and isinstance(test.ops[0], (ast.Eq, ast.NotEq)):
+        a, b = test.left, test.comparators[0]
+        if isinstance(b, ast.Name) and isinstance(a, ast.Constant):
+            a, b = b, a
+        if isinstance(a, ast.Name) and a.id in pins and isinstance(b, ast.Constant) \
+                and isinstance(b.value, int):
+            return a.id, isinstance(test.ops[0], ast.Eq), b.value
+    return None
+
+
+def _decide(test: ast.expr, known: Dict[str, int], pins: Set[str]) -> Optional[bool]:
+    """The test's value if what's known (the inputs', the locals set to constants)
+    decides it."""
+    v = _value(test, known)
+    return None if v is None else bool(v)
+
+
+_OPS = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
+        ast.BitAnd: lambda a, b: a & b, ast.BitOr: lambda a, b: a | b,
+        ast.BitXor: lambda a, b: a ^ b, ast.RShift: lambda a, b: a >> b,
+        ast.LShift: lambda a, b: a << b}
+_CMP = {ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b, ast.Lt: lambda a, b: a < b,
+        ast.LtE: lambda a, b: a <= b, ast.Gt: lambda a, b: a > b, ast.GtE: lambda a, b: a >= b}
+
+
+def _value(e: ast.expr, known: Dict[str, int]) -> Optional[int]:
+    """e's value, if it's of constants and known names only."""
+    if isinstance(e, ast.Constant) and isinstance(e.value, int):
+        return int(e.value)
+    if isinstance(e, ast.Name):
+        return known.get(e.id)
+    if isinstance(e, ast.UnaryOp):
+        v = _value(e.operand, known)
+        if v is None:
+            return None
+        return {ast.Not: lambda: int(not v), ast.USub: lambda: -v, ast.Invert: lambda: ~v,
+                ast.UAdd: lambda: v}.get(type(e.op), lambda: None)()
+    if isinstance(e, ast.BinOp) and type(e.op) in _OPS:
+        a, b = _value(e.left, known), _value(e.right, known)
+        if a is None or b is None or (isinstance(e.op, (ast.LShift, ast.RShift)) and b < 0):
+            return None
+        return _OPS[type(e.op)](a, b)
+    if isinstance(e, ast.Compare) and len(e.ops) == 1 and type(e.ops[0]) in _CMP:
+        a, b = _value(e.left, known), _value(e.comparators[0], known)
+        return None if a is None or b is None else int(_CMP[type(e.ops[0])](a, b))
+    if isinstance(e, ast.BoolOp):
+        vals = [_value(x, known) for x in e.values]
+        if isinstance(e.op, ast.And):
+            if any(v == 0 for v in vals if v is not None):
+                return 0
+            return None if None in vals else int(all(vals))
+        if any(v for v in vals if v is not None):
+            return 1
+        return None if None in vals else 0
+    return None
+
+
+def _facts(test: ast.expr, pins: Set[str]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """What the test says of an input's value: (if it's true, if it's false)."""
+    t = _pin_test(test, pins)
+    if t is None:
+        return {}, {}
+    name, eq, c = t
+    if eq is None:
+        return {}, {name: 0}
+    return ({name: c}, {}) if eq else ({}, {name: c})
 
 
 def _function(name: str, params: List[str], body: List[ast.stmt], returned: List[str],
@@ -1108,52 +1370,38 @@ def _sub_attrs(s: System, attr: Dict[str, Any], layout,
     return out
 
 
-def _simulate_system(s: System, inputs: Sequence[Any], attr: Dict[str, Any],
-                     outputs: Optional[Sequence[str]]) -> List[Dict[str, int]]:
-    layout = _layout(s)
-    _, ext, ext_in, ext_out = layout
-    sub = _sub_attrs(s, attr, layout)
-    runs = {p: _Runner(f, sub[p]) for p, f in s.processes.items()}
-    names = [ext[k] for k in ext_in]
-    outputs = list(outputs or [ext[k] for k in ext_out])
-    rows = []
-    for k, vec in enumerate(inputs):
-        values = vec if isinstance(vec, dict) else dict(zip(names, vec))
-        now = {p: {o: getattr(r.port, o) for o in r.outs} for p, r in runs.items()}
-        row = {ext[(p, o)]: v for p, d in now.items() for o, v in d.items()}
-        rows.append({o: row[o] for o in outputs})
-        for p, r in runs.items():
-            for n in r.ins:
-                q = s.wires.get((p, n))
-                setattr(r.port, n, now[q[0]][q[1]] if q else values.get(ext[(p, n)], 0))
-        for r in runs.values():
-            r.clock(k)
-    return rows
-
-
 def _compile_system(s: System, attr: Dict[str, Any]) -> Process:
     """The processes' clock functions as one: each one's state its own (named
     <process>_<name>), the outputs' registers first read (the pins' values this
     clock, what a wire carries), then each process's clock."""
     layout = _layout(s)
     pins, ext, ext_in, ext_out = layout
-    # (a process once its wired inputs' formats are known: its outputs' as built)
+    # (a wired input: its output's format as built; wires both ways, a bit to
+    # begin with, until the formats settle)
     built: Dict[str, Process] = {}
-    while len(built) < len(s.processes):
+
+    def formats(b: Dict[str, Process]):
+        return {(p, o): (pr.attr[o]["width"], pr.attr[o].get("signed", 0))
+                for p, pr in b.items() for o in pr.outputs}
+    for _ in range(8):
         sub = _sub_attrs(s, attr, layout, built)
-        ready = [p for p in s.processes if p not in built
-                 and all("width" in sub[p][n] for n in pins[p][0])]
-        if not ready:
-            p = next(p for p in s.processes if p not in built)
-            n = next(n for n in pins[p][0] if "width" not in sub[p][n])
-            raise ProcessError(f"{s.name}.{p}: give the input '{n}' its width in attr"
-                               + (" (its wire's output's isn't known before it)"
-                                  if (p, n) in s.wires else ""))
-        for p in ready:
+        for p, (ins, _) in pins.items():
+            for n in ins:
+                if (p, n) in s.wires and "width" not in sub[p][n]:
+                    sub[p][n].update(width=1, signed=0)
+        new = {}
+        for p, f in s.processes.items():
             try:
-                built[p] = compile_process(s.processes[p], sub[p])
+                new[p] = compile_process(f, sub[p])
             except ProcessError as e:
                 raise ProcessError(f"{s.name}.{p}: {e}") from None
+        settled = bool(built) and formats(new) == formats(built)
+        built = new
+        if settled:
+            break
+    else:
+        raise ProcessError(f"{s.name}: the wires' widths don't settle: give the outputs on them "
+                           f"their widths in attr")
     params = [ext[k] for k in ext_in]
     returned = [ext[k] for k in ext_out]
     copies: List[ast.stmt] = []
