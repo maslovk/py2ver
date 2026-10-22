@@ -381,6 +381,11 @@ class PinsMixin:
         qsf += ("\n# The design (py2ver PINS())\n"
                 "set_global_assignment -name VERILOG_FILE DE0_Nano.v\n"
                 f"set_global_assignment -name VERILOG_FILE {self.t_name}.v\n")
+        # (an open-drain pin: the FPGA's weak pull-up, its line high when nobody pulls it)
+        outs = self._pin_map()[1]
+        for o in getattr(self, "_opens", {}):
+            for pin in outs.get(o, []):
+                qsf += f"set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to {pin}\n"
         (project_dir / f"{name}.qsf").write_text(qsf, encoding="utf-8")
         shutil.copy(DEFAULT_TEMPLATE_DIR / "hw" / "de0_nano_sdc.txt", project_dir / "DE0_Nano.SDC")
         (project_dir / "DE0_Nano.v").write_text(self.board_top(signaltap), encoding="utf-8")

@@ -663,7 +663,9 @@ class _Expander:
                     if n.id in consts:
                         return ast.copy_location(_value_node(consts[n.id]), n)
                     v = env.get(n.id)
-                    if n.id not in stored and isinstance(v, (int, bytes)):
+                    # (the module's constants: an int, bytes, a tuple of ints, a table)
+                    if n.id not in stored and (isinstance(v, (int, bytes)) or (
+                            isinstance(v, tuple) and v and all(type(e) is int for e in v))):
                         return ast.copy_location(_value_node(v), n)
                 return n
 

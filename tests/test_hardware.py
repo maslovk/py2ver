@@ -25,7 +25,34 @@ def test_the_generator_says_what_the_board_must_answer():
     assert p.jtag_reference(b"hello") == b"hello"
 
 
+import accelerometer as A  # noqa: E402
 import jtag_console as C  # noqa: E402
+
+
+def test_an_accelerometer_read_on_a_bus():
+    # (an ADXL345's registers played by examples/i2c.py's memory: X, Y, Z from 0x32)
+    mem = {0x32: 0x03, 0x33: 0x00, 0x34: 0xF1, 0x35: 0xFF, 0x36: 0x1F, 0x37: 0x01}
+    import functools
+    p = _quiet(functools.partial(A.accelerometer, q=4, period=100), A.ATTR)
+    text = p.check(A.with_a_memory(mem, A.ADXL345, transfers=8, until=b"z=0x011F\n"),
+                   verilog=False).value
+    assert text == b"adxl345: measuring\nx=0x0003 y=0xFFF1 z=0x011F\n"
+    assert A.readings(text) == [(3, -15, 287)]
+    assert mem[A.POWER_CTL] == 0x08                                # (measuring: switched on)
+
+
+@pytest.mark.hardware
+def test_the_board_s_accelerometer_feels_gravity(quartus):
+    p = _quiet(A.accelerometer, A.PINS)
+    p.PINS(quartus)
+    p.PROGRAM(quartus)
+    with p.jtag_uart(quartus) as link:
+        text = link.read(timeout=3)
+    assert text.startswith(b"adxl345: measuring\n")
+    got = A.readings(text)
+    assert len(got) >= 5
+    for x, y, z in got:                                      # (1 g, whichever way it lies)
+        assert 200 <= (x * x + y * y + z * z) ** 0.5 <= 330
 
 FIELDS = [("byte_", 0, 8), ("valid", 8, 1), ("ready", 9, 1)]
 

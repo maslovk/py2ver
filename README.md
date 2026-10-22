@@ -377,6 +377,7 @@ in the generator, the model and the Verilog (on the EP4CE22, each meets
 | `examples/spi.py` | SPI master and slave (mode 0) on one bus, exchanging bytes | 76, 70 | 38, 33 | 250, 243 MHz |
 | `examples/ws2812.py` | WS2812 LED driver; its testbench reads the line as an LED does | 201 | 49 | 135 MHz |
 | `examples/i2c.py` | I2C master (100 kHz, clock stretching) writing and reading a register; its testbench plays a memory chip | 285 | 79 | 166 MHz |
+| `examples/accelerometer.py` | the board's ADXL345 over its I2C bus, X, Y, Z on the JTAG console (run on a DE0-Nano: 1 g lying flat) | 1244 | 136 | 92 MHz |
 
 (250 MHz is the device's limit, Quartus's *restricted* Fmax.)
 
@@ -1358,7 +1359,7 @@ The board's top module (`DE0_Nano`):
 
 Ports without a pin are tied off (inputs to 0, outputs unconnected), and a
 GPIO pin that no output drives floats. The GPIO pins are 3.3-V LVTTL (not
-5-V tolerant), and no pull-ups are enabled.
+5-V tolerant); an open-drain pin gets the FPGA's weak pull-up, the others none.
 
 `PINS()` compiles the project with Quartus and reports its area and timing
 as `SYN()` does. It does not program the board: load
@@ -1631,7 +1632,8 @@ forward pass and a step of its training loop (autograd, AdamW, a one-cycle
 schedule), a decimate-by-4 filter fed one sample per handshake, a receiver chain built from plain Python functions,
 a histogram in block RAM, pipelined SHA-256 rounds, a UART's transmitter
 and receiver written as generators, connected as an echo, an SPI master and
-slave, a WS2812 LED driver, and an I2C master). Each checks the
+slave, a WS2812 LED driver, an I2C master, and the board's accelerometer
+read over its I2C bus). Each checks the
 hardware against Python in simulation, and optionally on the virtual board, in
 Quartus, or on the real board:
 

@@ -424,8 +424,18 @@ Verilog.
 
 On the board, the pin is pulled low or left floating. Its input comes from
 the same pin, through the usual two registers. Use a GPIO pin, or the
-board's own `I2C_SCLK` and `I2C_SDAT`. The FPGA's pull-ups aren't enabled,
-so a GPIO bus needs its pull-up resistors (a few kΩ to 3.3 V).
+board's own `I2C_SCLK` and `I2C_SDAT`. An open-drain pin gets the FPGA's
+weak pull-up, so its line is high when nobody pulls it. That is enough for
+the board's own I2C bus at 100 kHz; a longer bus on GPIO wants pull-up
+resistors as well (a few kΩ to 3.3 V).
+
+**The board's own I2C bus** (`I2C_SCLK`, `I2C_SDAT`) has its ADXL345
+accelerometer, at address 0x1D once `G_SENSOR_CS_N` is held high (its I2C
+mode). Something else acknowledges from 0x50 to 0x57 and reads `0xFF`, as
+an erased I2C EEPROM would. `examples/accelerometer.py` probes the bus, and
+reads the accelerometer's X, Y and Z five times a second onto the JTAG
+console. On a board lying flat it reads about `x=0x0003 y=0x000F z=0x011F`:
+Z is 1 g, about 256 counts at its ±2 g range.
 
 `examples/i2c.py` is an I2C master written from the bus's spec:
 
@@ -543,7 +553,7 @@ line.
 
 - The GPIO pins are 3.3-V LVTTL. They are not 5-V tolerant: a 5-V device
   such as a PS/2 keyboard needs a level shifter.
-- No pull-ups are enabled.
+- Pull-ups are enabled only on open-drain pins: the FPGA's weak ones.
 - A GPIO pin that no output drives is left floating. An open-drain pin
   (section 8) is pulled low or left floating.
 
