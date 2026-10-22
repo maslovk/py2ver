@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .ast_ir import Port
 from .defaults import (DEFAULT_SYN_DEVICE, DEFAULT_SYN_FAMILY, DEFAULT_SYN_PERIOD_NS,
@@ -70,7 +70,7 @@ class SynMixin:
 
     @staticmethod
     def _run_quartus(quartus_sh: str, project_dir: Path, revision: str, top: str,
-                     syn_attr: Dict[str, Any]) -> SynReport:
+                     syn_attr: Dict[str, Any], out_dir: Optional[Path] = None) -> SynReport:
         log.info("Running Quartus synthesis/fit/timing for %s...", top)
         result = subprocess.run(
             [quartus_sh, "--flow", "compile", revision],
@@ -87,7 +87,7 @@ class SynMixin:
 
         report = read_report(
             project_dir, revision, top,
-            float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)),
+            float(syn_attr.get("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)), out_dir=out_dir,
         )
         log.info("Synthesis report for %s:\n%s", top, report)
         return report

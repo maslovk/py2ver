@@ -306,10 +306,71 @@ assert sim == ref
 
 State arguments disappear from the module ports and become registers with a
 synchronous active-high `rst` and a clock enable `ce`. All returned values stay
-output ports. A stream returns every output for each sample, read before the
+output ports, but one marked `'internal': True` in attr (a next value only
+its register needs, a delay line's): it loads its register, and neither the
+module nor `PY_stream()` / `TB_stream()` show it. A stream returns every output for each sample, read before the
 clock edge that loads the next state. On the board, each `HW()` call is one
 sample and advances the state once; KEY0 or power-up resets it. State cannot
 yet be combined with `'type': 'reg'` signals.
+
+### Processes: protocols as generators
+
+A protocol is specified as a sequence in time: a UART's line low for a bit
+time, then eight bits, least significant first, then high. Written as a Python
+generator in which a `yield` is a clock, that is the hardware:
+
+```python
+BIT = 50_000_000 // 115_200            # 434 clocks a bit
+
+def uart_tx(port):
+    port.tx = 1
+    while True:
+        port.busy = 0
+        while not port.start:          # idle, the line high
+            yield
+        data = port.data
+        port.busy = 1
+        port.tx = 0                    # start bit
+        yield BIT
+        for i in range(8):
+            port.tx = (data >> i) & 1  # least significant bit first
+            yield BIT
+        port.tx = 1                    # stop bit
+        yield BIT
+
+attr = {'start': {'width': 1}, 'data': {'width': 8},
+        'tx': {'width': 1, 'init': 1}, 'busy': {'width': 1}}
+p = Py2ver(uart_tx, attr)              # a state machine: 6 states, 82 LUTs, 198 MHz
+clocks = [{'start': 1, 'data': 0x55}] + [{'start': 0}] * 5000
+assert p.TB_process()(clocks) == p.PY_process()(clocks) == p.GEN_process()(clocks)
+```
+
+The generator's one argument is its port: an attribute it reads and never
+writes is an input pin, sampled each clock; one it writes is an output, a
+register (what it writes is on the pin from the next clock). `yield` lets a
+clock pass, `yield n` n clocks (n an expression: a counter loaded with it); the
+code between two yields runs in one clock. Locals keep their values from
+clock to clock. A loop or an `if` that yields (`while`, `for ... in range`,
+with `break` and `continue`) becomes states; one that doesn't is logic within
+a clock. attr gives the pins their widths (an output's `'init'`: its value
+after reset); a local's width is followed from what's assigned to it (a
+`range`'s variable: its ends), else given in attr too.
+
+py2ver builds it as a function of one clock with its state (`process.py`:
+the state's number, the clocks left to wait, the locals, the outputs, each a
+register, see "State registers"), so a process is built, simulated and
+synthesized as any design with state. The generator itself is the
+reference: `GEN_process()` runs it a clock at a time, each clock's inputs a
+dict, each clock's outputs a dict, as `PY_process()` (the machine's model) and
+`TB_process()` (its Verilog) do. A `while` that waits without a yield, or a
+value that grows without end, is an error saying so.
+The module's ports are the pins (`uart_tx(data, start, clk, rst, ce) -> tx,
+busy`): the state's registers and their next values have none (`'internal'`).
+`examples/uart.py` is a UART's transmitter and receiver (the receiver samples
+mid-bit, takes a sender 3 % off, flags a missing stop bit: 81 LUTs, 34
+registers, 250 MHz); `tests/test_process.py` sends frames through both, the
+generators, the models and the Verilog the same. A process's pins go on
+the board's with `'pin'` (see "On the board's own pins").
 
 ### Automatic pipelining
 
@@ -1247,6 +1308,39 @@ Options: `QUARTUS_DIR` (default: `quartus_sh` on `PATH`), `CLK_PERIOD_NS`
 (default 20), `DEVICE` (default `EP4CE22F17C6`), `FAMILY` (default
 `Cyclone IV E`). The project is written to `syn/<name>/`.
 
+### On the board's own pins (`'pin'`, `PINS()`)
+
+A port's `'pin'` attr puts it on a DE0-Nano pin, named as the board's pin
+assignments (`templates/hw/de0_nano_qsf.txt`) name it: `'LED[7:0]'` (the
+port's bit 0 on `LED[0]`), `'LED'` (from `LED[0]` up), `'GPIO_0[5]'`,
+`'GPIO_0_IN[1]'`, `'KEY[1]'`, `'SW[3:0]'`:
+
+```python
+attr = dict(RX, rx={'width': 1, 'pin': 'GPIO_0[0]'},       # examples/uart.py
+                data={'width': 8, 'pin': 'LED[7:0]'})
+p = Py2ver(uart_rx, attr)
+print(p.board_top())                 # the board's top, the design inside
+p.PINS({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
+# Device:          EP4CE22F17C6
+# Combinational:   75
+# Registers:       32
+# Fmax:            250.0 MHz ...
+```
+
+The board's top (`DE0_Nano`) clocks the design with `CLOCK_50`, holds it in
+reset at power-up and while `KEY[0]` is pressed (unless a port takes
+`KEY[0]`), its clock enable high. An input pin reaches its port through two
+registers (a pin changes whenever it likes; the second register's value is
+settled, two clocks late), an output port drives its pin, a GPIO pin no
+output drives floats. A port without a pin: an input 0, an output
+unconnected. A pin given twice, an input on an LED or an output on a key, a
+switch or a `GPIO_*_IN` pin is an error saying so.
+
+`PINS()` compiles it with Quartus and reports as `SYN()` does (the area the
+whole board project's); nothing is programmed. The project
+(`syn/<name>_pins/`, its `DE0_Nano.sof`) is the board's: program it with
+Quartus's programmer. A design with the SDRAM goes on the board with `HW()`.
+
 ### On the board (`HW()`) and the virtual board (`HW_sim()`)
 
 `HW()` builds the DE0-Nano project (UART link plus your module), programs the
@@ -1499,7 +1593,8 @@ training step with Adam (simulated), a convolutional network with pooling and
 dropout, its forward pass and its training step, a PyTorch MNIST network's
 forward pass and a step of its training loop (autograd, AdamW, a one-cycle
 schedule), a decimate-by-4 filter fed one sample per handshake, a receiver chain built from plain Python functions,
-a histogram in block RAM, and pipelined SHA-256 rounds). Each checks the
+a histogram in block RAM, pipelined SHA-256 rounds, and a UART's transmitter
+and receiver written as generators). Each checks the
 hardware against Python in simulation, and optionally on the virtual board, in
 Quartus, or on the real board:
 

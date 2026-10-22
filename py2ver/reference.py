@@ -103,11 +103,22 @@ class ReferenceMixin:
             return self.func(*bound.args, **bound.kwargs)
         return call
 
+    def _value_names(self) -> List[str]:
+        """The names of the values the function returns, in order: the ports'
+        and the 'internal' ones' (a register's next value without a port); the
+        ports' alone where they aren't all the returned names (a list returned
+        through the SDRAM)."""
+        names = getattr(self, "_returned_names", None)
+        if names is None or any(n not in names for n in self.output_args_list):
+            return list(self.output_args_list)
+        return names
+
     def _py_row(self, ret: Any) -> Tuple[int, ...]:
+        # (every returned value by its name: the ports' kept, an 'internal' one not)
+        values = dict(zip(self._value_names(), _flatten_outputs(ret)))
         return tuple(
-            self._wrap(int(v), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
-            for v, n, w in zip(_flatten_outputs(ret), self.output_args_list,
-                               self.output_args_width_list)
+            self._wrap(int(values[n]), w, int(self.attr.get(n, {}).get("signed", 0)) == 1)
+            for n, w in zip(self.output_args_list, self.output_args_width_list)
         )
 
     def hardware_random(self):
@@ -336,7 +347,7 @@ class ReferenceMixin:
             for mem, m in self._seq_mems.items():
                 mems[mem][:] = [self._wrap(int(v), m["width"], bool(m["signed"]))
                                 for v in mems[mem]]
-            row = {name: keep(name, v) for name, v in zip(self.output_args_list, ret)}
+            row = {name: keep(name, v) for name, v in zip(self._value_names(), ret)}
             outs.append(tuple(row[n] for n in self.output_args_list))
             state = {p: _state_value(p, lambda port: row[self.state_map[port]])
                      for p in self.state_params}

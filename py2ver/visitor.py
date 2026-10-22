@@ -727,6 +727,8 @@ class FunctionVisitor(ast.NodeVisitor):
                 return em
             if isinstance(node.op, ast.Invert):
                 return em
+            if isinstance(node.op, ast.Not):          # (not x: a bit, x == 0)
+                return {"width": 1, "signed": 0}
             return em
         if isinstance(node, ast.BoolOp):
             return {"width": 1, "signed": 0}
@@ -1008,6 +1010,7 @@ class FunctionVisitor(ast.NodeVisitor):
     def visit_USub(self, node): return "-"
     def visit_UAdd(self, node): return "+"
     def visit_Invert(self, node): return "~"
+    def visit_Not(self, node): return "!"
 
     def visit_BinOp(self, node: ast.BinOp):
         op_type = type(node.op)
@@ -1265,6 +1268,8 @@ class FunctionVisitor(ast.NodeVisitor):
                         env[k] = f"({v})"
                 elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
                     self._list_method(s.value, env)
+                elif isinstance(s, ast.Pass):
+                    pass
                 else:
                     raise NotImplementedError(
                         f"Unsupported statement type in combinational block: {type(s).__name__}"

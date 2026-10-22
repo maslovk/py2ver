@@ -61,6 +61,8 @@ from .reference import ReferenceMixin
 from .simulate import SimulationMixin, _drop_bytecode
 from .board import BoardMixin
 from .syn import SynMixin
+from .process import ProcessMixin
+from .pins import PinsMixin
 
 log = logging.getLogger(__name__)
 
@@ -178,7 +180,8 @@ def _check_options(given: Dict[str, bool]) -> None:
             raise error(message)
 
 
-class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixin):
+class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixin, ProcessMixin,
+             PinsMixin):
     """Main pipeline for Python → Verilog + optional testbench + Quartus + UART HW I/O."""
 
     t_name: str = ""
@@ -240,6 +243,19 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         from . import numpy_fe
         from .numpy_loops import _callable
         func = _callable(func)                       # (a torch module: its forward)
+        # (the board's pins of the ports, attr 'pin': PINS(), see pins.py)
+        self._pins = {k: v["pin"] for k, v in (attr or {}).items()
+                      if isinstance(v, dict) and "pin" in v}
+        # A process (a generator, a yield a clock): its clock's function and its
+        # state (see process.py)
+        from .process import compile_process, is_process
+        if is_process(func):
+            self._process_attr = normalize_attr(attr)
+            self.process = compile_process(func, self._process_attr)
+            func, attr = self.process.step, self.process.attr
+        # (returned values that are 'internal': a register's next value, no port)
+        self._internal = {k for k, v in (attr or {}).items()
+                          if isinstance(v, dict) and v.get("internal")}
         if numpy_fe.needs_frontend(func):
             from . import numpy_loops
             given = list(samples) if samples is not None else []
@@ -362,6 +378,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         )
         # State updated in place and returned (next = itself) leaves on <name>_out
         self.state_map = {s: f_visitor.output_renames.get(n, n) for s, n in self.state_map.items()}
+        self._internal_ports = {f_visitor.output_renames.get(n, n) for n in self._internal}
         # Block-RAM memories: name -> {"length", "elem", ...}; final port names
         self.rams = {m: dict(r) for m, r in f_visitor._rams.items()}
         self._ram_ports = dict(f_visitor.ram_ports)
@@ -395,6 +412,9 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         if self.schedule and (self.rams or ir.has_clk):
             raise NotImplementedError("fold can't be combined with block RAM or 'reg' signals yet")
         pre_inputs = list(ir.inputs)
+        # (every returned value, in order: an 'internal' one too, a register's next
+        # value without a port)
+        self._returned_names = [p.name for p in ir.outputs if p.kind != "vout"]
         self._ext_inputs: Dict[str, int] = {}     # (sdram=: an input's port -> its SDRAM address)
         if self.state_map or self.rams or self.schedule:
             ir = self._lower_state(ir, f_visitor.attr)
@@ -682,7 +702,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
             outputs=[p for p in ir.outputs if p.name not in
                      set(fold.regs.values()) | {r["index"] for r in roms.values()}
                      | {rf[k] for rf in rfs.values() for k in ("raddr", "we", "waddr", "wdata")}
-                     | ext_out],
+                     | ext_out | self._internal_ports],
             assigns=assigns,
             has_clk=True,
             items=ext_items + list(ir.items) + self._phase_items() + self._ram_items()

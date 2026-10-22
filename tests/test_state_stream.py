@@ -113,6 +113,20 @@ def test_fir7_stream_random_matches_python(sim_env):
 
 
 @pytest.mark.sim
+def test_a_next_value_without_a_port(sim_env):
+    # ('internal': the delay line's next values load their registers, no ports)
+    attr = _fir7_attr()
+    for i in range(1, 7):
+        attr[f"nd{i}"]["internal"] = True
+    p = Py2ver(fir7_step, attr)
+    assert [q.name for q in p.ir.outputs] == ["y"] and p.output_args_list == ["y"]
+    xs = [((i * 7919) % 4001) - 2000 for i in range(64)]
+    every = Py2ver(fir7_step, _fir7_attr()).PY_stream()(xs)
+    assert p.PY_stream()(xs) == [(r[0],) for r in every]
+    assert p.TB_stream()(xs) == p.PY_stream()(xs)
+
+
+@pytest.mark.sim
 def test_accumulator_init_and_wraparound(sim_env):
     attr = {
         "x": {"signed": 0, "width": 8, "type": "wire"},
