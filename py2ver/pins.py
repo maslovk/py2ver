@@ -23,6 +23,7 @@ import hashlib
 import logging
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -389,6 +390,66 @@ class PinsMixin:
         self._copy_hdl(project_dir, f"{self.t_name}.v")
         log.info("The design on the board's pins: %s", project_dir)
         return project_dir
+
+    def PROGRAM(self, syn_attr: Optional[Dict[str, Any]] = None, cable: str = "1") -> None:
+        """Load the PINS() build (syn/<name>_pins/DE0_Nano.sof) into the board's
+        FPGA over JTAG (its memory: a power cycle forgets it; the board's flash is
+        left as it is). cable: as jtagconfig names it, or its number."""
+        from .jtag_uart import find_tool
+        sof = self._pins_dir / "DE0_Nano.sof"
+        if not sof.exists():
+            raise FileNotFoundError(f"{sof}: run PINS() first")
+        pgm = find_tool("quartus_pgm", (syn_attr or {}).get("QUARTUS_DIR"))
+        result = subprocess.run([pgm, "-c", cable, "-m", "JTAG", "-o", f"p;{sof}"],
+                                capture_output=True, text=True)
+        if result.returncode != 0 or "Configuration succeeded" not in result.stdout:
+            errors = [l for l in result.stdout.splitlines() if "Error" in l]
+            raise RuntimeError(f"quartus_pgm failed: " + "\n".join(errors[-5:] or
+                                                                  result.stdout.splitlines()[-5:]))
+        log.info("Programmed %s", sof)
+
+    def jtag_uart(self, syn_attr: Optional[Dict[str, Any]] = None, cable: Optional[str] = None):
+        """A connection to the board's JTAG UART (jtag_uart.JtagUart): write()
+        bytes to the design running there, read() what it sends."""
+        from .jtag_uart import JtagUart
+        return JtagUart((syn_attr or {}).get("QUARTUS_DIR"), cable)
+
+    def jtag_reference(self, data: bytes, settle: int = 100_000) -> bytes:
+        """The bytes the design sends the PC for data sent to it over the JTAG
+        UART, by its generator: a testbench playing the board's JTAG UART (a
+        byte given while the design is ready, each byte sent taken, room for it
+        always), ending settle clocks after the last byte sent back. What the
+        board must answer: link.read(len(it))."""
+        from . import process
+        if self.process is None:
+            raise ValueError("jtag_reference(): a process's (a generator's)")
+        by = {pin: self._py_name.get(port, port) for port, pin in self._pins.items()
+              if pin in _JTAG}
+        missing = [p for p in ("JTAG_RX_DATA", "JTAG_RX_VALID", "JTAG_TX_DATA", "JTAG_TX_VALID")
+                   if p not in by]
+        if missing:
+            raise ValueError(f"jtag_reference(): no port on {', '.join(missing)}")
+
+        def tb(dut):
+            got, k, quiet = [], 0, 0
+            while quiet < settle:
+                if "JTAG_TX_READY" in by:
+                    setattr(dut, by["JTAG_TX_READY"], 1)
+                give = k < len(data) and (getattr(dut, by["JTAG_RX_READY"])
+                                          if "JTAG_RX_READY" in by else 1)
+                setattr(dut, by["JTAG_RX_VALID"], int(bool(give)))
+                if give:
+                    setattr(dut, by["JTAG_RX_DATA"], data[k])
+                    k += 1
+                if getattr(dut, by["JTAG_TX_VALID"]):
+                    got.append(getattr(dut, by["JTAG_TX_DATA"]))
+                    quiet = 0
+                elif k == len(data):
+                    quiet += 1
+                yield
+            return bytes(got)
+        return process.drive(self.process.func, tb, self._process_attr,
+                             limit=settle + 100 * len(data) + 1_000_000).value
 
     def PINS(self, syn_attr: Optional[Dict[str, Any]] = None, signaltap: Any = None) -> SynReport:
         """

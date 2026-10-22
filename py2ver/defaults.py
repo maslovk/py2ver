@@ -13,3 +13,7 @@ DEFAULT_TB_PERIOD = 2000
 DEFAULT_SYN_FAMILY = "Cyclone IV E"
 DEFAULT_SYN_DEVICE = "EP4CE22F17C6"
 DEFAULT_SYN_PERIOD_NS = 20.0
+
+# Where Quartus installs its tools (the board's: juart-terminal, quartus_pgm), if
+# QUARTUS_DIR doesn't say and they aren't on PATH
+DEFAULT_QUARTUS_DIR = "/opt/intelFPGA/22.1std/quartus/bin"

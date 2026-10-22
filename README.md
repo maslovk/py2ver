@@ -1368,7 +1368,8 @@ the SDRAM goes on the board with `HW()` instead. A pin marked
 its line read back from the same pin. The JTAG UART's pins (`JTAG_RX_DATA`,
 `JTAG_RX_VALID`, `JTAG_TX_DATA`, `JTAG_TX_VALID`, ...) carry bytes to and
 from the PC over the USB-Blaster cable (`juart-terminal`, no serial adapter;
-`examples/jtag_echo.py`). `PINS(q, signaltap=True)` builds
+`examples/jtag_echo.py`; from Python: `PROGRAM()`, `jtag_uart()`, and
+`jtag_reference()` for what the generator answers). `PINS(q, signaltap=True)` builds
 SignalTap in too, recording the pins (with `Py2ver(..., probes=True)`, the
 process's state as well) on the board; `syn/<name>_pins/signaltap.txt` says
 which bits are which. See sections 8 and 9 of
@@ -1670,6 +1671,9 @@ everything:
   (`/opt/intelFPGA/22.1std/quartus/bin`); skipped if none of them has it.
 - `long`: minutes each (the mini Llama's training step simulated, its SDRAM
   design and the stages in Quartus): skipped unless pytest runs with `--long`.
+- `hardware`: on a DE0-Nano plugged in (`tests/test_hardware.py`: a design
+  compiled, programmed into the board and answering over the JTAG UART as
+  its generator does): skipped unless pytest runs with `--hardware`.
 
 The SDRAM controller is tested against py2ver's model of the chip, and also
 against Micron's MT48LC16M16A2 model (organized as the DE0-Nano's chip; not in

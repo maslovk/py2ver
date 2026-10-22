@@ -58,6 +58,9 @@ def _normalize_expected(py_out, p):
 def pytest_addoption(parser):
     parser.addoption("--long", action="store_true",
                      help="also run the checks marked long (minutes each)")
+    parser.addoption("--hardware", action="store_true",
+                     help="also run the checks marked hardware: on a DE0-Nano plugged in "
+                          "(they program it)")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -65,7 +68,10 @@ def pytest_collection_modifyitems(config, items):
     Quartus's, a quartus test, and slow (a compile: a minute or more). A long
     one runs only with --long."""
     long_skip = pytest.mark.skip(reason="minutes: run with --long")
+    hardware_skip = pytest.mark.skip(reason="a DE0-Nano plugged in: run with --hardware")
     for item in items:
+        if item.get_closest_marker("hardware") and not config.getoption("--hardware"):
+            item.add_marker(hardware_skip)
         if "assert_python_matches_sim" in getattr(item, "fixturenames", ()):
             item.add_marker(pytest.mark.sim)
         if "quartus" in getattr(item, "fixturenames", ()):

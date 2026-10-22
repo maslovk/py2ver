@@ -589,9 +589,28 @@ The board's top adds Intel's JTAG UART core (`alt_jtag_atlantic`), with a
 FIFO of 8 bytes from the PC and 16 to it. These pins are inside the FPGA, on
 the design's clock, so they don't go through the two input registers. On
 the PC, after programming the board, run `juart-terminal` (in Quartus's
-`bin` directory) and type. It reads its standard input and writes its
-standard output, so a script can drive it too. The JTAG UART and SignalTap
-can be used together; both connect to the board through the same JTAG hub.
+`bin` directory) and type. The JTAG UART and SignalTap can be used
+together; both connect to the board through the same JTAG hub.
+
+From Python, the same design can be programmed, talked to, and checked
+against its generator:
+
+```py
+board.PINS(q)                                  # compile for the board
+board.PROGRAM(q)                               # load it into the FPGA (its RAM: the flash is left alone)
+expected = board.jtag_reference(b"hello")      # what the generator sends back: b'hello'
+with board.jtag_uart(q) as link:               # juart-terminal, through pipes
+    link.write(b"hello")
+    assert link.read(len(expected), timeout=5) == expected
+```
+
+`jtag_reference(data)` runs the generator with a testbench that behaves
+like the board's JTAG UART: a byte is given while the design is ready,
+every byte sent back is taken, and there's always room. It returns what the
+board must answer. `PROGRAM()` and `jtag_uart()` find Quartus's tools in
+`QUARTUS_DIR`, on `PATH`, or in `/opt/intelFPGA/22.1std/quartus/bin`.
+`tests/test_hardware.py` does all this on a board plugged in: run
+`pytest --hardware`.
 
 ### Debugging on the board with SignalTap
 
