@@ -71,6 +71,102 @@ def jtag_print_hex(port, value, digits, data="tx_data", send="tx_send", room="tx
         yield from jtag_send(port, d + 48 if d < 10 else d + 55, data, send, room)
 
 
+# ----------------------------- I2C (a controller's side) -----------------------------
+# SCL and SDA open drain ({'scl': {'open_drain': True}, ...}); q a quarter of SCL's
+# period in clocks (100 kHz at 50 MHz: 125). Checked on a DE0-Nano's ADXL345
+# (examples/accelerometer.py).
+
+def i2c_scl_high(port, q, scl="scl"):
+    """SCL let go, then waited for (a device may hold it low: clock stretching),
+    then held high half a period."""
+    setattr(port, scl, 1)
+    yield from wait_until(port, scl)
+    yield 2 * q
+
+
+def i2c_send_bit(port, bit, q, scl="scl", sda="sda"):
+    """A bit on SDA: set while SCL is low, taken by the device while it's high."""
+    setattr(port, sda, bit)
+    yield q
+    yield from i2c_scl_high(port, q, scl)
+    setattr(port, scl, 0)
+    yield q
+
+
+def i2c_receive_bit(port, q, scl="scl", sda="sda"):
+    """A bit from SDA: let go, and taken at the end of SCL's high half."""
+    setattr(port, sda, 1)
+    yield q
+    yield from i2c_scl_high(port, q, scl)
+    bit = getattr(port, sda)
+    setattr(port, scl, 0)
+    yield q
+    return bit
+
+
+def i2c_start(port, q, scl="scl", sda="sda"):
+    """A start (or a repeated start): SDA falls while SCL is high."""
+    setattr(port, sda, 1)
+    yield q
+    yield from i2c_scl_high(port, q, scl)
+    setattr(port, sda, 0)
+    yield 2 * q
+    setattr(port, scl, 0)
+    yield q
+
+
+def i2c_stop(port, q, scl="scl", sda="sda"):
+    """A stop: SDA rises while SCL is high; then the bus is free."""
+    setattr(port, sda, 0)
+    yield q
+    yield from i2c_scl_high(port, q, scl)
+    setattr(port, sda, 1)
+    yield 2 * q
+
+
+def i2c_write_byte(port, byte, q, scl="scl", sda="sda"):
+    """A byte out, most significant bit first; 1 if no one acknowledged it."""
+    for i in range(8):
+        yield from i2c_send_bit(port, (byte >> (7 - i)) & 1, q, scl, sda)
+    nack = yield from i2c_receive_bit(port, q, scl, sda)
+    return nack
+
+
+def i2c_read_byte(port, last, q, scl="scl", sda="sda"):
+    """A byte in, most significant bit first, then acknowledged (not if last: the
+    last one read)."""
+    data = 0
+    for i in range(8):
+        b = yield from i2c_receive_bit(port, q, scl, sda)
+        data = data | (b << (7 - i))
+    yield from i2c_send_bit(port, last, q, scl, sda)
+    return data
+
+
+def i2c_write_register(port, address, register, value, q, scl="scl", sda="sda"):
+    """A register of the device at address (7 bits) written; 1 if an acknowledge
+    was missing."""
+    yield from i2c_start(port, q, scl, sda)
+    n1 = yield from i2c_write_byte(port, address << 1, q, scl, sda)
+    n2 = yield from i2c_write_byte(port, register, q, scl, sda)
+    n3 = yield from i2c_write_byte(port, value, q, scl, sda)
+    yield from i2c_stop(port, q, scl, sda)
+    return n1 | n2 | n3
+
+
+def i2c_read_register(port, address, register, q, scl="scl", sda="sda"):
+    """A register of the device at address read (its number written, then a
+    repeated start): the value, and 256 more if an acknowledge was missing."""
+    yield from i2c_start(port, q, scl, sda)
+    n1 = yield from i2c_write_byte(port, address << 1, q, scl, sda)
+    n2 = yield from i2c_write_byte(port, register, q, scl, sda)
+    yield from i2c_start(port, q, scl, sda)
+    n3 = yield from i2c_write_byte(port, (address << 1) | 1, q, scl, sda)
+    value = yield from i2c_read_byte(port, 1, q, scl, sda)
+    yield from i2c_stop(port, q, scl, sda)
+    return value | ((n1 | n2 | n3) << 8)
+
+
 def wait_cycles(n):
     """n clocks pass."""
     yield n

@@ -1,5 +1,5 @@
 # The DE0-Nano's own I2C bus: its ADXL345 accelerometer (and what else answers),
-# read with examples/i2c.py's steps, the answers printed on the JTAG console
+# read with py2ver.protocol's I2C steps, the answers printed on the JTAG console
 # (see docs/processes.md, the guide).
 #
 #   python examples/accelerometer.py             # the testbench (a memory on the bus)
@@ -11,23 +11,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from i2c import Q, read_byte, start, stop, write_byte  # noqa: E402
-from py2ver.protocol import jtag_print, jtag_print_hex  # noqa: E402
+from py2ver.protocol import (i2c_read_byte, i2c_read_register, i2c_start,  # noqa: E402
+                             i2c_stop, i2c_write_byte, i2c_write_register, jtag_print,
+                             jtag_print_hex)
 
+Q = 50_000_000 // 100_000 // 4           # a quarter of a 100 kHz SCL period: 125 clocks
 ADDRESSES = (0x53, 0x1D, 0x50)           # the ADXL345 (its ALT ADDRESS low, or high); an EEPROM
-
-
-def read_register(port, address, register, q):
-    """A register of the device at address: written its number, then read
-    (a repeated start); the value, and 1 if an acknowledge was missing."""
-    yield from start(port, q)
-    n1 = yield from write_byte(port, address << 1, q)
-    n2 = yield from write_byte(port, register, q)
-    yield from start(port, q)
-    n3 = yield from write_byte(port, (address << 1) | 1, q)
-    value = yield from read_byte(port, 1, q)
-    yield from stop(port, q)
-    return value | ((n1 | n2 | n3) << 8)
 
 
 def i2c_probe(port, q=Q):
@@ -40,7 +29,7 @@ def i2c_probe(port, q=Q):
     yield from jtag_print(port, b"i2c probe\n")
     for k in range(len(ADDRESSES)):
         address = ADDRESSES[k]
-        got = yield from read_register(port, address, 0, q)
+        got = yield from i2c_read_register(port, address, 0, q)
         yield from jtag_print(port, b"0x")
         yield from jtag_print_hex(port, address, 2)
         yield from jtag_print(port, b": register 0 = 0x")
@@ -59,16 +48,6 @@ POWER_CTL, DATAX0 = 0x2D, 0x32           # (measure: 0x08; X, Y, Z: 6 bytes from
 PERIOD = 10_000_000                      # 0.2 s at 50 MHz between readings
 
 
-def write_register(port, address, register, value, q):
-    """A register of the device at address written; 1 if an acknowledge was missing."""
-    yield from start(port, q)
-    n1 = yield from write_byte(port, address << 1, q)
-    n2 = yield from write_byte(port, register, q)
-    n3 = yield from write_byte(port, value, q)
-    yield from stop(port, q)
-    return n1 | n2 | n3
-
-
 def print_axis(port, name, value):
     yield from jtag_print(port, name)
     yield from jtag_print_hex(port, value, 4)
@@ -81,25 +60,25 @@ def accelerometer(port, q=Q, period=PERIOD):
     port.sda = 1
     port.cs_n = 1
     yield 50_000
-    nack = yield from write_register(port, ADXL345, POWER_CTL, 0x08, q)
+    nack = yield from i2c_write_register(port, ADXL345, POWER_CTL, 0x08, q)
     yield from jtag_print(port, b"adxl345: ")
     if nack:
         yield from jtag_print(port, b"no answer\n")
     else:
         yield from jtag_print(port, b"measuring\n")
     while True:
-        yield from start(port, q)
-        yield from write_byte(port, ADXL345 << 1, q)
-        yield from write_byte(port, DATAX0, q)
-        yield from start(port, q)
-        yield from write_byte(port, (ADXL345 << 1) | 1, q)
-        x0 = yield from read_byte(port, 0, q)
-        x1 = yield from read_byte(port, 0, q)
-        y0 = yield from read_byte(port, 0, q)
-        y1 = yield from read_byte(port, 0, q)
-        z0 = yield from read_byte(port, 0, q)
-        z1 = yield from read_byte(port, 1, q)
-        yield from stop(port, q)
+        yield from i2c_start(port, q)
+        yield from i2c_write_byte(port, ADXL345 << 1, q)
+        yield from i2c_write_byte(port, DATAX0, q)
+        yield from i2c_start(port, q)
+        yield from i2c_write_byte(port, (ADXL345 << 1) | 1, q)
+        x0 = yield from i2c_read_byte(port, 0, q)
+        x1 = yield from i2c_read_byte(port, 0, q)
+        y0 = yield from i2c_read_byte(port, 0, q)
+        y1 = yield from i2c_read_byte(port, 0, q)
+        z0 = yield from i2c_read_byte(port, 0, q)
+        z1 = yield from i2c_read_byte(port, 1, q)
+        yield from i2c_stop(port, q)
         yield from print_axis(port, b"x=0x", x0 | (x1 << 8))
         yield from print_axis(port, b" y=0x", y0 | (y1 << 8))
         yield from print_axis(port, b" z=0x", z0 | (z1 << 8))

@@ -357,7 +357,7 @@ the board. It covers:
 - writing a protocol, and the rules for loops, ifs and widths;
 - steps with `yield from`, and the library in `py2ver.protocol`
   (`wait_until`, `wait_edge`, `shift_in`, `shift_out`, `uart_send`,
-  `uart_receive`, `debounced`);
+  `uart_receive`, `i2c_start`, `i2c_read_register`, ..., `jtag_print`, `debounced`);
 - when inputs are read and outputs change;
 - testbenches written as generators, and `check()`, which checks the
   generator, the model and the Verilog against each other in one call;

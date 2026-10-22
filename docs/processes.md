@@ -135,6 +135,11 @@ constant string):
 | `shift_in(port, pin, bits, clocks, msb_first=False)` | reads `bits` bits from the pin, one every `clocks` clocks, and returns the value |
 | `uart_send(port, pin, byte, bit)` | sends a UART frame |
 | `uart_receive(port, pin, bit)` | receives a UART frame and returns its byte |
+| `i2c_start(port, q)`, `i2c_stop(port, q)` | an I2C start (or repeated start), a stop; `q` a quarter of SCL's period in clocks |
+| `i2c_write_byte(port, byte, q)` | a byte out; returns 1 if it wasn't acknowledged |
+| `i2c_read_byte(port, last, q)` | a byte in, acknowledged unless `last` |
+| `i2c_write_register(port, address, register, value, q)` | a device's register written (returns 1 without an acknowledge) |
+| `i2c_read_register(port, address, register, q)` | a device's register read (its value; 256 more without an acknowledge) |
 | `jtag_send(port, byte)` | sends a byte to the PC over the JTAG UART (section 9) |
 | `jtag_print(port, b"text")` | sends a constant message to the PC: a debug console |
 | `jtag_print_hex(port, value, digits)` | sends a number to the PC in hexadecimal |
@@ -437,14 +442,17 @@ reads the accelerometer's X, Y and Z five times a second onto the JTAG
 console. On a board lying flat it reads about `x=0x0003 y=0x000F z=0x011F`:
 Z is 1 g, about 256 counts at its ±2 g range.
 
-`examples/i2c.py` is an I2C master written from the bus's spec:
+`py2ver.protocol`'s I2C steps (`i2c_start`, `i2c_write_byte`,
+`i2c_read_register`, ...) are the bus's spec written as generators:
 
 - start and stop conditions;
 - bits set while SCL is low and taken while it's high;
 - acknowledges;
-- a slave that holds SCL low makes it wait (clock stretching).
+- a device that holds SCL low makes them wait (clock stretching).
 
-It writes and reads one register of a device. Its testbench plays a
+Their pins are `scl` and `sda` unless you name others (`scl="i2c_clock"`).
+`examples/i2c.py` is a master built from them that writes and reads one
+register of a device. Its testbench plays a
 24LC02-style memory chip on the same two lines, acknowledging its own
 address and stretching the clock, and the master's write, read-back and
 missing acknowledge all check against the generator, the model and the

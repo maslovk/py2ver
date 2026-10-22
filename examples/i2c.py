@@ -1,7 +1,8 @@
 # I2C, from its spec to the FPGA: a master that writes and reads a register of a
-# device, written as the bus's spec says, as Python generators in which a yield is
-# a clock (see docs/processes.md, the guide), checked by a testbench that plays an
-# I2C memory chip on the same two open-drain lines.
+# device, with py2ver.protocol's I2C steps (written as the bus's spec says, as
+# Python generators in which a yield is a clock: see docs/processes.md, the guide),
+# checked by a testbench that plays an I2C memory chip on the same two open-drain
+# lines.
 #
 # The bus: SCL and SDA, each pulled up and pulled low by whoever drives it (open
 # drain: nobody drives a 1). A transfer begins with a start (SDA falls while SCL
@@ -17,81 +18,16 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py2ver.protocol import wait_until  # noqa: E402
+from py2ver.protocol import (i2c_read_byte, i2c_start, i2c_stop, i2c_write_byte,  # noqa: E402
+                             wait_until)
 
 CLOCK = 50_000_000
 Q = CLOCK // 100_000 // 4              # a quarter of a 100 kHz SCL period: 125 clocks
 
 
-# ----------------------------- the bus's steps -----------------------------
-
-def scl_high(port, q):
-    """SCL let go, then waited for (a slave may hold it low), then held high."""
-    port.scl = 1
-    yield from wait_until(port, "scl")
-    yield 2 * q
-
-
-def send_bit(port, bit, q):
-    """A bit on SDA: set while SCL is low, taken by the slave while it's high."""
-    port.sda = bit
-    yield q
-    yield from scl_high(port, q)
-    port.scl = 0
-    yield q
-
-
-def receive_bit(port, q):
-    """A bit from SDA: let go, and taken at the end of SCL's high half."""
-    port.sda = 1
-    yield q
-    yield from scl_high(port, q)
-    bit = port.sda
-    port.scl = 0
-    yield q
-    return bit
-
-
-def start(port, q):
-    """A start (or a repeated start): SDA falls while SCL is high."""
-    port.sda = 1
-    yield q
-    yield from scl_high(port, q)
-    port.sda = 0
-    yield 2 * q
-    port.scl = 0
-    yield q
-
-
-def stop(port, q):
-    """A stop: SDA rises while SCL is high; then the bus is free."""
-    port.sda = 0
-    yield q
-    yield from scl_high(port, q)
-    port.sda = 1
-    yield 2 * q
-
-
-def write_byte(port, byte, q):
-    """A byte out, most significant bit first; 1 if no one acknowledged it."""
-    for i in range(8):
-        yield from send_bit(port, (byte >> (7 - i)) & 1, q)
-    nack = yield from receive_bit(port, q)
-    return nack
-
-
-def read_byte(port, last, q):
-    """A byte in, most significant bit first, then acknowledged (not if it's the
-    last one read)."""
-    data = 0
-    for i in range(8):
-        b = yield from receive_bit(port, q)
-        data = data | (b << (7 - i))
-    yield from send_bit(port, last, q)
-    return data
-
-
 # ----------------------------- the master -----------------------------
+# (the bus's steps, as its spec says: py2ver.protocol's i2c_start, i2c_stop,
+# i2c_write_byte, i2c_read_byte, ...)
 
 def i2c_master(port, q=Q):
     """port.start (a clock high): a register of the device at port.address (7 bits)
@@ -109,17 +45,17 @@ def i2c_master(port, q=Q):
         read = port.read
         value = port.value
         port.busy = 1
-        yield from start(port, q)
-        n1 = yield from write_byte(port, address << 1, q)       # the device, to write
-        n2 = yield from write_byte(port, register, q)           # the register's number
+        yield from i2c_start(port, q)
+        n1 = yield from i2c_write_byte(port, address << 1, q)    # the device, to write
+        n2 = yield from i2c_write_byte(port, register, q)        # the register's number
         if read:
-            yield from start(port, q)                           # a repeated start
-            n3 = yield from write_byte(port, (address << 1) | 1, q)   # the device, to read
-            got = yield from read_byte(port, 1, q)              # one byte, the last
+            yield from i2c_start(port, q)                        # a repeated start
+            n3 = yield from i2c_write_byte(port, (address << 1) | 1, q)   # the device, to read
+            got = yield from i2c_read_byte(port, 1, q)           # one byte, the last
             port.got = got
         else:
-            n3 = yield from write_byte(port, value, q)
-        yield from stop(port, q)
+            n3 = yield from i2c_write_byte(port, value, q)
+        yield from i2c_stop(port, q)
         port.nack = n1 | n2 | n3
         port.done = 1
         yield
