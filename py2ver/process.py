@@ -106,6 +106,7 @@ class Process:
     parts: Dict[str, "Process"] = field(default_factory=dict)  # (a System's processes)
     notes: List[str] = field(default_factory=list)      # (the locals renamed)
     opens: Dict[str, str] = field(default_factory=dict)  # (an open-drain pin: its line's input)
+    probes: List[str] = field(default_factory=list)      # (its state: ports, with probes=True)
 
     def explain(self) -> str:
         """Its states, each where in the generator it waits, and its registers."""
@@ -1228,7 +1229,8 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
              for v in local_names if v.endswith("_v") and v[:-2] in inputs + outputs]
     return Process(func=func, step=step, attr=out_attr, inputs=inputs, outputs=outputs,
                    locals=local_names, states=n_states, source=source, widths=widths,
-                   tree=step_fd, where=where, notes=notes, opens={o: f"{o}_in" for o in opens})
+                   tree=step_fd, where=where, notes=notes, opens={o: f"{o}_in" for o in opens},
+                   probes=[PC, WAIT] + local_names)
 
 
 def _pin_test(test: ast.expr, pins: Set[str]) -> Optional[Tuple[str, Optional[bool], int]]:
@@ -1804,4 +1806,5 @@ def _compile_system(s: System, attr: Dict[str, Any]) -> Process:
                    outputs=[ext[k] for k in ext_out], locals=state, states=states,
                    source=source, tree=tree, parts={p: built[p] for p in s.processes},
                    opens={ext[(p, o)]: ext[(p, i)] for p, pr in built.items()
-                          for o, i in pr.opens.items()})
+                          for o, i in pr.opens.items()},
+                   probes=[f"{p}_{n}" for p in s.processes for n in built[p].probes])

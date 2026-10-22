@@ -195,7 +195,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
                  multipliers: int | None = None, rate: float | None = None,
                  clock: float = DEFAULT_CLK_FREQ, sequential: bool = False,
-                 sdram: Any = None, write: bool = True) -> None:
+                 sdram: Any = None, write: bool = True, probes: bool = False) -> None:
         """
         func: the function, as written (a method, numpy code, a torch module
         for its forward(), or a function looping over batches: one step of
@@ -227,6 +227,9 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         (default 50 MHz): fold / unroll / multipliers (for a sequenced design,
         its lanes) are chosen to fit, as small as possible, and the choice is
         printed (see choose.py).
+        probes: a process's state (its state's number __pc, its wait __wait, its
+        locals' next values) as ports too, for SignalTap on the board
+        (PINS(signaltap=True) records them).
         write: write the Verilog to hdl/ in the current directory now; with
         write=False nothing is written until a simulation, a project or
         write_hdl() needs it, and the Verilog is in self.verilog (every file
@@ -270,6 +273,11 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         # (returned values that are 'internal': a register's next value, no port)
         self._internal = {k for k, v in (attr or {}).items()
                           if isinstance(v, dict) and v.get("internal")}
+        # (probes: a process's state as ports, for SignalTap)
+        self._probes = set(self.process.probes) if probes and self.process else set()
+        if probes and not self.process:
+            raise ValueError("probes=True: a process's state as ports (a generator's)")
+        self._internal -= self._probes
         if numpy_fe.needs_frontend(func):
             from . import numpy_loops
             given = list(samples) if samples is not None else []
@@ -393,6 +401,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         # State updated in place and returned (next = itself) leaves on <name>_out
         self.state_map = {s: f_visitor.output_renames.get(n, n) for s, n in self.state_map.items()}
         self._internal_ports = {f_visitor.output_renames.get(n, n) for n in self._internal}
+        self._probe_ports = {f_visitor.output_renames.get(n, n) for n in self._probes}
         # Block-RAM memories: name -> {"length", "elem", ...}; final port names
         self.rams = {m: dict(r) for m, r in f_visitor._rams.items()}
         self._ram_ports = dict(f_visitor.ram_ports)

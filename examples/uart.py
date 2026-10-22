@@ -14,6 +14,8 @@
 #   python examples/uart.py --syn        # both in Quartus: 82 and 81 LUTs, 198 and 250 MHz
 #   python examples/uart.py --pins       # the echo on the DE0-Nano's serial pins (GPIO_0_RX,
 #                                        # GPIO_0_TX), the byte on the LEDs (compiled only)
+#   python examples/uart.py --pins --signaltap   # and SignalTap recording its pins and its
+#                                        # state on the board
 import os
 import sys
 
@@ -130,6 +132,9 @@ if __name__ == "__main__":
     print(f"the echo (the receiver and the transmitter connected): sent back "
           f"{bytes(r['data'] for r in back if r['valid'])!r}")
     if "--pins" in sys.argv[1:]:
-        board = Py2ver(echo(), ECHO_PINS)
-        print("the echo on the board's pins (syn/uart_echo_pins/DE0_Nano.sof):",
-              board.PINS(quartus))
+        # (--signaltap: SignalTap recording its pins and its state on the board)
+        tap = "--signaltap" in sys.argv[1:]
+        board = Py2ver(echo(), ECHO_PINS, probes=tap)
+        print("the echo on the board's pins (syn/uart_echo_pins/DE0_Nano.sof"
+              + (", SignalTap's bits in syn/uart_echo_pins/signaltap.txt" if tap else "") + "):",
+              board.PINS(quartus, signaltap=tap))

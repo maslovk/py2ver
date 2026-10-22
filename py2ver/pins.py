@@ -19,6 +19,7 @@ inputs 0, outputs unconnected.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import shutil
@@ -144,8 +145,9 @@ class PinsMixin:
                     raise ValueError(f"{pin} is an output pin: not for the input {port}")
         return ins, outs
 
-    def board_top(self) -> str:
-        """The Verilog of DE0_Nano: the board's pins, the design between them."""
+    def board_top(self, signaltap: Any = None) -> str:
+        """The Verilog of DE0_Nano: the board's pins, the design between them
+        (signaltap: SignalTap recording them too, see _signaltap)."""
         if self._sdram:
             raise ValueError("A design with the SDRAM goes on the board with HW()")
         ins, outs = self._pin_map()
@@ -209,13 +211,69 @@ class PinsMixin:
                     lines.append(f"    assign {g} = {len(pins[g])}'bz;")
                 else:
                     lines += [f"    assign {g}[{i}] = 1'bz;" for i in free]
-        lines += [f"    {self.t_name} u_design(", "        " + ",\n        ".join(conns) + ");",
-                  "endmodule", ""]
+        lines += [f"    {self.t_name} u_design(", "        " + ",\n        ".join(conns) + ");"]
+        if signaltap:
+            lines += self._signaltap(signaltap, ins)[0]
+        lines += ["endmodule", ""]
         return "\n".join(lines)
 
-    def gen_pins_project(self) -> Path:
+    def _signaltap(self, spec: Any, ins: Dict[str, List[str]]) -> Tuple[List[str], List[str]]:
+        """SignalTap in the board's top: (its Verilog, the map of its bits). spec:
+        True, or {'signals': [port names], 'depth': samples}; by default every
+        input on a pin (as the design gets it, after its two registers) and
+        every output (with probes=True, the process's state too)."""
+        spec = {} if spec is True else dict(spec)
+        sources = {p.name: (f"{p.name}_s2", p.width) for p in self.ir.inputs
+                   if p.kind == "input" and p.name in ins}
+        sources.update({p.name: (f"{p.name}_w", p.width) for p in self.ir.outputs})
+        names = list(spec.get("signals") or sources)
+        unknown = [n for n in names if n not in sources]
+        if unknown:
+            raise ValueError(f"SignalTap: no port {unknown} to record (the inputs on pins and "
+                             f"the outputs: {', '.join(sources)})")
+        bits = sum(sources[n][1] for n in names)
+        if bits > 4096:
+            raise ValueError(f"SignalTap: {bits} bits; at most 4096 ('signals': fewer)")
+        # (a depth of the buffer the device's memory holds easily, 256 Kbit at most of
+        # its 594: 4,096 samples of 61 bits, 82 us at 50 MHz; 16,384 of 13 bits)
+        depth = int(spec.get("depth")
+                    or max(128, min(32768, 1 << ((262144 // bits).bit_length() - 1))))
+        if depth & (depth - 1) or not 64 <= depth <= 131072:
+            raise ValueError(f"SignalTap: a depth of {depth}: a power of two, 64 to 131072")
+        crc = int(hashlib.md5(" ".join(f"{n}:{sources[n][1]}" for n in names).encode())
+                  .hexdigest()[:8], 16)
+        # (bit 0 the first signal's bit 0)
+        tap = "{" + ", ".join(sources[n][0] for n in reversed(names)) + "}"
+        mapping, k = [], 0
+        for n in names:
+            w = sources[n][1]
+            mapping.append(f"{n}\t{k if w == 1 else f'{k + w - 1}:{k}'}\t{w}")
+            k += w
+        params = {"sld_data_bits": bits, "sld_trigger_bits": bits, "sld_sample_depth": depth,
+                  "sld_ram_block_type": '"AUTO"', "sld_storage_qualifier_mode": '"OFF"',
+                  "sld_trigger_level": 1, "sld_trigger_in_enabled": 0,
+                  "sld_enable_advanced_trigger": 0, "sld_trigger_level_pipeline": 1,
+                  "sld_trigger_pipeline": 0, "sld_ram_pipeline": 0, "sld_counter_pipeline": 0,
+                  "sld_node_info": 806383104, "sld_incremental_routing": 0,
+                  "sld_node_crc_bits": 32, "sld_node_crc_hiword": crc >> 16,
+                  "sld_node_crc_loword": crc & 0xFFFF}
+        lines = [f"    // SignalTap: {', '.join(names)} ({bits} bits), {depth} samples a clock "
+                 f"apart; its",
+                 "    // trigger set and run in Quartus's SignalTap (File > Create/Update > "
+                 "Create SignalTap",
+                 "    // File from Design Instance(s)); signaltap.txt: which bits are which",
+                 "    sld_signaltap #(",
+                 ",\n".join(f"        .{k}({v})" for k, v in params.items()),
+                 "    ) u_signaltap (",
+                 f"        .acq_clk(clk),",
+                 f"        .acq_data_in({tap}),",
+                 f"        .acq_trigger_in({tap}));"]
+        return lines, ["signal\tbits\twidth"] + mapping
+
+    def gen_pins_project(self, signaltap: Any = None) -> Path:
         """The Quartus project of the design on the board's pins (PINS()): the
-        board's assignments, its clock's constraint, DE0_Nano and the design."""
+        board's assignments, its clock's constraint, DE0_Nano and the design
+        (with signaltap, SignalTap and signaltap.txt, its bits)."""
         project_dir = self._pins_dir
         if project_dir.is_dir():
             shutil.rmtree(project_dir)
@@ -228,20 +286,26 @@ class PinsMixin:
                 f"set_global_assignment -name VERILOG_FILE {self.t_name}.v\n")
         (project_dir / f"{name}.qsf").write_text(qsf, encoding="utf-8")
         shutil.copy(DEFAULT_TEMPLATE_DIR / "hw" / "de0_nano_sdc.txt", project_dir / "DE0_Nano.SDC")
-        (project_dir / "DE0_Nano.v").write_text(self.board_top(), encoding="utf-8")
+        (project_dir / "DE0_Nano.v").write_text(self.board_top(signaltap), encoding="utf-8")
+        if signaltap:
+            (project_dir / "signaltap.txt").write_text(
+                "\n".join(self._signaltap(signaltap, self._pin_map()[0])[1]) + "\n",
+                encoding="utf-8")
         self._copy_hdl(project_dir, f"{self.t_name}.v")
         log.info("The design on the board's pins: %s", project_dir)
         return project_dir
 
-    def PINS(self, syn_attr: Optional[Dict[str, Any]] = None) -> SynReport:
+    def PINS(self, syn_attr: Optional[Dict[str, Any]] = None, signaltap: Any = None) -> SynReport:
         """
         Compile the design on the DE0-Nano's own pins (each port's attr 'pin')
         with Quartus, its area and timing; nothing is programmed. syn_attr: as
-        SYN()'s ('QUARTUS_DIR'). The project: syn/<name>_pins.
+        SYN()'s ('QUARTUS_DIR'). The project: syn/<name>_pins. signaltap: True
+        (or {'signals': [...], 'depth': n}) for SignalTap recording the design's
+        pins (with probes=True, its state too) on the board.
         """
         syn_attr = dict(syn_attr or {})
         quartus_sh = self._quartus_sh(syn_attr)
-        project_dir = self.gen_pins_project()
+        project_dir = self.gen_pins_project(signaltap)
         syn_attr.setdefault("CLK_PERIOD_NS", DEFAULT_SYN_PERIOD_NS)
         # (the board's assignments keep the reports beside the project)
         return self._run_quartus(quartus_sh, project_dir, "DE0_Nano", self.t_name, syn_attr,

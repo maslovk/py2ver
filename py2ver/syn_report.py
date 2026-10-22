@@ -105,8 +105,12 @@ def _panel_rows(text: str, title: str) -> List[List[List[str]]]:
     return tables
 
 
+JTAG_CLOCK = "altera_reserved_tck"     # (SignalTap's, through the board's JTAG: not the design's)
+
+
 def parse_fmax(sta_rpt: str) -> Optional[float]:
-    """Worst (lowest) restricted Fmax over all corners' Fmax Summary panels."""
+    """Worst (lowest) restricted Fmax over all corners' Fmax Summary panels (the
+    design's clocks: not SignalTap's JTAG clock, altera_reserved_tck)."""
     vals: List[float] = []
     for rows in _panel_rows(sta_rpt, "Fmax Summary"):
         if not rows:
@@ -114,6 +118,8 @@ def parse_fmax(sta_rpt: str) -> Optional[float]:
         header = rows[0]
         col = header.index("Restricted Fmax") if "Restricted Fmax" in header else 0
         for row in rows[1:]:
+            if any(JTAG_CLOCK in cell for cell in row):
+                continue
             m = re.match(r"([\d.]+)\s*MHz", row[col]) if col < len(row) else None
             if m:
                 vals.append(float(m.group(1)))
@@ -121,13 +127,15 @@ def parse_fmax(sta_rpt: str) -> Optional[float]:
 
 
 def parse_setup_slack(sta_summary: str) -> Optional[float]:
-    """Worst setup slack over all corners in a .sta.summary."""
+    """Worst setup slack over all corners in a .sta.summary (the design's clocks:
+    not SignalTap's JTAG clock)."""
     slacks: List[float] = []
     current_type = ""
     for line in sta_summary.splitlines():
         if line.startswith("Type"):
             current_type = line.split(":", 1)[1]
-        elif line.startswith("Slack") and "Setup" in current_type:
+        elif line.startswith("Slack") and "Setup" in current_type \
+                and JTAG_CLOCK not in current_type:
             slacks.append(float(line.split(":", 1)[1]))
     return min(slacks) if slacks else None
 

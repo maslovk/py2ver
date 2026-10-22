@@ -1365,7 +1365,10 @@ as `SYN()` does. It does not program the board: load
 `syn/<name>_pins/DE0_Nano.sof` with Quartus's programmer. A design that uses
 the SDRAM goes on the board with `HW()` instead. A pin marked
 `{'open_drain': True}` (I2C's SCL and SDA) is pulled low or left floating,
-its line read back from the same pin. See sections 8 and 9 of
+its line read back from the same pin. `PINS(q, signaltap=True)` builds
+SignalTap in too, recording the pins (with `Py2ver(..., probes=True)`, the
+process's state as well) on the board; `syn/<name>_pins/signaltap.txt` says
+which bits are which. See sections 8 and 9 of
 [docs/processes.md](docs/processes.md) for more.
 
 ### On the board (`HW()`) and the virtual board (`HW_sim()`)

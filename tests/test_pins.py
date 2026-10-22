@@ -17,9 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "examples"))
 import uart as U  # noqa: E402
 
 
-def _quiet(f, attr):
+def _quiet(f, attr, **kw):
     with contextlib.redirect_stdout(io.StringIO()):
-        return Py2ver(f, attr)
+        return Py2ver(f, attr, **kw)
 
 
 def _receiver():
@@ -76,6 +76,36 @@ def test_unused_leds_are_off_and_pins_count_bits():
         _quiet(U.uart_tx, {"start": 1, "data": {"width": 8, "pin": "SW"}})
     with pytest.raises(ValueError, match=r"the port 'tx' \(1 bit\): GPIO_0\[1\]"):
         _quiet(U.uart_tx, {"start": 1, "data": 8, "tx": "GPIO_0[1]"})
+
+
+def test_signaltap_records_the_pins_and_the_state():
+    p = _quiet(U.echo(), dict(U.ECHO_PINS), probes=True)
+    probes = [q.name for q in p.ir.outputs][5:]
+    assert probes[:2] == ["rx___pc_out", "rx___wait_out"] and "tx_i_out" in probes
+    top = p.board_top(signaltap=True)
+    assert "sld_signaltap #(" in top and ".sld_node_info(806383104)" in top
+    assert ".sld_data_bits(61)" in top and ".sld_sample_depth(4096)" in top    # (61 bits: 4K)
+    assert ".acq_data_in({tx_i_out_w, " in top and ", valid_w, rx_s2})" in top  # (bit 0: rx)
+    mapping = p._signaltap(True, p._pin_map()[0])[1]
+    assert mapping[1:3] == ["rx\t0\t1", "valid\t1\t1"] and "data\t9:2\t8" in mapping
+    small = _quiet(U.echo(), dict(U.ECHO_PINS)).board_top(
+        signaltap={"signals": ["rx", "tx"], "depth": 8192})
+    assert ".sld_data_bits(2)" in small and ".acq_data_in({tx_w, rx_s2})" in small
+    assert "sld_signaltap" not in _quiet(U.echo(), dict(U.ECHO_PINS)).board_top()
+    with pytest.raises(ValueError, match="no port \\['rx___pc_out'\\]"):
+        _quiet(U.echo(), dict(U.ECHO_PINS)).board_top(signaltap={"signals": ["rx___pc_out"]})
+    with pytest.raises(ValueError, match="a depth of 1000"):
+        p.board_top(signaltap={"depth": 1000})
+    with pytest.raises(ValueError, match="probes=True: a process's state"):
+        Py2ver(lambda x: x + 1, {"x": 8}, probes=True)
+
+
+def test_signaltap_on_the_board_in_quartus(quartus):
+    p = _quiet(U.echo(), dict(U.ECHO_PINS), probes=True)
+    r = p.PINS(quartus, signaltap={"depth": 1024})
+    assert r.memory_bits == 61 * 1024                    # (its buffer)
+    assert r.fmax_mhz > 100 and r.meets_timing           # (the design's clock, not the JTAG's)
+    assert "rx___pc_out\t15:13\t3" in (p._pins_dir / "signaltap.txt").read_text()
 
 
 def test_processes_together_take_the_board_s_pins():

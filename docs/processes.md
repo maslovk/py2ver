@@ -547,6 +547,51 @@ line.
 most 250 MHz (the I/O toggle rate), even when the logic alone could run
 faster.
 
+### Debugging on the board with SignalTap
+
+SignalTap is Quartus's logic analyzer inside the FPGA. It records chosen
+signals at every clock into the device's memory while the design runs, and
+you read the record back over the USB-Blaster. `PINS(..., signaltap=True)`
+builds it into the board's project:
+
+```py
+board = Py2ver(echo(), {"rx": "GPIO_0_RX", "tx": "GPIO_0_TX", "data": "LED"}, probes=True)
+board.PINS({"QUARTUS_DIR": "/opt/intelFPGA/22.1std/quartus/bin"}, signaltap=True)
+# Memory bits:     249856        (61 signals' bits x 4,096 samples)
+# Fmax:            147.54 MHz    (the design's clock)
+```
+
+- **What it records.** By default, every input on a pin as the design gets
+  it (after its two registers), and every output. `probes=True` also puts
+  the process's state on ports: each process's state number (`__pc`), its
+  wait counter (`__wait`) and its locals, all as they will be at the next
+  clock. To record fewer signals, list them:
+  `signaltap={"signals": ["rx", "tx", "rx___pc_out"]}`.
+- **How long.** By default, the most samples that fit in 256 Kbit of the
+  device's 594 Kbit of memory: 4,096 samples (82 µs at 50 MHz) for the echo's
+  61 bits, and more for fewer bits. `"depth": 16384` sets it, as a power of
+  two.
+- **Which bit is which.** `syn/<name>_pins/signaltap.txt` lists each
+  signal's bits in the recording.
+
+To use it on the board:
+
+1. Load `syn/<name>_pins/DE0_Nano.sof`: with Quartus's programmer, or
+   `quartus_pgm -c USB-Blaster -m JTAG -o "p;syn/uart_echo_pins/DE0_Nano.sof"`.
+2. Open the project `syn/<name>_pins/DE0_Nano.qpf` in Quartus, then Tools >
+   Signal Tap Logic Analyzer. Choose File > Create/Update > Create SignalTap
+   File from Design Instance(s): this finds the `u_signaltap` instance.
+3. In SignalTap, choose the USB-Blaster as the hardware and the `.sof` as
+   the device's file. Set a trigger, for example `rx_s2` falling (a UART
+   start bit) or a state number. Then Run Analysis. Setting the trigger
+   needs no recompile.
+4. Read the states with `explain()`. A process's state number in the
+   record is the number `explain()` lists, with the line where it waits.
+
+SignalTap's logic adds about 700 LUTs and its memory. The design's clock
+keeps meeting 50 MHz. Quartus also reports SignalTap's JTAG clock
+(`altera_reserved_tck`), which `PINS()` leaves out of its Fmax and slack.
+
 ## 10. Error messages
 
 | message | meaning, and what to do |
