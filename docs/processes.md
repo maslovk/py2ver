@@ -639,19 +639,43 @@ board.PINS({"QUARTUS_DIR": "/opt/intelFPGA/22.1std/quartus/bin"}, signaltap=True
 - **Which bit is which.** `syn/<name>_pins/signaltap.txt` lists each
   signal's bits in the recording.
 
-To use it on the board:
+To capture from Python, load the build and call `CAPTURE()`:
 
-1. Load `syn/<name>_pins/DE0_Nano.sof`: with Quartus's programmer, or
-   `quartus_pgm -c USB-Blaster -m JTAG -o "p;syn/uart_echo_pins/DE0_Nano.sof"`.
-2. Open the project `syn/<name>_pins/DE0_Nano.qpf` in Quartus, then Tools >
-   Signal Tap Logic Analyzer. Choose File > Create/Update > Create SignalTap
-   File from Design Instance(s): this finds the `u_signaltap` instance.
-3. In SignalTap, choose the USB-Blaster as the hardware and the `.sof` as
-   the device's file. Set a trigger, for example `rx_s2` falling (a UART
-   start bit) or a state number. Then Run Analysis. Setting the trigger
-   needs no recompile.
-4. Read the states with `explain()`. A process's state number in the
-   record is the number `explain()` lists, with the line where it waits.
+```py
+board = Py2ver(jtag_echo, pins, probes=True)
+board.PINS(q, signaltap=True)
+board.PROGRAM(q)
+with board.jtag_uart(q) as link:
+    cap = board.CAPTURE(q, trigger={"valid": 1, "byte": ord("Z")},
+                        during=lambda: link.write(b"Z"))
+print(cap.show())
+#    -512  byte=65, valid=0, ..., __pc_out=1   [__pc_out: ... (in wait_until from examples/jtag_echo.py:26)]
+#       0  byte=90, valid=1, __pc_out=3   [__pc_out: examples/jtag_echo.py:33  yield]
+#       1  byte=65, valid=0, ready=0, send=1, __pc_out=1   [...]
+#       2  ready=1, send=0
+cap.write_vcd("capture.vcd")                   # for GTKWave or Surfer
+```
+
+- **The trigger.** `trigger` gives each port's value (every bit of it), or
+  `"rising"` / `"falling"` for a 1-bit port's edge. All of them must hold
+  at once. Without a trigger, the capture starts at once.
+- **What happens meanwhile.** `CAPTURE()` arms SignalTap, and a few seconds
+  later calls `during()`, which should make the trigger happen. Here it
+  sends a byte. If the trigger doesn't happen within `timeout` seconds
+  (30 by default), it raises `TimeoutError`.
+- **The record.** `cap.rows` has every sample's values by port name.
+  `cap.trigger` is the trigger's sample: by default an eighth of the way
+  into the record (512 of 4,096). `cap.changes()` lists only the samples
+  where something changes, counted from the trigger.
+- **States.** `cap.show()` names each state probe's value by its line in
+  the generator, as `explain()` lists it. `__pc_out` is the state the
+  process goes to next.
+
+Behind it, `quartus_stp` makes a SignalTap file (`.stp`) from the design's
+SignalTap instance, puts the trigger in it, runs it, and exports the record.
+Quartus's SignalTap window works on the same build too: open
+`syn/<name>_pins/DE0_Nano.qpf`, then Tools > Signal Tap Logic Analyzer,
+then File > Create/Update > Create SignalTap File from Design Instance(s).
 
 SignalTap's logic adds about 700 LUTs and its memory. The design's clock
 keeps meeting 50 MHz. Quartus also reports SignalTap's JTAG clock

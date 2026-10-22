@@ -1372,7 +1372,8 @@ from the PC over the USB-Blaster cable (`juart-terminal`, no serial adapter;
 `jtag_reference()` for what the generator answers). `PINS(q, signaltap=True)` builds
 SignalTap in too, recording the pins (with `Py2ver(..., probes=True)`, the
 process's state as well) on the board; `syn/<name>_pins/signaltap.txt` says
-which bits are which. See sections 8 and 9 of
+which bits are which, and `CAPTURE(q, trigger={...}, during=...)` captures
+from the board, every port by name and each state by its line. See sections 8 and 9 of
 [docs/processes.md](docs/processes.md) for more.
 
 ### On the board (`HW()`) and the virtual board (`HW_sim()`)

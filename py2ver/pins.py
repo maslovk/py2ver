@@ -408,6 +408,37 @@ class PinsMixin:
                                                                   result.stdout.splitlines()[-5:]))
         log.info("Programmed %s", sof)
 
+    def CAPTURE(self, syn_attr: Optional[Dict[str, Any]] = None,
+                trigger: Optional[Dict[str, Any]] = None, during=None, timeout: float = 30.0):
+        """
+        A SignalTap capture from the board running this design's PINS(signaltap=True)
+        build (PROGRAM() it first): armed, during() called a few seconds later (what
+        makes the trigger happen: link.write(b"A")), the record when it triggers.
+        trigger: {port: value} (every bit of it), or {port: 'rising' / 'falling'}
+        (a bit's edge), all at once; none: at once. Returns a signaltap.Capture:
+        .rows (each sample's values by port name), .trigger (its sample),
+        .changes(), .write_vcd(path). TimeoutError if it doesn't trigger.
+        """
+        from . import signaltap
+        from .jtag_uart import find_tool
+        project = self._pins_dir
+        if not (project / "signaltap.txt").exists():
+            raise FileNotFoundError(f"{project / 'signaltap.txt'}: PINS(signaltap=True) first, "
+                                    f"then PROGRAM()")
+        hw = getattr(self, "_hw_name", {})
+        cap = signaltap.capture(project, find_tool("quartus_stp", (syn_attr or {}).get("QUARTUS_DIR")),
+                                {hw.get(k, k): v for k, v in (trigger or {}).items()}, during,
+                                timeout, names=dict(getattr(self, "_py_name", {})))
+        # (the state probes: each state's line, as explain() has them)
+        pr = self.process
+        if pr is not None:
+            parts = pr.parts or {"": pr}
+            for p, part in parts.items():
+                name = f"{p}___pc_out" if p else "__pc_out"
+                if name in cap.widths:
+                    cap.states[name] = part.where
+        return cap
+
     def jtag_uart(self, syn_attr: Optional[Dict[str, Any]] = None, cable: Optional[str] = None):
         """A connection to the board's JTAG UART (jtag_uart.JtagUart): write()
         bytes to the design running there, read() what it sends."""
