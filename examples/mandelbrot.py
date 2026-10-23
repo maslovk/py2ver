@@ -58,21 +58,44 @@ VIEW = view()
 PALETTE = palette()
 
 
-def escape_count(port, cx, cy, max_iter):
-    """How many steps of z = z*z + c it takes z to leave the circle (max_iter if it never does)."""
+def escape_count(port, cx, cy, max_iter, frac=FRAC):
+    """How many steps of z = z*z + c it takes z to leave the circle (max_iter if it never does).
+
+    cx, cy and z are fixed point with `frac` fraction bits. The products of z
+    (xx, yy and xy) are kept in registers of their own, so that within a clock
+    cycle the adds come first and the multiplies after: one multiplier deep,
+    not two (which would be too slow at 50 MHz with many fraction bits).
+    """
     zx = 0
     zy = 0
     xx = 0                               # zx * zx
     yy = 0                               # zy * zy
+    xy = 0                               # 2 * zx * zy
     n = 0
-    while n < max_iter and xx + yy <= FOUR:
-        zy = ((zx * zy) >> (FRAC - 1)) + cy      # 2 * zx * zy + cy
-        zx = xx - yy + cx
-        xx = (zx * zx) >> FRAC
-        yy = (zy * zy) >> FRAC
+    while n < max_iter and xx + yy <= (4 << frac):
+        zx = xx - yy + cx                # z = z*z + c, from the products
+        zy = xy + cy
+        xx = (zx * zx) >> frac           # and the new z's products
+        yy = (zy * zy) >> frac
+        xy = (zx * zy) >> (frac - 1)
         n = n + 1
         yield
     return n
+
+
+def escape_widths(frac=FRAC):
+    """The escape loop's widths in attr, for `frac` fraction bits.
+
+    py2ver can't work them out (they depend on |z| <= 2, which links zx and
+    zy). Inside the loop |z| <= 2, so after the last step |zx|, |zy| <= 6.2:
+    under 8, so frac + 3 bits and a sign. Their squares stay under 64: frac + 6
+    bits and a sign; 2 * zx * zy under 128: frac + 7 bits and a sign. One more
+    bit each, to spare.
+    """
+    z = {"signed": 1, "width": frac + 5}
+    square = {"signed": 1, "width": frac + 8}
+    return {"zx": z, "zy": z, "xx": square, "yy": square,
+            "xy": {"signed": 1, "width": frac + 9}}
 
 
 def mandelbrot(port, area=VIEW, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER, colors=PALETTE):
@@ -91,14 +114,71 @@ def mandelbrot(port, area=VIEW, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER, c
                 yield from stream_send(port, colors[n], data="color")
 
 
-# The one input is ready (the next block can take a pixel). py2ver can't work
-# out how large z gets (that depends on |z| <= 2, which links zx and zy), so
-# the escape loop's widths are given: inside the loop |z| <= 2, so after the
-# last step |zx|, |zy| <= 6.2 (50,800 in fixed point: 18 signed bits), and
-# their squares need 21.
-ATTR = {"ready": 1,
-        "zx": {"signed": 1, "width": 18}, "zy": {"signed": 1, "width": 18},
-        "xx": {"signed": 1, "width": 21}, "yy": {"signed": 1, "width": 21}}
+# The one input is ready (the next block can take a pixel); and the escape
+# loop's widths, which py2ver can't work out (see escape_widths).
+ATTR = {"ready": 1, **escape_widths(FRAC)}
+
+
+# ----------------------------- the animation: zooming in -----------------------------
+
+ZOOM_FRAC = 24                           # more fraction bits: zooming in needs finer steps
+
+
+class Zoom(NamedTuple):
+    """An animation zooming in on a point, in fixed point with `frac` fraction bits.
+
+    cx, cy:    the point the picture stays centered on
+    start:     the first frame's distance between neighboring pixels
+    smallest:  the distance at which it starts over
+    shrink:    each frame the distance shrinks by 1/2**shrink (4: by 1/16)
+    """
+    cx: int
+    cy: int
+    start: int
+    smallest: int
+    shrink: int = 4
+    frac: int = ZOOM_FRAC
+
+
+def zoom(x=-0.743643887, y=0.131825904, start_width=3.2, end_width=0.0001, width=WIDTH,
+         frac=ZOOM_FRAC):
+    """A Zoom into the point (x, y): the picture first start_width across, then
+    narrower each frame until it is end_width across. (The default point is in
+    the "seahorse valley".)"""
+    scale = 1 << frac
+    return Zoom(round(x * scale), round(y * scale), round(start_width / width * scale),
+                max(1, round(end_width / width * scale)), frac=frac)
+
+
+ZOOM = zoom()
+
+
+def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER,
+                    colors=PALETTE):
+    """An animation: a picture after another, each zoomed in a little more on area's point.
+
+    Output stream: color (RGB565), valid; input: ready, as mandelbrot()'s.
+    """
+    port.valid = 0
+    step = area.start
+    while True:
+        x0 = area.cx - step * (width // 2)       # the top-left pixel, from the center
+        y0 = area.cy + step * (height // 2)
+        for row in range(height):
+            cy = y0 - row * step
+            for col in range(width):
+                cx = x0 + col * step
+                yield                    # a clock for the coordinates' multiply, before
+                                         # the escape loop's (one multiplier per clock)
+                n = yield from escape_count(port, cx, cy, max_iter, area.frac)
+                yield from stream_send(port, colors[n], data="color")
+        step = step - (step >> area.shrink) - 1  # zoom in (by 1 at least: once step is
+                                                 # under 2**shrink, step >> shrink is 0)
+        if step < area.smallest:
+            step = area.start                    # and start over
+
+
+ZOOM_ATTR = {"ready": 1, **escape_widths(ZOOM_FRAC)}
 
 
 def picture(width, height):

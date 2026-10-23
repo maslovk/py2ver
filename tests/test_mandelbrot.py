@@ -59,6 +59,53 @@ def test_the_picture_on_a_display(sim, monkeypatch, tmp_path):
     assert screen.on and screen.pixels == sent
 
 
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_a_zoom_frame_after_frame(sim, monkeypatch, tmp_path):
+    # Zooming in by half each frame, starting over after the third
+    monkeypatch.chdir(tmp_path)
+    w, h, iters = 8, 6, 8
+    area = M.zoom(start_width=3.2, end_width=0.5, width=w)._replace(shrink=1)
+    f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
+                          colors=M.palette(iters))
+    p = _quiet(f, M.ZOOM_ATTR)
+
+    def frames(count):
+        def tb(dut):
+            shots = []
+            for _ in range(count):
+                shot = yield from M.picture(w, h)(dut)
+                shots.append(shot)
+            return shots
+        return tb
+    shots = p.check(frames(4), verilog=sim).value
+    assert shots[0] != shots[1] != shots[2]                     # (each zoomed in further)
+    assert shots[3] == shots[0]                                 # (and from the start again)
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_a_zoom_starts_over_even_from_tiny_steps(sim, monkeypatch, tmp_path):
+    # Steps under 2**shrink, where step >> shrink is 0: the zoom used to stop
+    # shrinking at 15, short of smallest (7), stuck on one frame for ever. (4
+    # fraction bits: pixels far apart, so each step's frame looks different.)
+    monkeypatch.chdir(tmp_path)
+    w, h, iters = 4, 3, 4
+    area = M.Zoom(cx=-8, cy=0, start=40, smallest=7, shrink=4, frac=4)
+    f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
+                          colors=tuple(range(iters + 1)))
+    p = _quiet(f, {"ready": 1, **M.escape_widths(4)})
+
+    def frames(count):
+        def tb(dut):
+            shots = []
+            for _ in range(count):
+                shot = yield from M.picture(w, h)(dut)
+                shots.append(shot)
+            return shots
+        return tb
+    shots = p.check(frames(45), verilog=sim).value
+    assert shots[19] != shots[0] and shots[20:40] == shots[0:20]    # (20 frames, then again)
+
+
 def test_a_stream_hands_on_every_value_once():
     # A counter streaming 0, 1, 2, ... into a summing block that is sometimes slow
     def counter(port):
