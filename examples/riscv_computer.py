@@ -1,25 +1,30 @@
 # A RISC-V computer on the FPGA: a CPU written in Python, running C programs,
 # its console on the ILI9341 display and its keyboard the PC's.
 #
-# The CPU runs RV32I, RISC-V's base integer instructions, a clock to fetch an
-# instruction, a clock to decode it and read its registers, a clock (or a few,
-# for memory) to carry it out, a clock to write its result: about 12 million
-# instructions a second. Its memory:
+# The CPU runs RV32IMA with machine mode: the base integer instructions,
+# multiply and divide (M), atomics (A), the CSRs (Zicsr), traps and the timer's
+# interrupt. A clock to fetch an instruction, a clock to decode it and read its
+# registers, a clock or more to carry it out (memory, multiplying, dividing:
+# 32 clocks), a clock to write its result: about 12 million instructions a
+# second. Its memory is mini-rv32ima's (the small RISC-V emulator that boots
+# Linux), so that its Linux could run here later:
 #
-#   0x0000_0000  ROM, 16 KB: the program and its constants (built into the design)
-#   0x0001_0000  RAM, 4 KB: its variables and stack (a list in a memory block)
-#   0x1000_0000  write: a character on the screen (sent to terminal.py's terminal)
-#   0x1000_0004  read: a key typed on the PC (the JTAG UART), or -1 if none
-#   0x1000_0008  write: the 8 LEDs
-#   0x1000_000C  read: the keys KEY0, KEY1 (bits 0, 1; 0 while pressed)
+#   0x0000_0000  RAM, 16 KB: the program, loaded into it from the start (memory blocks)
+#   0x1000_0000  a 16550-style UART: write a character to the screen (terminal.py's
+#                terminal); read one typed on the PC (the JTAG UART); +5, its status
+#                (bit 0: a character came in, bit 5: room to write)
+#   0x1000_1000  write: the 8 LEDs;  0x1000_1004  read: the keys (bits 0, 1; 0 pressed)
+#   0x1100_4000  the timer's mtimecmp (and +4, its upper half): the interrupt at mtime
+#   0x1100_BFF8  mtime (and +4): microseconds since reset
+#   0x1110_0000  write 0x5555: power off (the CPU stops); 0x7777: restart
 #
-#   cpu --characters--> terminal --color/valid/ready--> ili9341_display
+#   machine_timer --mtime--> cpu --characters--> terminal --color/valid/ready--> ili9341_display
 #
 # Programs are written in C or assembly (examples/riscv/) and built with the
 # GNU RISC-V toolchain: riscv-none-elf-gcc (xPack's, unpacked in ~/opt/riscv,
 # or on PATH, or named by RISCV_GCC).
 #
-#   python examples/riscv_computer.py          # the CPU checks itself, then hello.c: test, print what they print
+#   python examples/riscv_computer.py          # the CPU's checks, then hello.c: test, print what they print
 #   python examples/riscv_computer.py --sim    # also simulate the generated Verilog
 #   python examples/riscv_computer.py --pins   # build hello.c's computer for the board
 import functools
@@ -39,12 +44,13 @@ from py2ver.protocol import stream_send  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAMS = os.path.join(HERE, "riscv")
 
-ROM_WORDS = 4096                         # 16 KB
-RAM_BASE = 0x00010000
-RAM_WORDS = 1024                         # 4 KB
-IO_BASE = 0x10000000
-CONSOLE, KEYBOARD, LEDS, KEYS = IO_BASE, IO_BASE + 4, IO_BASE + 8, IO_BASE + 12
+RAM_WORDS = 4096                         # 16 KB, from address 0
+UART, UART_STATUS = 0x10000000, 0x10000005
+LEDS, KEYS = 0x10001000, 0x10001004
+MTIMECMP, MTIME = 0x11004000, 0x1100BFF8
+SYSCON = 0x11100000
 MASK = 0xFFFFFFFF                        # (the registers are 32 bits)
+MISA = (1 << 30) | (1 << 12) | (1 << 8) | (1 << 0)    # 32 bits; M, I, A
 
 # ----------------------------- building programs -----------------------------
 
@@ -57,29 +63,42 @@ def toolchain():
     return next((g for g in found if g and os.path.exists(g)), None)
 
 
-def build(*sources):
-    """A program's words, from 0: its sources (in examples/riscv, C or
-    assembly; a C program gets start.S, which calls its main) compiled for
-    RV32I and linked to this computer's memory."""
+def build(*sources, includes=()):
+    """A program's memory image (RAM_WORDS words, from 0): its sources (paths,
+    or names in examples/riscv; C or assembly; a C program gets start.S,
+    which calls its main) compiled for RV32IMA and linked to this computer."""
     gcc = toolchain()
     if gcc is None:
         raise RuntimeError("No RISC-V toolchain: unpack xPack's riscv-none-elf-gcc in ~/opt/riscv, "
                            "or set RISCV_GCC")
-    paths = [os.path.join(PROGRAMS, s) for s in sources]
+    paths = [s if os.path.isabs(s) else os.path.join(PROGRAMS, s) for s in sources]
     if any(s.endswith(".c") for s in sources):
         paths.insert(0, os.path.join(PROGRAMS, "start.S"))
     with tempfile.TemporaryDirectory() as work:
         elf, binary = os.path.join(work, "program.elf"), os.path.join(work, "program.bin")
-        subprocess.run([gcc, "-march=rv32i", "-mabi=ilp32", "-Os", "-nostdlib", "-ffreestanding",
+        subprocess.run([gcc, "-march=rv32ima_zicsr_zifencei", "-mabi=ilp32", "-Os", "-nostdlib",
+                        "-ffreestanding", "-Wl,--no-warn-rwx-segments", *[f"-I{i}" for i in includes],
                         "-T", os.path.join(PROGRAMS, "link.ld"), "-o", elf, *paths, "-lgcc"],
                        check=True)
         objcopy = gcc[:-len("gcc")] + "objcopy"       # (riscv-none-elf-gcc: riscv-none-elf-objcopy)
-        subprocess.run([objcopy, "-O", "binary", "-j", ".text", elf, binary], check=True)
+        subprocess.run([objcopy, "-O", "binary", elf, binary], check=True)
         data = open(binary, "rb").read()
-    data += bytes(-len(data) % 4)
-    if len(data) > 4 * ROM_WORDS:
-        raise RuntimeError(f"The program is {len(data)} bytes: more than the ROM's {4 * ROM_WORDS}")
+    if len(data) > 4 * RAM_WORDS:
+        raise RuntimeError(f"The program is {len(data)} bytes: more than the RAM's {4 * RAM_WORDS}")
+    data += bytes(4 * RAM_WORDS - len(data))
     return tuple(int.from_bytes(data[k:k + 4], "little") for k in range(0, len(data), 4))
+
+
+# riscv-tests (github.com/riscv-software-src/riscv-tests), cloned next to the toolchain
+RISCV_TESTS = os.path.expanduser("~/opt/riscv/riscv-tests")
+
+
+def riscv_test(name):
+    """One of riscv-tests' programs (rv32ui/add, rv32um/div, rv32ua/amoadd_w...),
+    built with this computer's environment (examples/riscv/env)."""
+    return build(os.path.join(RISCV_TESTS, "isa", name + ".S"),
+                 includes=(os.path.join(PROGRAMS, "env"),
+                           os.path.join(RISCV_TESTS, "isa", "macros", "scalar")))
 
 
 # ----------------------------- the CPU -----------------------------
@@ -96,27 +115,54 @@ def take_key(port):
     return got, key
 
 
-def rv32i(port, program=(0x0000006F,)):
-    """The CPU, running `program` (its words, from address 0) from reset.
+def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
+    """The CPU, running from address 0 the memory image `image` (RAM_WORDS words).
 
     Outputs: the console's characters (tx, tx_valid; tx_ready: taken), the
     PC keyboard's kb_ready, leds. Inputs: tx_ready; the keyboard's kb,
-    kb_valid; keys.
+    kb_valid; keys; mtime_lo, mtime_hi (from machine_timer).
     """
     port.tx_valid = 0
     port.kb_ready = 0
     port.leds = 0
+    ram = list(image)                            # the memory, the program in it
     regs = [0] * 32                              # x0 to x31 (x0 never written: always 0)
-    ram = [0] * RAM_WORDS
     pc = 0
+    # Machine mode's state (the CSRs)
+    interrupts = 0                               # mstatus.MIE: interrupts on
+    interrupts_before = 0                        # mstatus.MPIE: MIE before the trap
+    enabled = 0                                  # mie: the interrupts wanted (bit 7: the timer's)
+    trap_vector = 0                              # mtvec
+    scratch = 0                                  # mscratch
+    trap_pc = 0                                  # mepc
+    cause = 0                                    # mcause
+    trap_value = 0                               # mtval
+    retired_lo = 0                               # instructions carried out (cycle, instret)
+    retired_hi = 0
+    compare_lo = MASK                            # mtimecmp: the timer's interrupt from then
+    compare_hi = MASK
+    reserved = 0                                 # lr.w's reservation: on, and where
+    reservation = 0
+    key_waiting = 0                              # a key taken from the PC, not yet read
+    waiting_key = 0
     while True:
+        # ---- the timer's interrupt, if it is due and wanted: a trap now ----
+        due = port.mtime_hi > compare_hi or (port.mtime_hi == compare_hi and port.mtime_lo >= compare_lo)
+        if interrupts and (enabled >> 7) & 1 and due:
+            trap_pc = pc
+            cause = 0x80000007
+            trap_value = 0
+            interrupts_before = interrupts
+            interrupts = 0
+            pc = (trap_vector & 0xFFFFFFFC) + (28 if trap_vector & 1 else 0)   # (vectored: + 4 x 7)
         # ---- fetch ----
-        instruction = program[min(pc >> 2, len(program) - 1)]
+        instruction = ram[(pc >> 2) & (RAM_WORDS - 1)]
         yield
         # ---- decode: the instruction's fields, the registers it reads ----
         op = instruction & 0x7F
         rd = (instruction >> 7) & 31
         f3 = (instruction >> 12) & 7
+        f7 = instruction >> 25
         a = regs[(instruction >> 15) & 31]
         b = regs[(instruction >> 20) & 31]
         sign = instruction >> 31                 # (each immediate's sign: bit 31)
@@ -131,7 +177,12 @@ def rv32i(port, program=(0x0000006F,)):
         # ---- execute ----
         result = 0
         write = 0                                # (1: rd gets result)
+        trap = 0                                 # (1: a trap instead: its cause, its value)
+        trap_cause = 0
+        trap_with = 0
         next_pc = (pc + 4) & MASK
+        sa = a - ((a >> 31) << 32)               # (a and b as signed numbers)
+        sb = b - ((b >> 31) << 32)
         if op == 0x37:                           # lui
             result = imm_u
             write = 1
@@ -147,17 +198,49 @@ def rv32i(port, program=(0x0000006F,)):
             write = 1
             next_pc = (a + imm_i) & 0xFFFFFFFE
         elif op == 0x63:                         # beq bne blt bge bltu bgeu
-            sa = a - ((a >> 31) << 32)           # (as signed numbers)
-            sb = b - ((b >> 31) << 32)
             taken = (f3 == 0 and a == b) or (f3 == 1 and a != b) or (f3 == 4 and sa < sb) \
                 or (f3 == 5 and sa >= sb) or (f3 == 6 and a < b) or (f3 == 7 and a >= b)
             if taken:
                 next_pc = (pc + imm_b) & MASK
+        elif op == 0x33 and f7 == 1 and f3 < 4:  # mul mulh mulhsu mulhu
+            left = sa if f3 == 1 or f3 == 2 else a
+            right = sb if f3 == 1 else b
+            yield
+            product = left * right               # (a clock of its own: the multipliers)
+            yield
+            result = product & MASK if f3 == 0 else (product >> 32) & MASK
+            write = 1
+        elif op == 0x33 and f7 == 1:             # div divu rem remu: a bit a clock
+            signed = f3 == 4 or f3 == 6
+            dividend = (-sa if sa < 0 else sa) if signed else a
+            divisor = (-sb if sb < 0 else sb) if signed else b
+            quotient = 0
+            remainder = 0
+            if divisor == 0:                     # (by 0: all ones, the dividend left)
+                quotient = MASK
+                remainder = a
+            else:
+                # (long division, a bit a clock: the dividend's top bit into the
+                # remainder, the divisor out of it if it goes, a 1 into the quotient)
+                for i in range(32):
+                    # (the remainder is under the divisor, so doubled it fits 33 bits)
+                    remainder = ((remainder << 1) | (dividend >> 31)) & 0x1FFFFFFFF
+                    dividend = (dividend << 1) & MASK
+                    quotient = (quotient << 1) & MASK
+                    if remainder >= divisor:
+                        remainder = remainder - divisor
+                        quotient = quotient | 1
+                    yield
+                if signed and (sa < 0) != (sb < 0):
+                    quotient = -quotient & MASK
+                if signed and sa < 0:
+                    remainder = -remainder & MASK
+            result = (quotient if f3 < 6 else remainder) & MASK
+            write = 1
         elif op == 0x13 or op == 0x33:           # arithmetic: with an immediate, or two registers
             y = b if op == 0x33 else imm_i & MASK
-            shift = y & 31
-            sa = a - ((a >> 31) << 32)
             sy = y - ((y >> 31) << 32)
+            shift = y & 31
             arithmetic = (instruction >> 30) & 1     # (sub, sra, srai)
             if f3 == 0:
                 result = (a - y) & MASK if op == 0x33 and arithmetic else (a + y) & MASK
@@ -179,20 +262,34 @@ def rv32i(port, program=(0x0000006F,)):
         elif op == 0x03:                         # lb lh lw lbu lhu
             address = (a + imm_i) & MASK
             value = 0
-            if address >= IO_BASE:
-                if address == KEYBOARD:
+            if (f3 == 2 and address & 3) or ((f3 == 1 or f3 == 5) and address & 1):
+                trap = 1                         # (misaligned)
+                trap_cause = 4
+                trap_with = address
+            elif address < 4 * RAM_WORDS:
+                word = ram[address >> 2]
+                yield
+                value = word
+            elif address == UART or address == UART_STATUS:
+                if not key_waiting:              # (a key from the PC, kept until read)
                     got, key = yield from take_key(port)
-                    value = key if got else MASK
-                elif address == KEYS:
-                    value = port.keys
-            elif address >= RAM_BASE:
-                ram_word = ram[((address - RAM_BASE) >> 2) & (RAM_WORDS - 1)]
-                yield
-                value = ram_word
-            else:
-                rom_word = program[min(address >> 2, len(program) - 1)]
-                yield
-                value = rom_word
+                    key_waiting = got
+                    waiting_key = key
+                if address == UART:
+                    value = waiting_key if key_waiting else 0
+                    key_waiting = 0
+                else:
+                    value = (0x60 | key_waiting) << 8 * (UART_STATUS & 3)
+            elif address == KEYS:
+                value = port.keys
+            elif address == MTIMECMP:
+                value = compare_lo
+            elif address == MTIMECMP + 4:
+                value = compare_hi
+            elif address == MTIME:
+                value = port.mtime_lo
+            elif address == MTIME + 4:
+                value = port.mtime_hi
             part = value >> ((address & 3) * 8)  # (the byte or half asked for, at the bottom)
             if f3 == 0:
                 result = ((part & 255) - (((part >> 7) & 1) << 8)) & MASK
@@ -204,33 +301,185 @@ def rv32i(port, program=(0x0000006F,)):
                 result = part & 65535
             else:
                 result = value
-            write = 1
+            write = 1 - trap
         elif op == 0x23:                         # sb sh sw
             address = (a + imm_s) & MASK
-            if address == CONSOLE:
-                yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
-            elif address == LEDS:
-                port.leds = b & 255
-            elif address >= RAM_BASE and address < IO_BASE:
-                k = ((address - RAM_BASE) >> 2) & (RAM_WORDS - 1)
+            if (f3 == 2 and address & 3) or (f3 == 1 and address & 1):
+                trap = 1                         # (misaligned)
+                trap_cause = 6
+                trap_with = address
+            elif address < 4 * RAM_WORDS:
+                k = address >> 2
                 if f3 == 2:
                     ram[k] = b
                 else:                            # (a byte or a half: into the word around it)
-                    ram_word = ram[k]
+                    word = ram[k]
                     yield
                     at = (address & 3) * 8
                     keep = 255 if f3 == 0 else 65535
-                    ram[k] = (ram_word & (MASK ^ (keep << at))) | ((b & keep) << at)
-        # (fence, ecall, ebreak: nothing to do)
+                    ram[k] = (word & (MASK ^ (keep << at))) | ((b & keep) << at)
+            elif address == UART:
+                yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
+            elif address == LEDS:
+                port.leds = b & 255
+            elif address == MTIMECMP:
+                compare_lo = b
+            elif address == MTIMECMP + 4:
+                compare_hi = b
+            elif address == SYSCON and b == 0x5555:
+                while True:                      # (powered off)
+                    yield
+            elif address == SYSCON and b == 0x7777:
+                next_pc = 0                      # (restart)
+        elif op == 0x2F:                         # lr.w sc.w amo*.w
+            address = a
+            k = (address >> 2) & (RAM_WORDS - 1)
+            kind = instruction >> 27
+            if address & 3:
+                trap = 1
+                trap_cause = 6
+                trap_with = address
+            elif kind == 3:                      # sc.w: done if lr.w's reservation is still here
+                if reserved and reservation == address:
+                    ram[k] = b
+                    result = 0
+                else:
+                    result = 1
+                reserved = 0
+            else:
+                word = ram[k]
+                yield
+                result = word
+                if kind == 2:                    # lr.w
+                    reserved = 1
+                    reservation = address
+                else:
+                    sw = word - ((word >> 31) << 32)
+                    new = b                      # (amoswap)
+                    if kind == 0:
+                        new = (word + b) & MASK
+                    elif kind == 4:
+                        new = word ^ b
+                    elif kind == 12:
+                        new = word & b
+                    elif kind == 8:
+                        new = word | b
+                    elif kind == 16:
+                        new = word if sw < sb else b
+                    elif kind == 20:
+                        new = word if sw > sb else b
+                    elif kind == 24:
+                        new = word if word < b else b
+                    elif kind == 28:
+                        new = word if word > b else b
+                    ram[k] = new
+            write = 1 - trap
+        elif op == 0x73 and f3 == 0:             # ecall ebreak mret wfi
+            if (instruction >> 20) == 0x302:     # mret: back from the trap
+                next_pc = trap_pc
+                interrupts = interrupts_before
+                interrupts_before = 1
+            elif (instruction >> 20) == 0:
+                trap = 1
+                trap_cause = 11                  # (ecall from machine mode)
+            elif (instruction >> 20) == 1:
+                trap = 1
+                trap_cause = 3                   # (ebreak)
+        elif op == 0x73:                         # csrrw csrrs csrrc, and with an immediate
+            csr = instruction >> 20
+            source = (instruction >> 15) & 31 if f3 >= 5 else a
+            mstatus = (interrupts << 3) | (interrupts_before << 7) | (3 << 11)
+            old = 0                              # (unknown CSRs: 0, written to no effect)
+            if csr == 0x300:
+                old = mstatus
+            elif csr == 0x301:
+                old = MISA
+            elif csr == 0x304:
+                old = enabled
+            elif csr == 0x305:
+                old = trap_vector
+            elif csr == 0x340:
+                old = scratch
+            elif csr == 0x341:
+                old = trap_pc
+            elif csr == 0x342:
+                old = cause
+            elif csr == 0x343:
+                old = trap_value
+            elif csr == 0x344:
+                old = 128 if due else 0          # (mip: the timer's interrupt due)
+            elif csr == 0xC00 or csr == 0xC02 or csr == 0xB00 or csr == 0xB02:
+                old = retired_lo
+            elif csr == 0xC80 or csr == 0xC82 or csr == 0xB80 or csr == 0xB82:
+                old = retired_hi
+            elif csr == 0xC01:
+                old = port.mtime_lo
+            elif csr == 0xC81:
+                old = port.mtime_hi
+            new = source
+            if f3 == 2 or f3 == 6:
+                new = old | source
+            elif f3 == 3 or f3 == 7:
+                new = old & (MASK ^ source)
+            if csr == 0x300:
+                interrupts = (new >> 3) & 1
+                interrupts_before = (new >> 7) & 1
+            elif csr == 0x304:
+                enabled = new & 0x888
+            elif csr == 0x305:
+                trap_vector = new
+            elif csr == 0x340:
+                scratch = new
+            elif csr == 0x341:
+                trap_pc = new & 0xFFFFFFFC
+            elif csr == 0x342:
+                cause = new
+            elif csr == 0x343:
+                trap_value = new
+            result = old
+            write = 1
+        elif op != 0x0F:                         # (fence, fence.i: nothing to do; else illegal)
+            trap = 1
+            trap_cause = 2
+            trap_with = instruction
+        if trap:                                 # a trap: to mtvec, as an interrupt goes
+            trap_pc = pc
+            cause = trap_cause
+            trap_value = trap_with
+            interrupts_before = interrupts
+            interrupts = 0
+            next_pc = trap_vector & 0xFFFFFFFC
         pc = next_pc
         yield
         # ---- write back (a clock of its own: the register file takes the
         # result from a register, not from the whole of the clock's logic) ----
         if write and rd != 0:
             regs[rd] = result
+        if retired_lo == MASK:
+            retired_lo = 0
+            retired_hi = 0 if retired_hi == MASK else retired_hi + 1
+        else:
+            retired_lo = retired_lo + 1
 
 
-CPU_ATTR = {"tx_ready": 1, "kb": 8, "kb_valid": 1, "keys": 2}
+CPU_ATTR = {"tx_ready": 1, "kb": 8, "kb_valid": 1, "keys": 2, "mtime_lo": 32, "mtime_hi": 32,
+            # (a product of two 33-bit signed numbers: past the 64 bits followed by itself)
+            "product": {"width": 66, "signed": 1}}
+
+
+def machine_timer(port, tick=50):
+    """mtime: microseconds since reset (tick: clocks a microsecond), its lower
+    and upper 32 bits."""
+    port.mtime_lo = 0
+    port.mtime_hi = 0
+    while True:
+        yield tick - 1
+        if port.mtime_lo == MASK:
+            port.mtime_lo = 0
+            port.mtime_hi = 0 if port.mtime_hi == MASK else port.mtime_hi + 1
+        else:
+            port.mtime_lo = port.mtime_lo + 1
+
 
 # ----------------------------- the computer -----------------------------
 
@@ -241,15 +490,16 @@ for _name in ("rx", "rx_valid", "rx_ready"):    # (the terminal's bytes come fro
     PINS.pop(_name)
 
 
-def computer(program, lcd=T.LCD, columns=T.COLUMNS, rows=T.ROWS, height=T.SCREEN_HEIGHT):
-    """The CPU running `program`, its console the terminal on the display."""
-    cpu = functools.partial(rv32i, program=program)
+def computer(image, lcd=T.LCD, columns=T.COLUMNS, rows=T.ROWS, height=T.SCREEN_HEIGHT):
+    """The CPU running the memory image `image`, its console the terminal on the display."""
+    cpu = functools.partial(rv32ima, image=image)
     screen = functools.partial(T.terminal, columns=columns, rows=rows, height=height)
     width = columns * 8
     display = functools.partial(T.ili9341_display, lcd=lcd, width=width, height=height)
-    return connect(cpu=(cpu, CPU_ATTR), terminal=(screen, {"ready": 1}),
+    return connect(timer=(machine_timer, {}), cpu=(cpu, CPU_ATTR), terminal=(screen, {"ready": 1}),
                    display=(display, {"color": 16, "valid": 1}), name="riscv_computer",
-                   wires={"terminal.rx": "cpu.tx", "terminal.rx_valid": "cpu.tx_valid",
+                   wires={"cpu.mtime_lo": "timer.mtime_lo", "cpu.mtime_hi": "timer.mtime_hi",
+                          "terminal.rx": "cpu.tx", "terminal.rx_valid": "cpu.tx_valid",
                           "cpu.tx_ready": "terminal.rx_ready",
                           "display.color": "terminal.color", "display.valid": "terminal.valid",
                           "terminal.ready": "display.ready"})
@@ -259,7 +509,7 @@ def console(until, typed=b"", limit=2_000_000):
     """A testbench for the CPU alone: it takes the console's characters (a
     clock after each, as the terminal would), types `typed` on the keyboard,
     and stops once the console has printed `until` (or after limit clocks).
-    Returns what was printed."""
+    mtime stays 0. Returns what was printed."""
     def tb(dut):
         printed, k = bytearray(), 0
         dut.keys = 3
@@ -282,9 +532,9 @@ if __name__ == "__main__":
     from py2ver import Py2ver
 
     args = sys.argv[1:]
-    for sources, until, typed in [(("selftest.S",), b"\n", b""),
+    for sources, until, typed in [(("selftest.S",), b"\n", b""), (("traps.S",), b"\n", b""),
                                   (("hello.c",), b"I echo:\nhi", b"hi")]:
-        p = Py2ver(functools.partial(rv32i, program=build(*sources)), CPU_ATTR)
+        p = Py2ver(functools.partial(rv32ima, image=build(*sources)), CPU_ATTR)
         run = p.check(console(until, typed), verilog="--sim" in args)
         print(f"{sources[0]} printed {run.value.decode()!r} in {len(run.inputs):,} clock cycles")
     if "--pins" in args:

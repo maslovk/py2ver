@@ -596,6 +596,32 @@ def delays(port):
         k = 0 if k == len(buffer) - 1 else k + 1
 
 
+SQUARES = tuple(k * k for k in range(40))
+
+
+def squares_then_doubles(port):
+    table = list(SQUARES)                    # (a list from a table: its contents from the start)
+    k = 0
+    while True:
+        old = table[k]
+        table[k] = 2 * k                     # (written over as it's read)
+        yield
+        port.out = old
+        k = 0 if k == len(table) - 1 else k + 1
+
+
+def test_a_list_made_from_a_table_starts_with_its_numbers():
+    p = _quiet(squares_then_doubles, None)
+    assert "in a memory block: 40 x" in p.verilog          # (as table_: a Verilog word)
+    clocks = [{}] * 100
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    outs = [g["out"] for g in gen]
+    first = outs.index(1)                    # (k = 1: 1, after the square of 0)
+    assert outs[first:first + 4] == [1, 4, 9, 16]
+    assert [2 * k for k in range(1, 5)] == outs[first + 40:first + 44]   # (the second time round)
+
+
 def sums_at_once(port):
     values = [0] * 100
     k = 0

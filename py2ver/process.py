@@ -1251,9 +1251,17 @@ def _desugar(fd: ast.FunctionDef, port: str, inputs: Set[str], outputs: Set[str]
 
 
 def _list_items(e: ast.expr) -> Optional[List[ast.expr]]:
-    """The items of a list written out ([a, b, c]) or repeated ([0] * 8), else None."""
+    """The items of a list written out ([a, b, c]), repeated ([0] * 8), or made
+    from a table (list(image), image a tuple of numbers), else None."""
     if isinstance(e, ast.List):
         return list(e.elts)
+    if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id == "list" \
+            and len(e.args) == 1 and not e.keywords:
+        table = e.args[0]
+        if isinstance(table, ast.Name) and table.id in _TABLES:
+            return [ast.Constant(v) for v in _TABLES[table.id]]
+        if is_table(table):
+            return [_copy(x) for x in table.elts]
     if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mult):
         for items, count in ((e.left, e.right), (e.right, e.left)):
             if isinstance(items, ast.List) and isinstance(count, ast.Constant) \
@@ -1311,7 +1319,7 @@ def _constant_locals(fd: ast.FunctionDef, pins: Set[str]) -> Dict[str, int]:
     return values
 
 
-MEMORY_MIN = 64              # a list this long or longer goes into a memory block, if it can
+MEMORY_MIN = 32              # a list this long or longer goes into a memory block, if it can
 MEMORY_REGISTERS_MAX = 256   # and one longer than this that can't is an error, not registers
 
 
@@ -2201,7 +2209,7 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
             # A value past MAX_BITS can't be built, and its range never shrinks
             # again: stop now, before squaring makes its bounds astronomically long.
             huge = sorted(v for v, r in new.items()
-                          if max(abs(r[0]), abs(r[1])) >> MAX_BITS
+                          if max(abs(r[0]), abs(r[1])) >> MAX_BITS and v not in given
                           and (start[j] is None or r != start[j].get(v)))
             if len(huge) == 1:
                 raise ProcessError(f"{where_of(huge[0])}: {_unbounded(user_name(huge[0]))}")

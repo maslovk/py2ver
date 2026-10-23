@@ -3,7 +3,6 @@
 # went wrong (n its number below), then stops.
 
     .equ CONSOLE, 0x10000000
-    .equ RAM, 0x00010000
 
 # check reg, value, n: reg should be value; if not, check n failed
     .macro check reg, value, n
@@ -105,8 +104,8 @@ here:
     jalr ra, 0(t0)
     check a1, 42, 29
 
-    # ---- memory: words, halves, bytes, RAM and ROM ----
-    li   s0, RAM
+    # ---- memory: words, halves, bytes; variables, and the program's own words ----
+    la   s0, scratch
     li   t0, 0x12345678
     sw   t0, 0(s0)
     lw   t1, 0(s0)
@@ -184,3 +183,8 @@ ok:
     .string "OK\n"
 failed:
     .string "FAIL "
+
+    .data
+    .align 2
+scratch:
+    .word 0, 0, 0, 0

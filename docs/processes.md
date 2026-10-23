@@ -186,12 +186,13 @@ an element at a variable index (`if digits[i] < 9`) doesn't limit the
 elements' widths; with a constant index (`if digits[3] < 9`) it does, as a
 test of a local does.
 
-A long list (64 elements or more) goes into a memory block, so it can hold
-thousands of values, such as a picture to draw from. That works when it is
-used the way a memory block can be:
+A long list (32 elements or more) goes into a memory block, so it can hold
+thousands of values, such as a picture to draw from, or a program to run.
+That works when it is used the way a memory block can be:
 
 - it is made once, from constants, before the first `yield`
-  (`heat = [0] * 4800`); that is its contents from power-up;
+  (`heat = [0] * 4800`, or `ram = list(image)` with `image` a tuple of
+  numbers, a parameter); that is its contents from power-up;
 - it is read as `x = heat[i]`, and `x` is used after the next `yield`, as
   with a table;
 - each clock writes it at most once (`heat[i] = v`), and doesn't read it
@@ -208,7 +209,8 @@ A shorter list used another way stays in registers. A longer one stops the
 build with what keeps it from a memory block. Two more things to know: each
 local that reads the list has a copy of the memory block of its own (each
 write goes to every copy), and a reset doesn't clear a memory block.
-`examples/fire.py` keeps Doom's fire, 60 x 80 heats, in one.
+`examples/fire.py` keeps Doom's fire, 60 x 80 heats, in one;
+`examples/riscv_computer.py` its CPU's memory (the program in it) and registers.
 
 ## 3. Steps, parameters and the protocol library
 
