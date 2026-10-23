@@ -146,7 +146,7 @@ table. Where it goes depends on when its entry is used:
 
 So, for a large table, read the entry into a local, then `yield`, then use it:
 
-```python
+```py
 x = PATH[k]
 yield
 port.out = x * 3
@@ -165,7 +165,7 @@ network's weights, worked out before building, can be given as a parameter.
 A local can be a list of fixed length, made as `[0] * n` or written out
 (`[a, b, c]`). Each element is a register of its own, with its own width:
 
-```python
+```py
 neurons = [0] * 64
 for j in range(64):
     ...
