@@ -28,7 +28,7 @@ test = ["pytest>=8", "pytest-xdist>=3", "hypothesis>=6", "pyserial>=3.5", "numpy
 Homepage = "https://github.com/maslovk/py2ver"
 
 [tool.setuptools]
-packages = ["py2ver"]
+packages = ["py2ver", "py2ver.devices"]
 
 [tool.setuptools.package-data]
 py2ver = [

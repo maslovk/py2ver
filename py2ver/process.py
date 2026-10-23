@@ -38,7 +38,8 @@ value after reset) and, if their values can't be followed, the locals' too.
 Parameters after the port are constants: their defaults, or a partial's
 (functools.partial(uart_tx, bit=217): the same transmitter, twice the baud);
 a record of them too (a NamedTuple, a dataclass: a bus's settings), its fields
-read where it's used (bus.q).
+read where it's used (bus.q). A step, a constant or a record's class can be
+named through its module (adxl345.adxl345_start, adxl345.POWER_CTL).
 A step of a protocol written once is a generator of its own, used with
 `yield from` (its body in the process where it's used; its value, `return`ed,
 with `x = yield from ...`):
@@ -677,9 +678,14 @@ class _Expander:
                         return ast.copy_location(_value_node(v), n)
                 return n
 
-            # (a record's field: its value)
+            # (a record's field: its value; a module's constant too: adxl345.ADDRESS)
             def visit_Attribute(self, n: ast.Attribute):
                 self.generic_visit(n)
+                if isinstance(n.ctx, ast.Load) and isinstance(n.value, (ast.Name, ast.Attribute)):
+                    v = _resolved(n, env, set(rename) | stored)
+                    if isinstance(v, (int, bytes)) or _record(v) or (
+                            isinstance(v, tuple) and v and all(type(e) is int for e in v)):
+                        return ast.copy_location(_value_node(v), n)
                 if isinstance(n.value, ast.Constant) and _record(n.value.value):
                     rec = n.value.value
                     if not isinstance(n.ctx, ast.Load):
@@ -700,8 +706,7 @@ class _Expander:
             def visit_Call(self, n: ast.Call):
                 self.generic_visit(n)
                 # (a record of constants: SPI(half, 3), half a constant; made here)
-                cls = env.get(n.func.id) if isinstance(n.func, ast.Name) \
-                    and n.func.id not in rename else None
+                cls = _resolved(n.func, env, set(rename))
                 if _record_type(cls):
                     args = n.args + [k.value for k in n.keywords]
                     if not all(isinstance(a, ast.Constant) for a in args) \
@@ -791,8 +796,8 @@ class _Expander:
     def inline(self, y: ast.YieldFrom, target: Optional[ast.expr], env: Dict[str, Any],
                at: ast.stmt) -> _Inline:
         call = y.value
-        fn = env.get(call.func.id) if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) \
-            else None
+        # (a step by its name, or a module's: adxl345.adxl345_start)
+        fn = _resolved(call.func, env, set()) if isinstance(call, ast.Call) else None
         if fn is None or not is_process(fn) or isinstance(fn, System):
             raise ProcessError(f"{_at(at)}: yield from a generator function's call "
                                f"(yield from wait_until(port, 'start'))")
@@ -884,6 +889,18 @@ def _record_type(v: Any) -> bool:
     """A record's class (SPI(half, 3) builds one where it's used, of constants)."""
     return isinstance(v, type) and (dataclasses.is_dataclass(v) or (
         issubclass(v, tuple) and hasattr(v, "_fields")))
+
+
+def _resolved(e: ast.expr, env: Dict[str, Any], local: Set[str]) -> Any:
+    """What a name, or a module's attribute (adxl345.ADDRESS, protocol.SPI), is in
+    the module env (None: a local's, or nothing there)."""
+    if isinstance(e, ast.Name):
+        return None if e.id in local else env.get(e.id)
+    if isinstance(e, ast.Attribute):
+        mod = _resolved(e.value, env, local)
+        if inspect.ismodule(mod):
+            return getattr(mod, e.attr, None)
+    return None
 
 
 def _value_node(v: Any) -> ast.expr:

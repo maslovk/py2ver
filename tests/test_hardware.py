@@ -32,8 +32,9 @@ import adc as D  # noqa: E402
 def test_an_adc_read_over_spi():
     import functools
     values = [0x000, 0x123, 0x456, 0x789, 0xABC, 0xDEF, 0x800, 0xFFF]
-    p = _quiet(functools.partial(D.adc_reader, half=2, period=100), D.ATTR)
-    text = p.check(D.sweep(values), verilog=False).value
+    fast = D.ADC128S022(D.ADC.spi._replace(half=2))
+    p = _quiet(functools.partial(D.adc_reader, adc=fast, period=100), D.ATTR)
+    text = p.check(D.sweep(values, fast), verilog=False).value
     assert D.readings(text) == [dict(enumerate(values))]
 
 

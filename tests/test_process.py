@@ -381,6 +381,27 @@ def test_a_record_is_constants_or_says_so():
         process.compile_process(functools.partial(board_pulses, board=1.5), one)
 
 
+import py2ver.protocol as P  # noqa: E402
+from py2ver.devices import adxl345 as ADXL  # noqa: E402
+
+
+def by_module(port):
+    while True:
+        yield from P.wait_until(port, "go")                 # (a module's step)
+        port.out = ADXL.MEASURE                             # (a module's constant)
+        yield P.I2C(q=3).q                                  # (a module's record, made here)
+        port.out = 0
+        yield
+
+
+def test_steps_constants_and_records_by_their_module():
+    p = _quiet(by_module, {"go": 1, "out": 4})
+    clocks = [{"go": 0}] * 3 + [{"go": 1}] + [{"go": 0}] * 8
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    assert [g["out"] for g in gen] == [0] * 4 + [8] * 3 + [0] * 5
+
+
 def test_a_parameter_is_a_constant_a_partial_its_value():
     half = U.BIT // 2
     tx = _quiet(functools.partial(U.uart_tx, bit=half), U.TX)

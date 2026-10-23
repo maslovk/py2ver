@@ -364,7 +364,9 @@ the board. It covers:
   settings: `SPI(...)`, `I2C(...)`), and the library in `py2ver.protocol`
   (`wait_until`, `wait_edge`, `shift_in`, `shift_out`, `uart_send`,
   `uart_receive`, `spi_transfer`, `i2c_start`, `i2c_read_register`, ..., `jtag_print`,
-  `debounced`);
+  `debounced`), and chips' drivers in `py2ver.devices` (the ADXL345
+  accelerometer, the ADC128S022 ADC, a 24LC02 EEPROM: registers, steps, and a
+  model of each for testbenches);
 - when inputs are read and outputs change;
 - testbenches written as generators, and `check()`, which checks the
   generator, the model and the Verilog against each other in one call;

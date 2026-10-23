@@ -1,6 +1,6 @@
-# The DE0-Nano's own I2C bus: its ADXL345 accelerometer (and what else answers),
-# read with py2ver.protocol's I2C steps, the answers printed on the JTAG console
-# (see docs/processes.md, the guide).
+# The DE0-Nano's own I2C bus: its ADXL345 accelerometer (py2ver.devices.adxl345's
+# driver) and what else answers (py2ver.protocol's I2C steps), printed on the
+# JTAG console (see docs/processes.md, the guide).
 #
 #   python examples/accelerometer.py             # the testbench (a memory on the bus)
 #   python examples/accelerometer.py --pins      # compiled for the board (not programmed)
@@ -9,10 +9,10 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py2ver.protocol import (I2C, i2c_read_register, i2c_read_registers,  # noqa: E402
-                             i2c_write_register, jtag_print, jtag_print_hex)
+from py2ver.devices.adxl345 import (ADDRESS as ADXL345, POWER_CTL,  # noqa: E402
+                                    adxl345_read_xyz, adxl345_start, signed16)
+from py2ver.protocol import I2C, i2c_read_register, jtag_print, jtag_print_hex  # noqa: E402
 
 BUS = I2C(q=50_000_000 // 100_000 // 4)  # 100 kHz (a quarter of SCL: 125 clocks); scl, sda
 ADDRESSES = (0x53, 0x1D, 0x50)           # the ADXL345 (its ALT ADDRESS low, or high); an EEPROM
@@ -42,8 +42,6 @@ def i2c_probe(port, bus=BUS):
         yield
 
 
-ADXL345 = 0x1D                           # (on the DE0-Nano: its ALT ADDRESS high)
-POWER_CTL, DATAX0 = 0x2D, 0x32           # (measure: 0x08; X, Y, Z: 6 bytes from DATAX0)
 PERIOD = 10_000_000                      # 0.2 s at 50 MHz between readings
 
 
@@ -53,23 +51,23 @@ def print_axis(port, name, value):
 
 
 def accelerometer(port, bus=BUS, period=PERIOD):
-    """The ADXL345 measuring (+-2 g: 1 g about 256), its X, Y and Z read (one
-    transfer of 6 bytes, so they belong together) and printed every period."""
+    """The ADXL345 measuring (+-2 g: 1 g about 256), its X, Y and Z printed
+    every period."""
     port.scl = 1
     port.sda = 1
     port.cs_n = 1
     yield 50_000
-    nack = yield from i2c_write_register(port, bus, ADXL345, POWER_CTL, 0x08)
+    nack = yield from adxl345_start(port, bus)
     yield from jtag_print(port, b"adxl345: ")
     if nack:
         yield from jtag_print(port, b"no answer\n")
     else:
         yield from jtag_print(port, b"measuring\n")
     while True:
-        xyz, nack = yield from i2c_read_registers(port, bus, ADXL345, DATAX0, 6)
-        yield from print_axis(port, b"x=0x", xyz & 0xFFFF)
-        yield from print_axis(port, b" y=0x", (xyz >> 16) & 0xFFFF)
-        yield from print_axis(port, b" z=0x", xyz >> 32)
+        x, y, z, nack = yield from adxl345_read_xyz(port, bus)
+        yield from print_axis(port, b"x=0x", x)
+        yield from print_axis(port, b" y=0x", y)
+        yield from print_axis(port, b" z=0x", z)
         yield from jtag_print(port, b"\n")
         yield period
 
@@ -81,10 +79,10 @@ PINS = dict(ATTR, scl=dict(ATTR["scl"], pin="I2C_SCLK"), sda=dict(ATTR["sda"], p
 
 
 def with_a_memory(mem, address=0x50, transfers=1, until=b"done\n"):
-    """A testbench: the design on a bus with an I2C memory at address
-    (examples/i2c.py's model: an ADXL345's registers can be its bytes); what it
+    """A testbench: the design on a bus with a chip of registers at address
+    (py2ver.devices' model: an ADXL345's registers can be its bytes); what it
     printed, up to until."""
-    from i2c import i2c_memory
+    from py2ver.devices.i2c_target import i2c_memory
     from py2ver.protocol import together
 
     def printed(dut):
@@ -102,17 +100,13 @@ def with_a_memory(mem, address=0x50, transfers=1, until=b"done\n"):
     return tb
 
 
-def signed(v):
-    return v - 65536 if v >= 32768 else v
-
-
 def readings(text):
     """The (x, y, z) of each line an accelerometer printed."""
     out = []
     for line in text.decode(errors="replace").splitlines():
         if line.startswith("x=0x"):
             parts = dict(p.split("=0x") for p in line.split())
-            out.append(tuple(signed(int(parts[a], 16)) for a in "xyz"))
+            out.append(tuple(signed16(int(parts[a], 16)) for a in "xyz"))
     return out
 
 

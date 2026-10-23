@@ -461,19 +461,36 @@ weak pull-up, so its line is high when nobody pulls it. That is enough for
 the board's own I2C bus at 100 kHz; a longer bus on GPIO wants pull-up
 resistors as well (a few kΩ to 3.3 V).
 
+**Chips' drivers** are in `py2ver.devices`, a module for each chip: its
+registers, the steps that work it, and a model of it for testbenches. A
+driver step takes the port, then the bus's record:
+
+| module | steps | model |
+|---|---|---|
+| `adxl345` (accelerometer, I2C) | `adxl345_start(port, bus)` → `nack`; `adxl345_id(port, bus)` → `id, nack`; `adxl345_read_xyz(port, bus)` → `x, y, z, nack` | `adxl345_model(dut, registers(x, y, z), transfers)` |
+| `adc128s022` (ADC, SPI) | `adc128s022_read(port, adc, channel)` → its 16 bits (4 zeros, 12 of result); `adc128s022_frame(...)` | `adc128s022_model(values, frames)` |
+| `eeprom24` (24LC02, I2C) | `eeprom_read(port, bus, offset)` → `value, nack`; `eeprom_write(port, bus, offset, value)` → `nack`, its write cycle waited for | `eeprom_model(dut, mem, transfers, write_clocks=5000)` |
+| `i2c_target` | | `i2c_memory(dut, mem, transfers, address)`: any chip of registers on I2C |
+
+A step can be called through its module (`adxl345.adxl345_read_xyz(port,
+bus)`), and a module's constants read the same way (`adxl345.POWER_CTL`).
+A chip with a pin of its own carries it in its record: `ADC128S022(spi=SPI(10,
+mode=3), cs_n="cs_n")`. `tests/test_devices.py` checks each driver against
+its model, in the Verilog too.
+
 **The board's own I2C bus** (`I2C_SCLK`, `I2C_SDAT`) has its ADXL345
 accelerometer, at address 0x1D once `G_SENSOR_CS_N` is held high (its I2C
-mode). Something else acknowledges from 0x50 to 0x57 and reads `0xFF`, as
-an erased I2C EEPROM would. `examples/accelerometer.py` probes the bus, and
+mode). Something else acknowledges from 0x50 to 0x57 and reads `0xFF`: its
+24LC02 EEPROM, erased. `examples/accelerometer.py` probes the bus, and
 reads the accelerometer's X, Y and Z five times a second onto the JTAG
-console: all six bytes in one transfer, so they belong together
-(`xyz, nack = yield from i2c_read_registers(port, bus, 0x1D, 0x32, 6)`, `bus`
-`I2C(q=125)`: 100 kHz). On a board lying flat it reads about `x=0x0003 y=0x000F z=0x011F`:
+console, all six bytes in one transfer so they belong together:
+`x, y, z, nack = yield from adxl345_read_xyz(port, bus)`, with `bus`
+`I2C(q=125)`, 100 kHz. On a board lying flat it reads about `x=0x0003 y=0x000F z=0x011F`:
 Z is 1 g, about 256 counts at its ±2 g range.
 
 **The board's ADC** (an ADC128S022: 8 inputs, 12 bits) is on `ADC_CS_N`,
 `ADC_SCLK`, `ADC_SADDR` and `ADC_SDAT`, in SPI mode 3. `examples/adc.py`
-reads all 8 inputs with `spi_transfer(port, SPI(10, mode=3), channel << 11, 16)`
+reads all 8 inputs with `adc128s022_read(port, ADC128S022(), channel)`
 (2.5 MHz) five times a second onto the JTAG console. Each frame sends back
 4 zeros and then the result of the channel chosen in the frame before.
 Inputs left open read whatever they drift to, about 0x500.
@@ -486,10 +503,12 @@ Inputs left open read whatever they drift to, about 0x500.
 - acknowledges;
 - a device that holds SCL low makes them wait (clock stretching).
 
-Their pins are `scl` and `sda` unless you name others (`scl="i2c_clock"`).
+Their pins are `scl` and `sda` unless the bus names others
+(`I2C(scl="i2c_clock")`).
 `examples/i2c.py` is a master built from them that writes and reads one
 register of a device. Its testbench plays a
-24LC02-style memory chip on the same two lines, acknowledging its own
+24LC02-style memory chip on the same two lines (`py2ver.devices.i2c_target`'s
+`i2c_memory`), acknowledging its own
 address and stretching the clock, and the master's write, read-back and
 missing acknowledge all check against the generator, the model and the
 Verilog. At 100 kHz it compiles to 285 LUTs and 79 registers (166 MHz).
