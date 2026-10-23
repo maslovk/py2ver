@@ -56,7 +56,7 @@ output of another.
 The generator itself is the reference: simulate() runs it a clock at a time,
 the inputs of each clock given, its outputs read; the machine built from it
 (compile_process: a function of one clock with its state, see "State
-registers" in the README) computes the same, clock for clock.
+registers" in docs/reference.md) computes the same, clock for clock.
 """
 from __future__ import annotations
 
@@ -450,10 +450,19 @@ class ProcessMixin:
             raise ValueError("Not a process (a generator function)")
         return self.process.explain()
 
-    def check(self, tb: Callable, verilog: bool = True, vcd: Optional[str] = None,
-              limit: int = 10_000_000) -> Run:
+    def check(self, tb: Any, verilog: bool = True, vcd: Optional[str] = None,
+              limit: int = 10_000_000) -> Any:
         """
-        Check the design with the testbench tb (see drive()), in three steps:
+        Check the design: Python, py2ver's model of the hardware and the
+        simulated Verilog must all agree.
+
+        For a function, give it input vectors: p.check([(3, 1), (7, 2)]). Each
+        output is compared with what the function returns as written; one too
+        narrow for its value is named, with the width it needs. Returns the
+        outputs. Without a simulator installed, the Verilog is skipped, with a
+        warning.
+
+        For a process, give it a testbench, tb (see drive()), and it runs in three steps:
         1. tb runs against the generator, a clock at a time (its asserts: a
            TestbenchFailed at their clock);
         2. the inputs of each clock of that run go through the machine's model;
@@ -468,7 +477,10 @@ class ProcessMixin:
         """
         pr = self.process
         if pr is None:
-            raise ValueError("Not a process (a generator function)")
+            if callable(tb):
+                raise ValueError("check() takes a list of input vectors for a function (a "
+                                 "testbench is for a process: a generator)")
+            return self._check_function(tb, verilog)
         run = drive(pr.func, tb, self._process_attr, limit)
         if vcd:
             write_vcd(vcd, pr, run.inputs, run.outputs)

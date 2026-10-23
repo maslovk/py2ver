@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import sys
@@ -7,6 +8,28 @@ from pathlib import Path
 from cocotb_tools.runner import get_runner
 
 LANGUAGE = os.getenv("HDL_TOPLEVEL_LANG", "verilog").lower().strip()
+
+
+def _show_log() -> bool:
+    return os.getenv("PY2VER_SIM_LOG", "").strip() not in ("", "0")
+
+
+def _log(build_dir: Path, name: str) -> dict:
+    """Where the simulator's output goes: a file in the build directory, so the
+    console stays readable; PY2VER_SIM_LOG=1 shows it instead."""
+    if _show_log():
+        return {}
+    build_dir.mkdir(parents=True, exist_ok=True)
+    return {"log_file": build_dir / name}
+
+
+def _runner(sim: str):
+    """cocotb's runner for the simulator, its own messages (the commands it runs)
+    only shown with PY2VER_SIM_LOG=1."""
+    runner = get_runner(sim)
+    if not _show_log() and hasattr(runner, "log"):
+        runner.log.setLevel(logging.WARNING)
+    return runner
 
 
 def test_runner(top_name: str, proj_path: Path | None = None):
@@ -34,7 +57,7 @@ def test_runner(top_name: str, proj_path: Path | None = None):
     if hdl_toplevel_lang == "vhdl" and sim == "xcelium":
         build_test_args = ["-v93"]
 
-    runner = get_runner(sim)
+    runner = _runner(sim)
 
     # Build DUT with a clean build_dir
     runner.build(
@@ -43,6 +66,7 @@ def test_runner(top_name: str, proj_path: Path | None = None):
         build_dir=str(build_dir),
         always=True,
         build_args=build_test_args,
+        **_log(build_dir, "build.log"),
     )
 
     # Run cocotb tests in the same build_dir, using tb.py as test_module.
@@ -55,6 +79,7 @@ def test_runner(top_name: str, proj_path: Path | None = None):
             test_module="tb",
             build_dir=str(build_dir),
             test_args=build_test_args,
+            **_log(build_dir, "sim.log"),
         )
     finally:
         sys.path.remove(str(proj_path))
@@ -69,7 +94,7 @@ def run_cocotb(top_name: str, sources, test_module: str, proj_path: Path,
     if build_dir.exists():
         shutil.rmtree(build_dir)
 
-    runner = get_runner(sim)
+    runner = _runner(sim)
     build_kwargs = {}
     if timescale is not None:
         build_kwargs["timescale"] = timescale
@@ -79,6 +104,7 @@ def run_cocotb(top_name: str, sources, test_module: str, proj_path: Path,
         build_dir=str(build_dir),
         always=True,
         **build_kwargs,
+        **_log(build_dir, "build.log"),
     )
 
     sys.path.insert(0, str(proj_path))
@@ -87,6 +113,7 @@ def run_cocotb(top_name: str, sources, test_module: str, proj_path: Path,
             hdl_toplevel=top_name,
             test_module=test_module,
             build_dir=str(build_dir),
+            **_log(build_dir, "sim.log"),
         )
     finally:
         sys.path.remove(str(proj_path))

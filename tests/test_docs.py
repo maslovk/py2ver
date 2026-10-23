@@ -9,7 +9,8 @@ import pytest
 # order, as one module (py2ver reads the generators' source, so a file, not
 # exec). ```py blocks (Quartus, the board) are shown, not run.
 
-DOCS = Path(__file__).resolve().parent.parent / "docs"
+ROOT = Path(__file__).resolve().parent.parent
+DOCS = ROOT / "docs"
 
 
 def _blocks(path: Path) -> str:
@@ -27,3 +28,16 @@ def test_the_processes_guide_runs_as_written(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "guide", module)
     spec.loader.exec_module(module)
     assert module.run.value == b"hi"
+
+
+@pytest.mark.sim
+def test_the_readme_runs_as_written(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "readme.py"
+    source.write_text(_blocks(ROOT / "README.md"), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("readme", source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "readme", module)
+    spec.loader.exec_module(module)
+    assert module.outputs == [(4, 2, 3, 3), (9, 5, 14, 3), (510, 0, 65025, 1), (7, -3, 10, 0)]
+    assert module.tx.process.states == 5

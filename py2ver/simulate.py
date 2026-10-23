@@ -30,6 +30,15 @@ def _drop_bytecode(directory: Path, module: str) -> None:
             log.warning("Failed to remove %s: %s", p, e)
 
 
+def _fitting(name: str, values: List[int]) -> str:
+    """The attr entry that holds all these values: {'x': 9}, or a signed one."""
+    lo, hi = min(values), max(values)
+    if lo >= 0:
+        return f"{{'{name}': {max(1, hi.bit_length())}}}"
+    width = max(hi.bit_length(), (~lo).bit_length()) + 1
+    return f"{{'{name}': {{'signed': 1, 'width': {width}}}}}"
+
+
 class SimulationMixin:
     """Py2ver's testbenches: the design simulated (a plain Verilog testbench on Icarus or Verilator, or cocotb), its stream wrapper and outputs' latencies."""
 
@@ -298,8 +307,10 @@ class SimulationMixin:
             self.handshake_cycles = payload["cycles"]
         if len(rows) != calls * ser["l"]:
             raise RuntimeError(
-                f"Stream wrapper returned {len(rows)} results for {calls * ser['l']} expected"
-            )
+                f"The stream wrapper's simulation returned {len(rows)} results, not "
+                f"{calls * ser['l']}. What the simulator said is in "
+                f"{self.outdir / 'sim_build_handshake' / 'sim.log'} (or run with "
+                f"PY2VER_SIM_LOG=1 to see it here).")
         if ser["out"]:
             # l element transfers -> one call's outputs
             blocks = []
@@ -321,6 +332,70 @@ class SimulationMixin:
 
     def TB_stream(self) -> Callable[[List[Any]], List[Tuple[int, ...]]]:
         return self._fx_rows(self.tb_stream_fun)
+
+    def _check_function(self, vectors: List[Any], verilog: bool = True) -> List[Tuple[Any, ...]]:
+        """check() for a function: Python as written, py2ver's model of the
+        hardware, and the simulated Verilog must agree. Returns the outputs."""
+        from .process import CheckFailed
+        stream = bool(self.state_map or self.rams or self._seq_mems)
+        vectors = [v if isinstance(v, tuple) else (v,) for v in vectors]
+        model = (self.PY_stream() if stream else self.PY_batch())(vectors)
+        # The model wraps each result to its output's width, as the hardware
+        # does. Python as written doesn't, so where they differ, a width is too
+        # small. (Fixed point, numpy and state have references of their own.)
+        if not stream and self._model is None and self._adapt is None and not self._fx_out:
+            self._check_against_python(vectors, model)
+        if not verilog:
+            return model
+        if not (shutil.which("iverilog") or shutil.which("verilator")):
+            import warnings
+            warnings.warn("check(): no Verilog simulator is installed (Icarus Verilog's iverilog, "
+                          "or Verilator), so only py2ver's model was checked against Python. "
+                          "Install one to check the Verilog too, or pass verilog=False.",
+                          stacklevel=3)
+            return model
+        simulated = (self.TB_stream() if stream else self.TB_batch())(vectors)
+        for vec, want, got in zip(vectors, model, simulated):
+            if want != got:
+                raise CheckFailed(
+                    f"{self.t_name}{vec}: the simulated Verilog gives {got}, py2ver's model "
+                    f"{want}. They should always agree: this is a py2ver bug. Please report "
+                    f"it, with the function and its attr.")
+        return simulated
+
+    def _check_against_python(self, vectors: List[Tuple[Any, ...]],
+                              model: List[Tuple[int, ...]]) -> None:
+        """Raise a CheckFailed saying which output is too narrow (or not a whole
+        number) where Python as written and the model differ."""
+        from .process import CheckFailed
+        from .reference import _flatten_outputs
+        func = self._original()
+        names = [self._py_name.get(n, n) for n in self.output_args_list]
+        python = [dict(zip(self._value_names(), _flatten_outputs(func(*self._py_args(vec)))))
+                  for vec in vectors]
+        for vec, values, row in zip(vectors, python, model):
+            call = f"{getattr(self.func, '__name__', 'the function')}{vec}"
+            for port, name, width, got in zip(self.output_args_list, names,
+                                              self.output_args_width_list, row):
+                want = values[port]
+                if want == got:
+                    continue
+                if isinstance(want, float) and want != int(want):
+                    raise CheckFailed(
+                        f"{call}: Python gives {name} = {want}, but the hardware works in whole "
+                        f"numbers and gives {got}. Use // to divide, or give {name} fraction "
+                        f"bits ('frac' in attr: see \"Fixed point\" in docs/reference.md).")
+                signed = int(self.attr.get(port, {}).get("signed", 0)) == 1
+                lo, hi = (-(1 << (width - 1)), (1 << (width - 1)) - 1) if signed else \
+                    (0, (1 << width) - 1)
+                kind = "signed bits" if signed else "bits"
+                what = ("It can be negative, so make it signed" if want < 0 and not signed
+                        else "Give it more bits")
+                raise CheckFailed(
+                    f"{call}: Python gives {name} = {int(want)}, but its {width} {kind} hold "
+                    f"only {lo} to {hi}, so the hardware gives {got}. {what} in attr: "
+                    f"{_fitting(name, [int(v[port]) for v in python])} holds every value it "
+                    f"takes here.")
 
     def _render_tb(self, template: str, vecs: List[Tuple[int, ...]]) -> None:
         # Write raw bit patterns of each port's width (cocotb rejects e.g. -1
@@ -438,7 +513,10 @@ class SimulationMixin:
                 payload = ast.literal_eval(payload)
             rows = [payload] if isinstance(payload, dict) else list(payload)
         else:
-            log.warning("No TB results found at %s", results_path)
+            raise RuntimeError(
+                f"The simulation of {self.t_name} gave no results. What the simulator said is "
+                f"in {self.outdir / 'sim_build' / 'sim.log'} (or run with PY2VER_SIM_LOG=1 to "
+                f"see it here).")
 
         return self._rows_to_outputs(rows, n_vectors)
 

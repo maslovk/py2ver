@@ -1,28 +1,23 @@
+# A for loop with constant bounds: py2ver writes it out (unrolls it), so all
+# ten additions happen within one clock cycle.
+#
+#   python examples/loop.py                # simulate the Verilog and compare with Python
 from py2ver import Py2ver
 
 from _run import run
 
 
-
-# ==========================================================
-# Example HDL-like Python function with for-loop unrolling
-# ==========================================================
 def sum_loop(x):
     acc = 0
-    for i in range(0, 10):       # unrolled by FunctionVisitor
+    for i in range(10):
         acc = acc + (x + i)
     return acc
 
 
-# ----------------------------------------------------------
-# Attribute definitions (signal widths, signedness)
-# ----------------------------------------------------------
 attr = {
-    'x':   {'signed': 1, 'width': 8},   # input
-    'acc': {'signed': 1, 'width': 16},  # accumulator output
+    "x": {"signed": 1, "width": 8},             # -128 .. 127
+    "acc": {"signed": 1, "width": 16},
 }
-
-# Optional synthesis / Quartus environment attributes
 
 
 if __name__ == "__main__":

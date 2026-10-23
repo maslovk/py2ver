@@ -18,7 +18,8 @@ def rt_add_sub(a, b):
     return s, d
 
 
-def test_tb_fun_returns_zero_tuple_when_results_missing(monkeypatch, tmp_path):
+def test_a_simulation_without_results_says_where_its_log_is(monkeypatch, tmp_path):
+    # (not zeros, which would look like answers)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(py2ver_mod.tb_runner, "test_runner", lambda _top, _proj=None: None)
 
@@ -30,8 +31,9 @@ def test_tb_fun_returns_zero_tuple_when_results_missing(monkeypatch, tmp_path):
     }
     p = Py2ver(rt_add_sub, attr)
 
-    out = p.TB()(7, 3)
-    assert out == (0, 0)
+    with pytest.raises(RuntimeError, match=r"gave no results\. What the simulator said is in "
+                                           r".*sim_build/sim\.log"):
+        p.TB()(7, 3)
 
 
 def test_tb_fun_parses_string_payload_and_applies_signed(monkeypatch, tmp_path):

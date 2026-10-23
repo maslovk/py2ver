@@ -219,7 +219,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         func: the function, as written (a method, numpy code, a torch module
         for its forward(), or a function looping over batches: one step of
         its loop, see numpy_loops.py). attr: widths, formats and state (see
-        the README). With `samples` (example inputs), formats missing from
+        docs/reference.md). With `samples` (example inputs), formats missing from
         attr (or all of them, without attr) are chosen by auto_fixed() from
         the ranges seen: `width` bits per value (default 16), or the fewest
         bits that keep the outputs within `max_error` of the float function,

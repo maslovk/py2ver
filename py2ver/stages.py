@@ -3,7 +3,7 @@
 Build a chain as separate hardware stages instead of one fused block.
 
 A chain is a function calling the blocks' functions (see "Signal chains" in
-the README). Built as one design, everything runs once per block: a stage
+docs/reference.md). Built as one design, everything runs once per block: a stage
 called for each of a block's M samples is built M times. With stages=True,
 each call becomes its own core behind a valid/ready stream wrapper, and a
 top module, <chain>_stages, connects them:

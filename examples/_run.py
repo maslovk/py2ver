@@ -63,7 +63,7 @@ def run(p, vectors, stream=False):
         sim = p.TB_batch()(vectors)
 
     for v, e in list(zip(vectors, expected))[:4]:
-        print(f"  {p.t_name}{v} -> {e}")
+        print(f"  {p.t_name}({', '.join(map(str, v))}) -> {e[0] if len(e) == 1 else e}")
     ok = _report("simulation", sim, expected, vectors)
     if p._fx_out:                 # fixed point: how far from the float model
         state_out = {p._py_name.get(n, n) for n in p.state_map.values()}

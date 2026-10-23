@@ -1,26 +1,30 @@
+# Registers: 'type': 'reg' in attr puts a register on a value.
+#
+# A registered value comes out one clock cycle later, but it splits the logic
+# into shorter pieces, so the design can run at a higher clock. py2ver works out
+# how many cycles each output is late, and the testbench waits for it.
+#
+#   python examples/registers.py           # simulate the Verilog and compare with Python
+#   python examples/registers.py --syn     # see the speed in Quartus (needs Quartus)
 from py2ver import Py2ver
 
 from _run import run
 
 
-def foo(arg1, arg2):
-    a = arg1 + arg2
-    b = arg1 - arg2
-    c = arg1 * arg2
-    d = arg1 / arg2
-    e = d
-    return a, b, c, d, e
+def multiply_add(x, y, z):
+    product = x * y
+    result = product + z
+    return product, result
+
 
 attr = {
-    'arg1': {'signed': 0, 'width': 8},
-    'arg2': {'signed': 0, 'width': 8},
-    'a':    {'signed': 0, 'width': 9},
-    'b':    {'signed': 1, 'width': 9},
-    'c':    {'signed': 0, 'width': 9},
-    'd':    {'signed': 0, 'width': 9, "type": "reg"},
-    'e':    {'signed': 0, 'width': 9, "type": "reg"},
+    "x": 8,
+    "y": 8,
+    "z": 16,
+    "product": {"width": 16, "type": "reg"},    # registered: one cycle late
+    "result": {"width": 17, "type": "reg"},     # computed from product: two cycles late
 }
 
 
 if __name__ == "__main__":
-    run(Py2ver(foo, attr), [(4, 4), (200, 3), (17, 255)])
+    run(Py2ver(multiply_add, attr), [(4, 4, 1), (200, 3, 1000), (255, 255, 65535)])
