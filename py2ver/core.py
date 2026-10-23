@@ -469,6 +469,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         self._ext_inputs: Dict[str, int] = {}     # (sdram=: an input's port -> its SDRAM address)
         if self.state_map or self.rams or self.schedule:
             ir = self._lower_state(ir, f_visitor.attr)
+        if ir.has_clk and not self._pipe:
+            ir = self._rom_registers(ir, f_visitor.rom_reads, f_visitor.attr)
         ir = self._rom_arrays(ir, f_visitor.rom_reads, f_visitor.attr)
         self.ir = ir
 

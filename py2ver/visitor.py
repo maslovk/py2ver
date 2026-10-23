@@ -25,6 +25,16 @@ except Exception:
         return ''.join(ret[:-1])
 
 
+def _int_literal(node: ast.expr) -> int | None:
+    """The integer a constant is (5, or -5 written as minus 5), else None."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _int_literal(node.operand)
+        return None if inner is None else -inner
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    return None
+
+
 # ------------------------------------------------------------
 # Attribute normalization
 # ------------------------------------------------------------
@@ -492,11 +502,9 @@ class FunctionVisitor(ast.NodeVisitor):
             return self._ram_read(node.value.id, node.slice)
         if isinstance(node.slice, ast.Slice):
             raise NotImplementedError("A slice is a list; index it or assign it to a variable")
-        if (self.rom_min and isinstance(node.value, ast.Tuple)
-                and len(node.value.elts) >= self.rom_min
-                and all(isinstance(e, ast.Constant) and type(e.value) is int
-                        for e in node.value.elts)):
-            rom = self._rom_read([e.value for e in node.value.elts], node.slice)
+        if self.rom_min and isinstance(node.value, ast.Tuple) and len(node.value.elts) >= self.rom_min:
+            values = [_int_literal(e) for e in node.value.elts]
+            rom = self._rom_read(values, node.slice) if None not in values else None
             if rom is not None:
                 return rom
         elems = self._visit_list(node.value)

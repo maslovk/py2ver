@@ -6,7 +6,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from .ast_ir import ModuleIR
+from . import vprint
+from .ast_ir import Assignment, ModuleIR
 
 ROM_FILE_MIN = 4096         # a table longer than this is read from a file ($readmemh)
 
@@ -137,6 +138,187 @@ class MemoriesMixin:
         compute = max((c + 1 for c in issue.values()), default=0)
         writes = max((len(p["writes"]) for p in self._ram_ports.values()), default=0)
         return compute + max(writes, 1), {"issue": issue, "compute": compute}
+
+    @staticmethod
+    def _rom_registers(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],
+                       attr: Dict[str, Dict[str, Any]]) -> ModuleIR:
+        """Tables whose value only goes into a register, read by a memory block.
+
+        A memory block gives its value a clock after the address, so a table
+        read used in the same clock stays logic (see _rom_arrays). But when the
+        value only goes into a register r, as in `x = PATH[k]` followed by a
+        yield, the memory block's output register can hold it instead:
+
+            r__q       the memory block's output, loaded when r takes the table's value
+            r__table   whether r's value is r__q (set when r takes the table's value,
+                       cleared when it takes any other)
+            r__held    r's register, for the other values
+            r          a wire: r__table ? r__q : r__held
+
+        This applies when the table's value is r's next value, or one of the
+        choices of it, and nothing else reads the value or that next value."""
+        regs = {}       # (a register -> its update's reset value, next value and hold's cast)
+        for a in ir.assigns:
+            m = re.fullmatch(r"rst \? (.+) : \(ce \? (\w+) : (\$(?:un)?signed)\((\w+)\)\)", a.right)
+            if a.is_reg and m and m.group(4) == a.left:
+                regs[a.left] = (m.group(1), m.group(2), m.group(3))
+        tables = [t for t, rom in rom_reads.items() if "entries" in rom]
+        if not regs or not tables:
+            return ir
+        by_left = {a.left: a for a in ir.assigns}
+        readers: Dict[str, List[str]] = {}       # (a name -> the assignments that read it)
+        for a in ir.assigns:
+            for n in set(re.findall(r"(?<![$\w'])[A-Za-z_]\w*", a.right)):
+                readers.setdefault(n, []).append(a.left)
+        outputs = {p.name for p in ir.outputs}
+
+        def copied(name: str) -> str | None:
+            """The name that `name = other` copies, if name is such a copy."""
+            a = by_left.get(name)
+            if a is None or a.is_reg or not re.fullmatch(r"[A-Za-z_]\w*", a.right):
+                return None
+            return a.right
+
+        def copies(name: str) -> set:
+            """name and the names that copy it (or copy a copy)."""
+            out, todo = {name}, [name]
+            while todo:
+                for r in readers.get(todo.pop(), []):
+                    if r not in out and copied(r) in out:
+                        out.add(r)
+                        todo.append(r)
+            return out
+
+        def choices(node: Any, change: Any) -> Any:
+            """The selection with each of its choices (not its conditions) changed."""
+            if node[0] == "tern":
+                return ("tern", node[1], choices(node[2], change), choices(node[3], change))
+            return change(node)
+
+        def leaves(node: Any) -> List[Any]:
+            found: List[Any] = []
+            choices(node, lambda n: found.append(n) or n)
+            return found
+
+        removed: set = set()
+        new_assigns: List[Assignment] = []
+        items: List[str] = []
+        for r, (init, nxt, cast) in regs.items():
+            if r in outputs or r not in attr:
+                continue
+            # Back from the next value through its copies, to the table's value or
+            # to the selection that makes it
+            chain = [nxt]
+            while copied(chain[-1]) is not None and chain[-1] not in rom_reads:
+                chain.append(copied(chain[-1]))
+            rom = next((t for t in tables if chain[-1] in copies(t)), None)
+            select = None
+            if rom is not None:                   # (the next value is the table's value)
+                reads = [rom]
+                chain = chain[:min(k for k, c in enumerate(chain) if c in copies(rom))]
+                tree = None
+            else:
+                a = by_left.get(chain[-1])
+                tree = vprint.tree_or_none(a.right) if a is not None and not a.is_reg else None
+                if tree is None:
+                    continue
+                # (the choices may read one table at several places: one memory block)
+                reads = [t for t in tables if any(n[0] == "atom" and n[1] in copies(t)
+                                                  for n in leaves(tree))]
+                same = {(tuple(rom_reads[t]["entries"]), rom_reads[t]["width"],
+                         bool(rom_reads[t].get("signed")), rom_reads[t]["address_bits"])
+                        for t in reads}
+                if len(same) != 1:
+                    continue
+                select = chain[-1]
+            read_of = {c: t for t in reads for c in copies(t)}    # (a copy -> its read)
+            table = set(read_of)
+            if select is not None:
+                # (the table's value only a choice, not in a condition or a sum)
+                named = re.findall(r"(?<![$\w'])[A-Za-z_]\w*", by_left[select].right)
+                if sum(n in table for n in named) != sum(n[0] == "atom" and n[1] in table
+                                                         for n in leaves(tree)):
+                    continue
+            # Nothing else reads the table's value, or the next value on its way to r
+            user = select or (chain[-1] if chain else r)
+            if {x for t in table for x in readers.get(t, []) if x not in table} != {user}:
+                continue
+            if any(readers.get(c) != [b] for c, b in zip(chain, [r] + chain)):
+                continue
+            info = rom_reads[reads[0]]
+            w, ab = int(info["width"]), int(info["address_bits"])
+            # (each read's address: its index, as _rom_arrays finds it)
+            address = {}
+            for t in reads:
+                index = set(re.findall(r"(?<![$\w'])[A-Za-z_]\w*", by_left[t].right))
+                if len(index) != 1:
+                    break
+                idx = index.pop()
+                iw = int(attr.get(idx, attr.get(rom_reads[t]["index"], {})).get("width", ab + 1))
+                address[t] = f"{idx}[{ab - 1}:0]" if iw > ab else idx
+            if len(address) != len(reads):
+                continue
+
+            def is_table(n: Any) -> bool:
+                return n[0] == "atom" and n[1] in table
+
+            held, flag, q = f"{r}__held", f"{r}__table", f"{r}__q"
+            if select is None:
+                load = keep = "1'b1"
+                addr = address[rom]
+                held_next = held                # (r__held is unused: it holds)
+                removed |= set(chain)
+            else:
+                own = copies(r)
+                one, zero = ("atom", "1'b1"), ("atom", "1'b0")
+                load = vprint.text(choices(tree, lambda n: one if is_table(n) else zero))
+                keep = vprint.text(choices(tree, lambda n: one if is_table(n) else (
+                    ("atom", flag) if n[0] == "atom" and n[1] in own else zero)))
+                # (the address of the read chosen; with no read chosen, any)
+                first = ("atom", address[reads[0]])
+                addr = vprint.text(choices(tree, lambda n: ("atom", address[read_of[n[1]]])
+                                           if is_table(n) else first)) if len(reads) > 1 \
+                    else address[reads[0]]
+                # (r__held takes the other choices; when r takes the table's, any value)
+                new_assigns.append(Assignment(
+                    select, vprint.text(choices(tree, lambda n: ("atom", r) if is_table(n) else n)),
+                    False, by_left[select].line))
+                removed.add(select)
+                held_next = nxt
+            rw = int(attr[r].get("width", 1))
+            if rw > w:                      # (r's value: the entry extended by its sign)
+                fill = f"{{{rw - w}{{{q}[{w - 1}]}}}}" if info.get("signed") else f"{rw - w}'d0"
+                value = f"{{{fill}, {q}}}"
+            else:
+                value = f"{q}[{rw - 1}:0]" if rw < w else q
+            entries = list(info["entries"])
+            entries += [entries[-1]] * ((1 << ab) - len(entries))
+            mask = (1 << w) - 1
+            arr = f"{r}__rom"
+            items += [f"// Table in a memory block: {len(info['entries'])} x {w} bits, "
+                      f"its entry for {r} a clock after the address",
+                      f"reg [{w - 1}:0] {arr} [0:{len(entries) - 1}];",
+                      "initial begin"]
+            items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+            items += ["end",
+                      f"reg [{w - 1}:0] {q};",
+                      f"wire [{ab - 1}:0] {q}__address = {addr};",
+                      f"always @(posedge clk) if (ce && {flag}__load) {q} <= {arr}[{q}__address];"]
+            attr[held] = dict(attr[r])
+            for n in (flag, f"{flag}__load", f"{flag}__next"):
+                attr[n] = {"width": 1, "signed": 0}
+            new_assigns += [
+                Assignment(f"{flag}__load", load, False),
+                Assignment(f"{flag}__next", keep, False),
+                Assignment(held, f"rst ? {init} : (ce ? {held_next} : {cast}({held}))", True),
+                Assignment(flag, f"rst ? 1'b0 : (ce ? {flag}__next : $unsigned({flag}))", True),
+                Assignment(r, f"{flag} ? {value} : {held}", False)]
+            removed |= {r} | table
+        if not removed:
+            return ir
+        return ModuleIR(name=ir.name, inputs=ir.inputs, outputs=ir.outputs,
+                        assigns=[a for a in ir.assigns if a.left not in removed] + new_assigns,
+                        has_clk=ir.has_clk, items=list(ir.items) + items)
 
     @staticmethod
     def _rom_arrays(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],

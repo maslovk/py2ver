@@ -9,6 +9,8 @@
 #   python examples/mandelbrot.py           # a small picture: test it, save mandelbrot.png
 #   python examples/mandelbrot.py --sim     # also simulate the generated Verilog
 #   python examples/mandelbrot.py --syn     # also build it in Quartus (size and speed)
+import cmath
+import math
 import os
 import sys
 from typing import NamedTuple
@@ -101,6 +103,26 @@ def escape_count(port, cx, cy, max_iter, frac=FRAC):
     return n
 
 
+def escape_count_from(port, zx, zy, cx, cy, max_iter, frac=FRAC):
+    """escape_count, with z starting at (zx, zy) rather than 0: the Mandelbrot
+    set's way with z at 0 and c the pixel, a Julia set's with z the pixel and c
+    the same for the whole picture."""
+    xx = (zx * zx) >> frac               # z's first products: a clock of their own,
+    yy = (zy * zy) >> frac               # so that the loop's first step starts
+    xy = (zx * zy) >> (frac - 1)         # with registers (one multiplier deep)
+    yield
+    n = 0
+    while n < max_iter and xx + yy <= (4 << frac):
+        zx = xx - yy + cx
+        zy = xy + cy
+        xx = (zx * zx) >> frac
+        yy = (zy * zy) >> frac
+        xy = (zx * zy) >> (frac - 1)
+        n = n + 1
+        yield
+    return n
+
+
 def escape_widths(frac=FRAC):
     """The escape loop's widths in attr, for `frac` fraction bits.
 
@@ -173,10 +195,38 @@ def zoom(x=-0.743643887, y=0.131825904, start_width=3.2, end_width=0.0016, width
 ZOOM = zoom()
 
 
-def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER,
-                    colors=CYCLIC, cycle=1):
-    """An animation: a picture after another, zooming in on area's point, then
-    back out again, and in again, and so on.
+class Julia(NamedTuple):
+    """Julia sets morphing: the view (its top-left pixel x0, y0 and the distance
+    between pixels, fixed point), and c for each frame in turn (path_x, path_y)."""
+    x0: int
+    y0: int
+    step: int
+    path_x: tuple
+    path_y: tuple
+
+
+def julia(radius=0.7885, frames=360, across=3.2, width=WIDTH, height=HEIGHT, frac=ZOOM_FRAC):
+    """Julia sets for c going once round a circle of `radius` in `frames` frames
+    (0.7885: just outside the Mandelbrot set, where Julia sets are most
+    intricate); the view `across` wide, centered on 0."""
+    scale = 1 << frac
+    step = across / width
+    path = [cmath.rect(radius, 2 * math.pi * k / frames) for k in range(frames)]
+    return Julia(round(-across / 2 * scale), round(step * height / 2 * scale),
+                 round(step * scale), tuple(round(c.real * scale) for c in path),
+                 tuple(round(c.imag * scale) for c in path))
+
+
+JULIA = julia()
+
+
+def fractal_show(port, area=ZOOM, morph=JULIA, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER,
+                 colors=CYCLIC, cycle=1):
+    """An animation in two modes, switched with a key (port.key, 0 while pressed;
+    read once a frame, which also gets past its bounces):
+
+    - the Mandelbrot set, zooming in on area's point, then back out, and so on;
+    - Julia sets morphing, for c going round morph's path, a step a frame.
 
     cycle: how many places the colors move along the palette each frame (0:
     they stay), so that the bands seem to flow; points in the set stay black.
@@ -186,16 +236,37 @@ def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_IT
     step = area.start
     zooming_in = 1
     offset = 0                                   # how far the colors have cycled
+    julia_mode = 0
+    k = 0                                        # where c is on the Julia path
+    was = 1
     while True:
-        x0 = area.cx - step * (width // 2)       # the top-left pixel, from the center
-        y0 = area.cy + step * (height // 2)
+        key = port.key                           # pressed (just now): the other mode
+        if was == 1 and key == 0:
+            julia_mode = 1 - julia_mode
+        was = key
+        if julia_mode:
+            x0 = morph.x0                        # the Julia view stays put
+            y0 = morph.y0
+            spacing = morph.step
+            jx = morph.path_x[k]                 # (used after a yield: the tables are
+            jy = morph.path_y[k]                 # read by memory blocks, not built as logic)
+        else:
+            x0 = area.cx - step * (width // 2)   # the top-left pixel, from the center
+            y0 = area.cy + step * (height // 2)
+            spacing = step
+            jx = 0
+            jy = 0
         for row in range(height):
-            cy = y0 - row * step
+            py = y0 - row * spacing
             for col in range(width):
-                cx = x0 + col * step
+                px = x0 + col * spacing
                 yield                    # a clock for the coordinates' multiply, before
                                          # the escape loop's (one multiplier per clock)
-                n = yield from escape_count(port, cx, cy, max_iter, area.frac)
+                if julia_mode:           # Julia: z from the pixel, c the frame's
+                    zx, zy, ccx, ccy = px, py, jx, jy
+                else:                    # Mandelbrot: z from 0, c the pixel
+                    zx, zy, ccx, ccy = 0, 0, px, py
+                n = yield from escape_count_from(port, zx, zy, ccx, ccy, max_iter, area.frac)
                 index = n                        # in the set: black, as it is
                 if n < max_iter:
                     index = n + offset           # else the color `offset` places along
@@ -205,9 +276,14 @@ def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_IT
         offset = offset + cycle                  # the next frame's colors, moved along
         if offset >= max_iter:
             offset = offset - max_iter
+        if julia_mode:                           # the next frame's c, round the path
+            if k == len(morph.path_x) - 1:
+                k = 0
+            else:
+                k = k + 1
         # The next frame's step: smaller zooming in, larger zooming out (by 1 at
         # least either way: once step is under 2**shrink, step >> shrink is 0)
-        if zooming_in:
+        elif zooming_in:
             step = step - (step >> area.shrink) - 1
             if step <= area.smallest:
                 step = area.smallest             # the deepest: turn around
@@ -219,7 +295,7 @@ def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_IT
                 zooming_in = 1
 
 
-ZOOM_ATTR = {"ready": 1, **escape_widths(ZOOM_FRAC)}
+ZOOM_ATTR = {"ready": 1, "key": 1, **escape_widths(ZOOM_FRAC)}
 
 
 def picture(width, height):

@@ -454,6 +454,80 @@ def test_a_conditional_expression_s_test_bounds_its_branches():
     assert {g["walk"] for g in gen} == {0, 1, 2, 4, 8, 16}
 
 
+def halve_until_small(port, x):
+    while x > 3:
+        x = x >> 1                           # (a parameter the step changes: a local too)
+        yield
+    return x
+
+
+def halves(port):
+    while True:
+        if port.pick:
+            a = yield from halve_until_small(port, port.v)
+        else:
+            a = yield from halve_until_small(port, 0)
+        port.out = a
+        yield
+
+
+def test_a_step_s_changed_parameter_is_one_local():
+    # (it was named twice, halve_until_small2_x, which made {'x': ...} in attr
+    # look like a local of two steps)
+    p = _quiet(halves, {"v": 8, "pick": 1, "x": 9})
+    assert p.process.locals == ["halve_until_small_x", "a"]     # (both calls: one register)
+    assert p.process.attr["halve_until_small_x"]["width"] == 9  # ('x' in attr: its own name)
+    clocks = [{"v": v, "pick": 1} for v in (200, 7, 64, 3)] * 5
+    assert p.PY_process()(clocks) == p.GEN_process()(clocks)
+
+
+PATH = tuple((k * 7919) % 2001 - 1000 for k in range(100))      # (signed entries)
+
+
+def follows_path(port):
+    k = 0
+    x = 0
+    while True:
+        if port.hold:
+            x = 0                            # (a constant, or the table's entry)
+        else:
+            x = PATH[k]
+        yield                                # (x used only after a yield: a memory block)
+        port.out = x * 3
+        k = 0 if k == len(PATH) - 1 else k + 1
+
+
+def reads_path_at_once(port):
+    k = 0
+    while True:
+        port.out = PATH[k] + 1               # (used in the clock it's read: logic)
+        yield 2
+        k = 0 if k == len(PATH) - 1 else k + 1
+
+
+_PATH_CLOCKS = [{"hold": int(i % 37 < 5)} for i in range(250)]
+
+
+def test_a_table_whose_entry_waits_for_a_clock_is_a_memory_block():
+    p = _quiet(follows_path, {"hold": 1})
+    assert "x__q <= x__rom[x__q__address];" in p.verilog
+    gen = p.GEN_process()(_PATH_CLOCKS)
+    assert p.PY_process()(_PATH_CLOCKS) == gen
+    assert {g["out"] for g in gen} >= {0, 3 * PATH[1], 3 * min(PATH)}
+    at_once = _quiet(reads_path_at_once, None)
+    assert "// Table: 100 x 11 bits" in at_once.verilog
+    assert "memory block" not in at_once.verilog
+
+
+@pytest.mark.sim
+def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = _quiet(follows_path, {"hold": 1})
+    assert p.TB_process()(_PATH_CLOCKS) == p.GEN_process()(_PATH_CLOCKS)
+    q = _quiet(reads_path_at_once, None)
+    assert q.TB_process()([{}] * 250) == q.GEN_process()([{}] * 250)
+
+
 def test_a_parameter_is_a_constant_a_partial_its_value():
     half = U.BIT // 2
     tx = _quiet(functools.partial(U.uart_tx, bit=half), U.TX)

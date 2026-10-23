@@ -41,7 +41,7 @@ board's pins); each file's first lines list them.
 | [lcd.py](lcd.py) | a test picture on an ILI9341 TFT display; the model saves it as a PNG |
 | [mandelbrot.py](mandelbrot.py) | a Mandelbrot set generator, one iteration a clock, streaming RGB565 pixels for a display |
 | [mandelbrot_lcd.py](mandelbrot_lcd.py) | the generator connected to the ILI9341 display: two blocks joined by a stream |
-| [mandelbrot_zoom.py](mandelbrot_zoom.py) | an animation on the display: zooming into the seahorse valley, about 7 frames a second |
+| [mandelbrot_zoom.py](mandelbrot_zoom.py) | a fractal show on the display, its colors cycling: the Mandelbrot set zooming in and out, or (KEY1) Julia sets morphing; 10 to 17 frames a second |
 
 ## Signal processing
 

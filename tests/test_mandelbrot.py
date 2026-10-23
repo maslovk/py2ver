@@ -59,15 +59,55 @@ def test_the_picture_on_a_display(sim, monkeypatch, tmp_path):
     assert screen.on and screen.pixels == sent
 
 
-def _frames(width, height, count):
-    """A testbench: `count` pictures in a row, from the stream."""
+def _frames(width, height, count, press_at=None):
+    """A testbench: `count` pictures in a row, from the stream; the key released
+    (1, as the board's keys read), but pressed while frame `press_at` comes."""
     def tb(dut):
         shots = []
-        for _ in range(count):
+        for k in range(count):
+            dut.key = 0 if k == press_at else 1
             shot = yield from M.picture(width, height)(dut)
             shots.append(shot)
         return shots
     return tb
+
+
+def _julia_counts(morph, k, width, height, max_iter, frac=M.ZOOM_FRAC):
+    """Frame k of the Julia morph, in floating point: each pixel's escape count."""
+    scale = 1 << frac
+    c = complex(morph.path_x[k], morph.path_y[k]) / scale
+    rows = []
+    for row in range(height):
+        out = []
+        for col in range(width):
+            z = complex(morph.x0 + col * morph.step, morph.y0 - row * morph.step) / scale
+            n = 0
+            while n < max_iter and abs(z) <= 2:
+                z = z * z + c
+                n += 1
+            out.append(n)
+        rows.append(out)
+    return rows
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_a_key_switches_to_julia_sets_morphing(sim, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    w, h, iters = 12, 8, 16
+    area = M.zoom(width=w)
+    morph = M.julia(frames=6, width=w, height=h)
+    f = functools.partial(M.fractal_show, area=area, morph=morph, width=w, height=h,
+                          max_iter=iters, colors=tuple(range(iters + 1)), cycle=0)
+    p = _quiet(f, M.ZOOM_ATTR)
+    shots = p.check(_frames(w, h, 6, press_at=2), verilog=sim).value
+
+    def like(shot, counts):
+        return sum(a == b for x, y in zip(shot, counts) for a, b in zip(x, y)) >= 0.9 * w * h
+    first = next(k for k in range(6) if like(shots[k], _julia_counts(morph, 0, w, h, iters)))
+    assert first in (2, 3)                                      # (from the press on)
+    assert not like(shots[0], _julia_counts(morph, 0, w, h, iters))
+    for j in range(first, 6):                                   # (c a step further each frame)
+        assert like(shots[j], _julia_counts(morph, j - first, w, h, iters))
 
 
 @pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
@@ -76,7 +116,7 @@ def test_a_zoom_frame_after_frame(sim, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     w, h, iters = 8, 6, 8
     area = M.zoom(start_width=3.2, end_width=0.5, width=w)._replace(shrink=1)
-    f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
+    f = functools.partial(M.fractal_show, area=area, width=w, height=h, max_iter=iters,
                           colors=M.palette(iters), cycle=0)
     p = _quiet(f, M.ZOOM_ATTR)
     shots = p.check(_frames(w, h, 9), verilog=sim).value
@@ -91,7 +131,7 @@ def test_the_colors_cycle_frame_after_frame(sim, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     w, h, iters = 8, 6, 8
     area = M.zoom(start_width=3.2, end_width=3.2, width=w)
-    f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
+    f = functools.partial(M.fractal_show, area=area, width=w, height=h, max_iter=iters,
                           colors=tuple(range(iters + 1)), cycle=3)
     p = _quiet(f, M.ZOOM_ATTR)
     shots = p.check(_frames(w, h, 4), verilog=sim).value
@@ -111,9 +151,9 @@ def test_a_zoom_turns_around_at_both_ends(sim, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     w, h, iters = 4, 3, 4
     area = M.Zoom(cx=-8, cy=0, start=40, smallest=7, shrink=4, frac=4)
-    f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
+    f = functools.partial(M.fractal_show, area=area, width=w, height=h, max_iter=iters,
                           colors=tuple(range(iters + 1)), cycle=0)
-    p = _quiet(f, {"ready": 1, **M.escape_widths(4)})
+    p = _quiet(f, {"ready": 1, "key": 1, **M.escape_widths(4)})
     shots = p.check(_frames(w, h, 60), verilog=sim).value
     deepest = [[iters] * w for _ in range(h)]                       # (all in the set)
     assert shots[19] == deepest and shots[20] == shots[18]          # (in, and turning back)

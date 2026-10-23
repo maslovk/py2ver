@@ -842,7 +842,8 @@ class _Expander:
         names = self.names.get(base)
         if names is None:
             names = {}
-            for n in list(sig.parameters) + sorted(_stored(fd.body)):
+            # (each name once: a parameter the step assigns is in both lists)
+            for n in dict.fromkeys(list(sig.parameters) + sorted(_stored(fd.body))):
                 name, k = f"{base.__name__}_{n}", 1
                 while name in self.used:
                     k += 1

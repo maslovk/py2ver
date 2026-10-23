@@ -133,6 +133,29 @@ renamed:
   `edge_n` (section 3). In attr it can go by its own name, `{"n": 8}`, as
   long as only one step has an `n` (and the process itself doesn't).
 
+### Tables
+
+A tuple of 64 or more numbers, read at a variable index (`PATH[k]`), is a
+table. Where it goes depends on when its entry is used:
+
+- If the entry is only stored in a local and used after the next `yield`,
+  the table goes into a memory block, which reads it on the clock edge.
+  This costs no logic for the table itself.
+- If the entry is used in the same clock it is read (`port.out = PATH[k] + 1`),
+  the table is built as logic, which takes many LUTs for a large table.
+
+So, for a large table, read the entry into a local, then `yield`, then use it:
+
+```python
+x = PATH[k]
+yield
+port.out = x * 3
+```
+
+The local can also be set to other values elsewhere (`x = 0`). The Julia
+paths in `examples/mandelbrot.py` are read this way. Their two tables of 360
+entries take 25,600 memory bits, where as logic they took about 3,700 LUTs.
+
 ## 3. Steps, parameters and the protocol library
 
 A step that a protocol takes more than once can be written as a generator of
@@ -163,6 +186,19 @@ settings. Its fields are read where the step is built (`bus.q`, `bus.scl`),
 it can be given on to other steps, and it can be made in a process from
 constants (`SPI(half, mode=3)`, with `half` a parameter). Its fields can't be
 assigned, and it isn't a value of its own (`x = bus` is refused).
+
+A step is built where it's used: each `yield from` of it adds its states and
+logic there (its locals' registers are shared by all of them). A step with
+multipliers, used in two places, gets them twice. If only the inputs differ,
+choose them first and use the step once:
+
+```py
+if julia_mode:
+    zx, zy, cx, cy = px, py, jx, jy          # not a yield from in each branch
+else:
+    zx, zy, cx, cy = 0, 0, px, py
+n = yield from escape_count_from(port, zx, zy, cx, cy, max_iter)
+```
 
 `py2ver.protocol` has common steps. Each takes the port, then a pin's name (a
 constant string) or a bus's record: `SPI(half, mode=0, sclk="sclk",
