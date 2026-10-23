@@ -248,7 +248,12 @@ def _analyze(node: Node, meta) -> Info:
     if op in (">>", ">>>"):
         return Info(a.bits, a.nonneg)
     if op == "&":
-        return Info(max(a.bits, b.bits), a.nonneg or b.nonneg)
+        # (with a part that can't be negative: no larger than it, x & 31 at most 31)
+        if a.nonneg and b.nonneg:
+            return Info(min(a.bits, b.bits), True)
+        if a.nonneg or b.nonneg:
+            return Info(a.bits if a.nonneg else b.bits, True)
+        return Info(max(a.bits, b.bits), False)
     if op in ("|", "^"):
         return Info(max(a.bits, b.bits), a.nonneg and b.nonneg)
     raise Unsupported(f"operator {op!r}")
