@@ -573,6 +573,7 @@ driver step takes the port, then the bus's record:
 | `adc128s022` (ADC, SPI) | `adc128s022_read(port, adc, channel)` → its 16 bits (4 zeros, 12 of result); `adc128s022_frame(...)` | `adc128s022_model(values, frames)` |
 | `eeprom24` (24LC02, I2C) | `eeprom_read(port, bus, offset)` → `value, nack`; `eeprom_write(port, bus, offset, value)` → `nack`, its write cycle waited for | `eeprom_model(dut, mem, transfers, write_clocks=5000)` |
 | `ili9341` (240 x 320 display, SPI) | `ili9341_init(port, lcd)`; `ili9341_fill(port, lcd, x0, y0, x1, y1, color)`; `ili9341_window(...)` then `ili9341_pixel(port, lcd, color)` for each pixel; `rgb565(r, g, b)`; `ili9341_display`, a whole process that shows a stream of pixels (connect it after a block that sends them) | `ILI9341Model()`: `.run(dut)` keeps the picture, `.save("screen.png")` |
+| `font` (text, 8 x 13) | not a device: `FONT`, a table of the printable ASCII characters' rows of pixels (X11's fixed font), `FONT[(c - FIRST) * HEIGHT + row]`, bit 7 the leftmost; `examples/terminal.py` draws with it | `glyph(c)`: a character's rows, in Python |
 | `i2c_target` | | `i2c_memory(dut, mem, transfers, address)`: any chip of registers on I2C |
 | `spi_target` | | `spi_listen(dut, bus, cs_n, on_word)`: the bit-level part of a chip that listens on SPI |
 
