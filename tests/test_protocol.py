@@ -287,7 +287,7 @@ def test_errors_say_where_and_all_at_once():
                                                    r"\S*test_protocol\.py:\d+ -> "):
         process.compile_process(no_clock, {"a": 1})
     with pytest.raises(process.ProcessError, match=r"'j' \(\S*test_protocol\.py:\d+\), 'k' "
-                                                   r"\(\S*test_protocol\.py:\d+\): their values grow"):
+                                                   r"\(\S*test_protocol\.py:\d+\) need: nothing"):
         process.compile_process(two_counters, {"a": 1})
 
 

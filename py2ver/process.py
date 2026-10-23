@@ -1731,12 +1731,13 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
                         unbounded.append(v)
                 if len(unbounded) == 1:
                     v = unbounded[0]
-                    raise ProcessError(f"{where_of(v)}: '{user_name(v)}': its values grow without "
-                                       f"end as followed: give its width in attr")
+                    raise ProcessError(f"{where_of(v)}: {_unbounded(user_name(v))}")
                 if unbounded:
                     each = ", ".join(f"'{user_name(v)}' ({where_of(v)})" for v in sorted(unbounded))
-                    raise ProcessError(f"{fname}: {each}: their values grow without end as "
-                                       f"followed: give their widths in attr")
+                    raise ProcessError(
+                        f"{fname}: py2ver can't tell how many bits {each} need: nothing in the "
+                        f"code limits their values. Give each a width in attr, or limit it "
+                        f"with a test such as `while x > 0` (rather than `while x != 0`).")
                 new = widened
             start[j] = new
             if j not in todo:
@@ -1751,17 +1752,22 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
             if s:
                 r = _hull(r, s[v])
         if max(abs(r[0]), abs(r[1])) >> MAX_BITS:
-            raise ProcessError(f"{_at(first[v]) if v in first else fname}: '{v}': its values "
-                               f"grow without end as followed: give its width in attr")
+            raise ProcessError(f"{_at(first[v]) if v in first else fname}: {_unbounded(v)}")
         out[v] = dict(_fmt_of(r))
     for o in followed:
         v = int(attr.get(o, {}).get("init", 0))
         r = _hull(assigned.get(f"{o}__n", (v, v)), (v, v))
         if max(abs(r[0]), abs(r[1])) >> MAX_BITS:
-            raise ProcessError(f"{fname}: the output '{o}': its values grow without end as "
-                               f"followed: give its width in attr")
+            raise ProcessError(f"{fname}: the output {_unbounded(o)}")
         out[o] = dict(_fmt_of(r))
     return out
+
+
+def _unbounded(name: str) -> str:
+    """The message for a value whose width can't be worked out."""
+    return (f"py2ver can't tell how many bits '{name}' needs: nothing in the code limits its "
+            f"value. Give it a width in attr ({{'{name}': 16}}, say), or limit it with a test "
+            f"such as `while {name.rsplit('_', 1)[-1]} > 0` (rather than `!= 0`).")
 
 
 # ==================================================================== processes together

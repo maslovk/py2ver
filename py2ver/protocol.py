@@ -140,7 +140,9 @@ class SPI(NamedTuple):
     mode: the SPI mode, 0 to 3. Its high bit (CPOL) is SCLK's idle level; its
           low bit (CPHA) says when data is read: 0 on the first edge of each
           clock pulse, 1 on the second.
-    sclk, mosi, miso: the names of the bus's pins.
+    sclk, mosi, miso: the names of the bus's pins. Use miso="" for a chip that
+          only listens (a display, say): nothing is read back, and the
+          design gets no MISO input.
     """
     half: int
     mode: int = 0
@@ -152,9 +154,9 @@ class SPI(NamedTuple):
 def spi_transfer(port, bus, word, bits):
     """Send `bits` bits of `word` on MOSI while reading as many from MISO.
 
-    Both go most significant bit first. Returns the word that was read.
-    Selecting the chip (pulling its CS low) is up to the caller, and SCLK
-    should be at its idle level when the transfer starts.
+    Both go most significant bit first. Returns the word that was read (0 on
+    a bus without MISO). Selecting the chip (pulling its CS low) is up to the
+    caller, and SCLK should be at its idle level when the transfer starts.
     """
     idle = bus.mode >> 1
     received = 0
@@ -166,14 +168,16 @@ def spi_transfer(port, bus, word, bits):
             setattr(port, bus.mosi, bit)
             yield bus.half
             setattr(port, bus.sclk, idle)
-            received = received | (getattr(port, bus.miso) << (bits - 1 - i))
+            if bus.miso:
+                received = received | (getattr(port, bus.miso) << (bits - 1 - i))
             yield bus.half
         else:
             # CPHA 0: set the data before the first edge, read on it.
             setattr(port, bus.mosi, bit)
             yield bus.half
             setattr(port, bus.sclk, 1 - idle)
-            received = received | (getattr(port, bus.miso) << (bits - 1 - i))
+            if bus.miso:
+                received = received | (getattr(port, bus.miso) << (bits - 1 - i))
             yield bus.half
             setattr(port, bus.sclk, idle)
     return received
@@ -371,8 +375,8 @@ def together(*steps):
                                         uart_receive(dut, "tx", BIT))
 
     Every step must end on its own; one that watches the pins forever keeps
-    together() from ever returning. (Inside a design, run things at the same
-    time with connect() instead.)
+    together() from ever returning (use alongside() for those). Inside a
+    design, run things at the same time with connect() instead.
     """
     waits = [0] * len(steps)
     values = [None] * len(steps)
@@ -387,5 +391,32 @@ def together(*steps):
                     done[k], values[k] = True, stop.value
         if all(done):
             return values
+        yield
+        waits = [w - 1 for w in waits]
+
+
+def alongside(main, *models):
+    """Run a testbench step with chip models beside it, and return main's value.
+
+    The models (an ADC's, a display's, ...) play the chips the design talks
+    to. They may run forever: they stop as soon as main returns.
+
+        def tb(dut):
+            got = yield from alongside(read_the_answer(dut), display.run(dut))
+            return got
+    """
+    models = list(models)
+    waits = [0] * (1 + len(models))
+    steps = [main] + models
+    while True:
+        for k, step in enumerate(steps):
+            if step is not None and waits[k] == 0:
+                try:
+                    n = next(step)
+                    waits[k] = 1 if n is None else int(n)
+                except StopIteration as stop:
+                    if k == 0:
+                        return stop.value
+                    steps[k] = None             # a model that ended: the rest go on
         yield
         waits = [w - 1 for w in waits]

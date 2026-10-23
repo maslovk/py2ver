@@ -160,7 +160,7 @@ mosi="mosi", miso="miso")` or `I2C(q=125, scl="scl", sda="sda")`:
 | `shift_in(port, pin, bits, clocks, msb_first=False)` | reads `bits` bits from the pin, one every `clocks` clocks, and returns the value |
 | `uart_send(port, pin, byte, bit)` | sends a UART frame |
 | `uart_receive(port, pin, bit)` | receives a UART frame and returns its byte |
-| `spi_transfer(port, bus, word, bits)` | an SPI word out on the bus's MOSI and in from its MISO (the result), `bus.half` clocks a half of SCLK, in SPI mode `bus.mode` (0 to 3); the chip select is yours |
+| `spi_transfer(port, bus, word, bits)` | an SPI word out on the bus's MOSI and in from its MISO (the result), `bus.half` clocks a half of SCLK, in SPI mode `bus.mode` (0 to 3); the chip select is yours. For a chip that only listens, `SPI(..., miso="")`: no MISO input at all |
 | `i2c_start(port, bus)`, `i2c_stop(port, bus)` | an I2C start (or repeated start), a stop; `bus.q` a quarter of SCL's period in clocks |
 | `i2c_write_byte(port, bus, byte)` | a byte out; returns 1 if it wasn't acknowledged |
 | `i2c_read_byte(port, bus, last)` | a byte in, acknowledged unless `last` |
@@ -171,6 +171,7 @@ mosi="mosi", miso="miso")` or `I2C(q=125, scl="scl", sda="sda")`:
 | `jtag_print(port, b"text")` | sends a constant message to the PC: a debug console |
 | `jtag_print_hex(port, value, digits)` | sends a number to the PC in hexadecimal |
 | `together(*steps)` | in testbenches only: runs steps at the same time, and returns when every one has returned, with a list of their values (section 5) |
+| `alongside(main, *models)` | in testbenches only: runs `main` with chip models beside it, and returns `main`'s value as soon as it returns; the models may run forever |
 
 `debounced(port, clocks)` is a whole process rather than a step: connect it
 in front of a switch or a slow line (section 7) and its `port.clean` follows
@@ -469,7 +470,9 @@ driver step takes the port, then the bus's record:
 | `adxl345` (accelerometer, I2C) | `adxl345_start(port, bus)` → `nack`; `adxl345_id(port, bus)` → `id, nack`; `adxl345_read_xyz(port, bus)` → `x, y, z, nack` | `adxl345_model(dut, registers(x, y, z), transfers)` |
 | `adc128s022` (ADC, SPI) | `adc128s022_read(port, adc, channel)` → its 16 bits (4 zeros, 12 of result); `adc128s022_frame(...)` | `adc128s022_model(values, frames)` |
 | `eeprom24` (24LC02, I2C) | `eeprom_read(port, bus, offset)` → `value, nack`; `eeprom_write(port, bus, offset, value)` → `nack`, its write cycle waited for | `eeprom_model(dut, mem, transfers, write_clocks=5000)` |
+| `ili9341` (240 x 320 display, SPI) | `ili9341_init(port, lcd)`; `ili9341_fill(port, lcd, x0, y0, x1, y1, color)`; `ili9341_window(...)` then `ili9341_pixel(port, lcd, color)` for each pixel; `rgb565(r, g, b)` | `ILI9341Model()`: `.run(dut)` keeps the picture, `.save("screen.png")` |
 | `i2c_target` | | `i2c_memory(dut, mem, transfers, address)`: any chip of registers on I2C |
+| `spi_target` | | `spi_listen(dut, bus, cs_n, on_word)`: the bit-level part of a chip that listens on SPI |
 
 A step can be called through its module (`adxl345.adxl345_read_xyz(port,
 bus)`), and a module's constants read the same way (`adxl345.POWER_CTL`).
@@ -800,7 +803,7 @@ keeps meeting 50 MHz. Quartus also reports SignalTap's JTAG clock
 | message | meaning, and what to do |
 |---|---|
 | `give the input 'x' its width in attr` | every input needs a width: `{"x": 8}`, or a pin |
-| `'x': its values grow without end as followed: give its width in attr` | nothing bounds `x`; give its width, or test it against a bound |
+| `py2ver can't tell how many bits 'x' needs: nothing in the code limits its value` | give `x` a width in attr, or test it against a bound: a countdown `while x > 0` is bounded, `while x != 0` isn't |
 | `a loop that doesn't yield: in one clock it can go a.py:46 -> a.py:34 -> a.py:46` | that path never reaches a `yield`; add one, or a test the inputs rule out |
 | `a while loop that doesn't yield (it would wait without a clock passing)` | a `while` without a `yield` in it can't wait; add a `yield` |
 | `the port 'data' (8 bits): LED[7:1]: 7 pins for a port of 8 bits` | give 8 pins, or give the port 7 bits in attr |

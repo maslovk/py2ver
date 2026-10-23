@@ -8,7 +8,9 @@ from py2ver import Py2ver
 from py2ver.devices import adxl345 as X
 from py2ver.devices.adc128s022 import ADC128S022, adc128s022_model, adc128s022_read
 from py2ver.devices.eeprom24 import eeprom_model, eeprom_read, eeprom_write
-from py2ver.protocol import I2C, SPI, together, wait_until
+from py2ver.devices.ili9341 import (ILI9341, ILI9341Model, ili9341_fill, ili9341_init,
+                                    ili9341_pixel, ili9341_window, rgb565)
+from py2ver.protocol import I2C, SPI, alongside, together, wait_until
 
 # Each chip's driver (py2ver.devices) against the chip's model on the same pins:
 # the generator, the machine's model and (marked sim) the Verilog, clock for clock.
@@ -112,6 +114,66 @@ def test_an_adc128s022_read_input_by_input(sim, monkeypatch, tmp_path):
     (a, b), _ = _check(p, with_chip(until_done("a", "b"),
                                     adc128s022_model(values, 4, QUICK_ADC)), sim).value
     assert (a, b) == (values[5], values[2])                # (the frame's 4 zeros: 12 bits)
+
+
+# ------------------------------------ ILI9341 ------------------------------------
+
+QUICK_LCD = ILI9341(wake_clocks=20)
+RED, GREEN, BLUE, GREY = rgb565(255, 0, 0), rgb565(0, 255, 0), rgb565(0, 0, 255), 0x8410
+
+
+def draws(port, lcd=QUICK_LCD):
+    port.done = 0
+    yield from ili9341_init(port, lcd)
+    yield from ili9341_fill(port, lcd, 1, 2, 3, 3, RED)        # a 3 x 2 rectangle
+    yield from ili9341_window(port, lcd, 5, 0, 6, 1)            # a 2 x 2 one, pixel by pixel
+    yield from ili9341_pixel(port, lcd, RED)
+    yield from ili9341_pixel(port, lcd, GREEN)
+    yield from ili9341_pixel(port, lcd, BLUE)
+    yield from ili9341_pixel(port, lcd, GREY)
+    port.done = 1
+    while True:
+        yield
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_an_ili9341_drawn_on(sim, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    screen = ILI9341Model(QUICK_LCD, width=8, height=4)
+    p = _quiet(draws, {"cs_n": {"init": 1}, "reset_n": {"init": 1}})
+
+    def tb(dut):
+        yield from alongside(wait_until(dut, "done"), screen.run(dut))
+    _check(p, tb, sim)
+    assert screen.awake and screen.on
+    assert [c for c, _ in screen.commands[:4]] == [0x11, 0x3A, 0x36, 0x29]
+    assert screen.commands[1][1] == [0x55]                      # 16 bits a pixel
+    assert [row[1:4] for row in screen.pixels[2:4]] == [[RED] * 3] * 2
+    assert [row[5:7] for row in screen.pixels[0:2]] == [[RED, GREEN], [BLUE, GREY]]
+    assert sum(c != 0 for row in screen.pixels for c in row) == 10
+    assert "miso" not in p.process.inputs                       # (it only listens)
+    screen.save(str(tmp_path / "screen.png"), scale=4)
+    assert (tmp_path / "screen.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_alongside_returns_with_its_main_step():
+    def counter(n):
+        for _ in range(n):
+            yield
+        return n
+
+    def forever():
+        while True:
+            yield 3
+
+    steps = alongside(counter(5), forever(), counter(2))
+    clocks = 0
+    try:
+        while True:
+            next(steps)
+            clocks += 1
+    except StopIteration as stop:
+        assert (stop.value, clocks) == (5, 5)
 
 
 # ------------------------------------ EEPROM ------------------------------------

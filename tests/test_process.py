@@ -496,7 +496,8 @@ def test_waveforms_and_where_two_runs_differ(tmp_path):
 def test_an_error_says_where_in_the_source():
     with pytest.raises(process.ProcessError, match=r"test_process\.py:\d+: a while loop that"):
         process.compile_process(spins, {"a": 1})
-    with pytest.raises(process.ProcessError, match=r"test_process\.py:\d+: 'k': its values grow"):
+    with pytest.raises(process.ProcessError,
+                       match=r"test_process\.py:\d+: py2ver can't tell how many bits 'k' needs"):
         process.compile_process(counts, {"a": 1})
     with pytest.raises(process.ProcessError, match=r"test_process\.py:\d+: selfish uses itself"):
         process.compile_process(selfish, {})
@@ -507,7 +508,7 @@ def test_what_a_process_can_t_be_says_so():
         process.compile_process(U.uart_tx, {"tx": {"width": 1}})
     with pytest.raises(process.ProcessError, match="doesn't yield"):
         process.compile_process(spins, {"a": {"width": 1}, "x": {"width": 1}})
-    with pytest.raises(process.ProcessError, match="give its width"):
+    with pytest.raises(process.ProcessError, match="can't tell how many bits .* Give it a width"):
         process.compile_process(counts, {"a": {"width": 1}, "x": {"width": 1}})
     # (its width given: built)
     process.compile_process(counts, {"a": {"width": 1}, "x": {"width": 1}, "k": {"width": 8}})
