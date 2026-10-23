@@ -102,7 +102,8 @@ values assigned to it through each state, taking the `if` tests into
 account:
 
 - `if pos < 255: pos = pos + 1` keeps `pos` at 8 bits, and so does
-  `pos = min(pos + 1, 255)`.
+  `pos = min(pos + 1, 255)`. A conditional expression counts its test the
+  same way: `k = 0 if k == 4 else k + 1` keeps `k` at 3 bits.
 - A counter reset at a bound (`n = n + 1`, then `if n == 50_000: n = 0`) is
   as wide as the bound: 16 bits.
 - A `for i in range(8)` variable is 4 bits wide: it reaches 8 when the loop

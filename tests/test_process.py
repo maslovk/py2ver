@@ -437,6 +437,23 @@ def test_an_output_s_value_from_reset_in_hardware(monkeypatch, tmp_path):
     assert p.TB_process()(clocks) == p.GEN_process()(clocks)
 
 
+def walks(port):
+    k = 0
+    while True:
+        port.walk = 1 << k
+        yield 3
+        k = 0 if k == 4 else k + 1          # (a conditional expression: its test bounds k)
+
+
+def test_a_conditional_expression_s_test_bounds_its_branches():
+    p = _quiet(walks, None)
+    assert p.process.attr["k"]["width"] == 3 and p.process.attr["walk"]["width"] == 5
+    clocks = [{}] * 40
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    assert {g["walk"] for g in gen} == {0, 1, 2, 4, 8, 16}
+
+
 def test_a_parameter_is_a_constant_a_partial_its_value():
     half = U.BIT // 2
     tx = _quiet(functools.partial(U.uart_tx, bit=half), U.TX)

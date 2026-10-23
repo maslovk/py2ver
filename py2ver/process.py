@@ -1659,9 +1659,24 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
     def shown(v: str) -> str:
         return v[:-3] if v.endswith("__n") and v[:-3] in outputs else v
 
+    def ranged(e: ast.expr, env) -> Range:
+        """e's range; a conditional expression's branches each with what its test
+        says, as an if statement's (0 if k == 4 else k + 1: k + 1 where k isn't 4)."""
+        if isinstance(e, ast.IfExp):
+            parts = [ranged(branch, where)
+                     for branch, where in ((e.body, refine(env, e.test, True)),
+                                           (e.orelse, refine(env, e.test, False)))
+                     if where is not None]
+            if parts:
+                out = parts[0]
+                for p in parts[1:]:
+                    out = _hull(out, p)
+                return out
+        return _interval(e, env, {})
+
     def value(e: ast.expr, env, s) -> Range:
         try:
-            return _interval(_constants(e, ns), env, {})
+            return ranged(_constants(e, ns), env)
         except NotShareable as x:
             t = s.targets[0].id if isinstance(s, ast.Assign) and isinstance(s.targets[0], ast.Name) \
                 else "it"
