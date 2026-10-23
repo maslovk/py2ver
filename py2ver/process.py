@@ -1262,12 +1262,113 @@ def _list_items(e: ast.expr) -> Optional[List[ast.expr]]:
     return None
 
 
-def _expand_lists(fd: ast.FunctionDef) -> Dict[str, int]:
+MEMORY_MIN = 64              # a list this long or longer goes into a memory block, if it can
+MEMORY_REGISTERS_MAX = 256   # and one longer than this that can't is an error, not registers
+
+
+def _memory_lists(fd: ast.FunctionDef, as_registers: Set[str]) -> Dict[str, List[int]]:
+    """The lists that may go into a memory block, and their contents at the
+    start: each long one (MEMORY_MIN or more) made once, of constants, before
+    the first yield (its contents from power-up). Their making is marked
+    (_memory_init) for _expand_lists to take out of the code."""
+    made: Dict[str, int] = {}
+    for n in ast.walk(fd):
+        for t in getattr(n, "targets", []):
+            if isinstance(t, ast.Name):
+                made[t.id] = made.get(t.id, 0) + 1
+    found: Dict[str, List[int]] = {}
+    for s in fd.body:
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
+            continue                              # (a docstring)
+        if not isinstance(s, ast.Assign) or _yields([s]):
+            break                                 # (past the start: something that may wait)
+        target = s.targets[0]
+        items = _list_items(s.value)
+        if len(s.targets) != 1 or not isinstance(target, ast.Name) or items is None \
+                or len(items) < MEMORY_MIN or made.get(target.id) != 1 or target.id in as_registers:
+            continue
+        values = [ast.literal_eval(x) if isinstance(x, (ast.Constant, ast.UnaryOp)) else None
+                  for x in items]
+        if all(type(v) is int for v in values):
+            found[target.id] = values
+            s._memory_init = True
+    return found
+
+
+def _memory_problems(segments: List[List[ast.stmt]], memories: Set[str]) -> Dict[str, str]:
+    """What keeps each list from a memory block, if anything: a memory block is
+    read a clock at a time, so in each clock, on every way through it, a list
+    in one is read only as x = values[i], x used after the clock (it gets the
+    element on the clock's edge); written at most once (values[i] = x); and not
+    read after it is written."""
+    problems: Dict[str, str] = {}
+
+    def loads(node: ast.AST) -> Set[str]:
+        return {n.id for n in walk_code(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+
+    def walk(stmts: List[ast.stmt], written: Set[str], fresh: Dict[str, str]):
+        for s in stmts:
+            if isinstance(s, ast.If):
+                for x in loads(s.test) & set(fresh):
+                    problems.setdefault(fresh[x], f"'{x}' is used in the clock it is read in "
+                                                  f"({_at(s)}): use it after a yield")
+                for m in loads(s.test) & memories:
+                    problems.setdefault(m, f"it is read in a test ({_at(s)}): read it into a "
+                                           f"local first (x = {m}[i]), then yield")
+                a, b = walk(s.body, set(written), dict(fresh)), walk(s.orelse, set(written), dict(fresh))
+                written, fresh = a[0] | b[0], {**a[1], **b[1]}
+                continue
+            if not isinstance(s, ast.Assign):
+                for m in loads(s) & memories:
+                    problems.setdefault(m, f"it is used other than as x = {m}[i] ({_at(s)})")
+                continue
+            target, value = s.targets[0], s.value
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) \
+                    and target.value.id in memories:
+                m = target.value.id
+                used = loads(value) | loads(target.slice)
+                if m in written:
+                    problems.setdefault(m, f"it is written twice in a clock ({_at(s)}): a yield "
+                                           f"between the writes")
+                written.add(m)
+            elif isinstance(value, ast.Subscript) and isinstance(value.value, ast.Name) \
+                    and value.value.id in memories and isinstance(target, ast.Name):
+                m = value.value.id
+                used = loads(value.slice)
+                if m in written:
+                    problems.setdefault(m, f"it is read after it is written in the same clock "
+                                           f"({_at(s)}): read it first, or after a yield")
+            else:
+                m = None
+                used = loads(value)
+                for x in used & memories:
+                    problems.setdefault(x, f"it is used other than as x = {x}[i] ({_at(s)})")
+            for x in used & set(fresh):
+                problems.setdefault(fresh[x], f"'{x}' is used in the clock it is read in "
+                                              f"({_at(s)}): use it after a yield")
+            if isinstance(target, ast.Name):
+                fresh.pop(target.id, None)
+                if m is not None and isinstance(value, ast.Subscript):
+                    fresh[target.id] = m
+        return written, fresh
+
+    for seg in segments:
+        walk(seg, set(), {})
+    return problems
+
+
+def _expand_lists(fd: ast.FunctionDef, memories: Optional[Dict[str, List[int]]] = None
+                  ) -> Dict[str, int]:
     """In place: each list local (values = [0] * 8) as a register per element,
     values_0 to values_7. values[i] = x sets the element i is (an if for each
     element when i is a variable); values[i] reads it (a selection of the
-    elements); len(values) is its length. Returns each list's length."""
-    lengths: Dict[str, int] = {}
+    elements); len(values) is its length. Returns each list's length.
+
+    A list in memories stays a list (a memory block): its making (the
+    contents at the start) taken out of the code, its reads and writes as
+    they are, len() its length."""
+    memories = memories or {}
+    lengths: Dict[str, int] = {m: len(v) for m, v in memories.items()}
     for n in ast.walk(fd):
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
             items = _list_items(n.value)
@@ -1281,6 +1382,12 @@ def _expand_lists(fd: ast.FunctionDef) -> Dict[str, int]:
             lengths[name] = len(items)
     if not lengths:
         return lengths
+    for name, n in lengths.items():
+        if name not in memories and n > MEMORY_REGISTERS_MAX:
+            raise ProcessError(
+                f"{fd.name}: the list '{name}' ({n} elements) is too long for registers (at most "
+                f"{MEMORY_REGISTERS_MAX}), and only a list made once, before the first yield, "
+                f"of constants ([0] * n), can go into a memory block")
 
     def constant(index: ast.expr, name: str, at: ast.AST) -> Optional[int]:
         """A constant index as the element it is (-1: the last), else None."""
@@ -1301,8 +1408,14 @@ def _expand_lists(fd: ast.FunctionDef) -> Dict[str, int]:
 
     class _T(ast.NodeTransformer):
         def visit_Assign(self, s: ast.Assign):
-            s.value = self.visit(s.value)
             target = s.targets[0]
+            if getattr(s, "_memory_init", False):
+                return None                       # (a memory block's contents from power-up)
+            s.value = self.visit(s.value)
+            if len(s.targets) == 1 and isinstance(target, ast.Subscript) \
+                    and isinstance(target.value, ast.Name) and target.value.id in memories:
+                target.slice = self.visit(target.slice)     # (a memory block's write)
+                return s
             if len(s.targets) == 1 and isinstance(target, ast.Name) and target.id in lengths:
                 items = _list_items(s.value)
                 if items is None:
@@ -1333,6 +1446,9 @@ def _expand_lists(fd: ast.FunctionDef) -> Dict[str, int]:
             return s
 
         def visit_Subscript(self, e: ast.Subscript):
+            if isinstance(e.value, ast.Name) and e.value.id in memories:
+                e.slice = self.visit(e.slice)               # (a memory block's read)
+                return e
             if isinstance(e.value, ast.Name) and e.value.id in lengths \
                     and isinstance(e.ctx, ast.Load):
                 name = e.value.id
@@ -1360,16 +1476,19 @@ def _expand_lists(fd: ast.FunctionDef) -> Dict[str, int]:
 
     _T().visit(fd)
     ast.fix_missing_locations(fd)
-    return lengths
+    return {n: k for n, k in lengths.items() if n not in memories}
 
 
-def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Process:
+def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None,
+                    _as_registers: frozenset = frozenset()) -> Process:
     """The generator as a function of one clock: its inputs, then its state (the
     state's number __pc, the clocks left to wait __wait, the locals, the
-    outputs' registers) as 'next' registers; it returns the outputs (their
-    registers: what was written before this clock), then the state's next
-    values. With the attr for it. A System: its processes' functions as one."""
+    memory blocks' lists, the outputs' registers) as 'next' registers; it
+    returns the outputs (their registers: what was written before this clock),
+    then the state's next values. With the attr for it. A System: its
+    processes' functions as one. (_as_registers: lists kept in registers.)"""
     from .hwtypes import normalize_attr
+    given_attr = attr
     attr = {k: dict(v) for k, v in normalize_attr(attr).items() if isinstance(v, dict)}
     if isinstance(func, System):
         return _compile_system(func, attr)
@@ -1414,8 +1533,11 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
             n.id = f"{n.id}_v"
     used |= {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)}
     _desugar(fd, port, set(inputs), set(outputs), opens)
-    # (a list local: a register per element; its width in attr each element's)
-    for name, n in _expand_lists(fd).items():
+    # A long list local: in a memory block, if it is used as one can be (else
+    # this is done again with it in registers, see below). A list local in
+    # registers: a register per element, its width in attr each element's.
+    memories = _memory_lists(fd, _as_registers)
+    for name, n in _expand_lists(fd, memories).items():
         if name in attr:
             given = attr.pop(name)
             for k in range(n):
@@ -1534,6 +1656,20 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
                 n.value = ast.Constant(done)
                 ends = True
 
+    # A list that can't be a memory block, used as it is: in registers if it is
+    # short enough (built again so), else what stops it
+    problems = _memory_problems(segments, set(memories))
+    if problems:
+        too_long = {m: why for m, why in problems.items() if len(memories[m]) > MEMORY_REGISTERS_MAX}
+        if too_long:
+            m, why = next(iter(too_long.items()))
+            raise ProcessError(
+                f"{fd.name}: the list '{m}' ({len(memories[m])} elements) is too long for "
+                f"registers, and can't go into a memory block as it is used: {why}. A memory "
+                f"block's list is read as x = {m}[i], x used after a yield, and written at most "
+                f"once a clock (see docs/processes.md, Lists)")
+        return compile_process(func, given_attr, _as_registers | set(problems))
+
     # The locals: every name assigned, but the pins'
     pins = set(inputs) | {f"{o}__n" for o in outputs}
     names: Dict[str, None] = {}
@@ -1560,17 +1696,20 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
                        body=[_assign(WAIT, ast.BinOp(left=ast.Name(id=WAIT, ctx=ast.Load()),
                                                      op=ast.Sub(), right=ast.Constant(1)))],
                        orelse=chain))
+    # (a memory block's list: a parameter, changed in place, not returned)
+    lists = list(memories)
     returned = outputs + [PC, WAIT] + local_names + [f"{o}__n" for o in outputs]
-    params = inputs + [PC, WAIT] + local_names + [f"{o}__q" for o in outputs]
+    params = inputs + [PC, WAIT] + local_names + lists + [f"{o}__q" for o in outputs]
     ns = dict(base.__globals__, **_TABLES)       # (the long tables by their names too)
     # (the module's name: the generator's)
     step, step_fd, source = _function(fd.name, params, body, returned, ns, base.__qualname__)
 
     # Its attr: the pins as given, the outputs registers (their working values the
     # same format; without a width, followed from what's written), the locals'
-    # widths followed from what's assigned to them
-    widths = _flow_widths(segments, done, local_names, inputs, outputs, attr, ns, fd.name,
-                          fd._plain)
+    # widths followed from what's assigned to them, a memory block's list's
+    # elements' from every value written to it and its contents at the start
+    widths = _flow_widths(segments, done, local_names + lists, inputs, outputs, attr, ns, fd.name,
+                          fd._plain, {m: (min(v), max(v)) for m, v in memories.items()})
     out_attr: Dict[str, Dict[str, Any]] = {}
     for p in inputs:
         out_attr[p] = dict(attr[p])
@@ -1585,6 +1724,8 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
         out_attr[f"{o}__n"] = dict(m, internal=True)
     for v in local_names:
         out_attr[v] = dict(widths[v], next=v, internal=True)
+    for m, values in memories.items():
+        out_attr[m] = dict(widths[m], length=len(values), memory="ram", init=list(values))
     n_states = done + 1 if ends else done             # (the end a state if it's reached)
     out_attr[PC] = {"signed": 0, "width": max(1, (n_states - 1).bit_length()), "next": PC,
                     "internal": True}
@@ -1766,8 +1907,8 @@ GIVE_UP_AFTER = 64            # and this often: a range still growing grows with
 
 
 def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], inputs, outputs,
-                 attr, ns, fname: str, plain: Optional[Dict[str, str]] = None
-                 ) -> Dict[str, Dict[str, Any]]:
+                 attr, ns, fname: str, plain: Optional[Dict[str, str]] = None,
+                 lists: Optional[Dict[str, Range]] = None) -> Dict[str, Dict[str, Any]]:
     """
     Each local's format: attr's, or every value assigned to it, as followed
     through each state's clock: a state's registers' ranges at its start, the
@@ -1807,7 +1948,7 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
     def start_of(env: Dict[str, Range]) -> Dict[str, Range]:
         """A clock's registers from the env at its end (o__q: o__n)."""
         return {**{v: env[v] for v in names}, **{f"{o}__q": env[f"{o}__n"] for o in outputs}}
-    init = {v: given.get(v, (0, 0)) for v in names}
+    init = {v: given.get(v, (lists or {}).get(v, (0, 0))) for v in names}
     for o in outputs:
         v = int(attr.get(o, {}).get("init", 0))
         init[f"{o}__q"] = _fmt_range(attr[o]) if o not in followed else (v, v)
@@ -1946,6 +2087,11 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
                     vals = [value(v, env, s) for v in s.value.elts]
                     for x, r in zip(t.elts, vals):
                         env = assign(env, x.id, r)
+                elif isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) \
+                        and t.value.id in (lists or {}):
+                    # (a memory block's list: its elements every value written to it)
+                    m = t.value.id
+                    env = assign(env, m, _hull(env[m], value(s.value, env, s)))
                 else:
                     raise ProcessError(f"{_at(s)}: can't follow what's assigned: one name at a time")
             elif isinstance(s, ast.If):

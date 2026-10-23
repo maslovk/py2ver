@@ -177,8 +177,31 @@ n = len(neurons)                     # 64
 
 An index can be a variable or a constant, and a negative one counts from the
 end, as in Python. A list can only be used through its elements and its
-length: it can't be passed to a step or assigned to another name. Each
-element is a register, so a list suits tens of values, not thousands.
+length: it can't be passed to a step or assigned to another name.
+
+A long list (64 elements or more) goes into a memory block, so it can hold
+thousands of values, such as a picture to draw from. That works when it is
+used the way a memory block can be:
+
+- it is made once, from constants, before the first `yield`
+  (`heat = [0] * 4800`); that is its contents from power-up;
+- it is read as `x = heat[i]`, and `x` is used after the next `yield`, as
+  with a table;
+- each clock writes it at most once (`heat[i] = v`), and doesn't read it
+  after writing it.
+
+```py
+here = heat[block]                   # read it into a local,
+yield                                # then a clock,
+heat[block - across] = here - 1      # then use it (and write, once a clock)
+yield
+```
+
+A shorter list used another way stays in registers. A longer one stops the
+build with what keeps it from a memory block. Two more things to know: each
+local that reads the list has a copy of the memory block of its own (each
+write goes to every copy), and a reset doesn't clear a memory block.
+`examples/fire.py` keeps Doom's fire, 60 x 80 heats, in one.
 
 ## 3. Steps, parameters and the protocol library
 

@@ -44,6 +44,7 @@ board's pins); each file's first lines list them.
 | [mandelbrot_zoom.py](mandelbrot_zoom.py) | a fractal show on the display, its colors cycling: the Mandelbrot set zooming in and out, or (KEY1) Julia sets morphing; 10 to 17 frames a second |
 | [plasma.py](plasma.py) | a plasma on the display: four sine waves added at each pixel pick a rainbow color, flowing at 20 frames a second; its tables in memory blocks |
 | [dreaming_digits.py](dreaming_digits.py) | a neural network on the FPGA drawing handwritten digits that melt into one another: a small VAE's decoder (trained on MNIST on first run, 8-bit weights in memory blocks) gliding from one clear digit to another (80 picked from where the network puts MNIST's own) and pausing on each, about 17 frames a second |
+| [fire.py](fire.py) | Doom's fire on the display: flames rising and flickering, their 4,800 heats a list in a memory block; KEY1 puts the fire out and lights it again |
 | [tunnel.py](tunnel.py) | flying down an endless checkered tube that twists and fades into the dark: each pixel's point on the wall from a table worked out before building (a quarter of the screen, mirrored) |
 
 ## Signal processing

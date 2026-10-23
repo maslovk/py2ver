@@ -137,6 +137,9 @@ class FunctionVisitor(ast.NodeVisitor):
         # the read data is <mem>__rdata; ram_ports holds their final names.
         self._rams: Dict[str, Dict[str, Any]] = {}
         self.ram_ports: Dict[str, Dict[str, str | None]] = {}
+        # A process's clock: its states' code side by side, so a read after a
+        # write in the text may be in another clock (process.py checks each clock)
+        self.reads_after_writes = False
         self._tmp_count = 0
         self._line: int | None = None      # the Python line being translated
         self._ssa: Dict[str, str] = {}
@@ -944,7 +947,7 @@ class FunctionVisitor(ast.NodeVisitor):
     def _ram_read(self, mem: str, index: ast.AST) -> str:
         """mem[index]: a read port per distinct address (<mem>__rdata<j>)."""
         ram = self._rams[mem]
-        if ram["written"]:
+        if ram["written"] and not self.reads_after_writes:
             raise NotImplementedError(
                 f"RAM '{mem}' is read after being written in the same sample; "
                 "read it first (the RAM reads before it writes)"

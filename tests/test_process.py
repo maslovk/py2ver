@@ -584,6 +584,67 @@ def test_what_a_list_local_can_t_do_says_so():
         _quiet(two_lengths, None)
 
 
+def delays(port):
+    buffer = [0] * 128                       # (long, made before the first yield: a memory block)
+    k = 0
+    while True:
+        old = buffer[k]                      # (read, then used after the yield)
+        buffer[k] = port.x                   # (one write a clock, after the read)
+        yield
+        port.out = old
+        k = 0 if k == len(buffer) - 1 else k + 1
+
+
+def sums_at_once(port):
+    values = [0] * 100
+    k = 0
+    while True:
+        values[k] = port.x
+        yield
+        port.out = values[k] + values[99 - k]    # (read and used at once: registers)
+        k = 0 if k == 99 else k + 1
+
+
+def misuses_a_long_list(port):
+    values = [0] * 300
+    k = 0
+    while True:
+        values[k] = port.x
+        port.out = values[299 - k]           # (read after a write in the clock)
+        yield
+        k = 0 if k == 299 else k + 1
+
+
+def remakes_a_long_list(port):
+    while True:
+        values = [0] * 300                   # (made again and again: not a memory block)
+        values[port.x] = 1
+        yield
+
+
+_DELAY_CLOCKS = [{"x": (7 * i) % 256} for i in range(300)]
+
+
+def test_a_long_list_is_a_memory_block():
+    p = _quiet(delays, {"x": 8})
+    assert "The list buffer in a memory block: 128 x 8 bits" in p.verilog
+    gen = p.GEN_process()(_DELAY_CLOCKS)
+    assert p.PY_process()(_DELAY_CLOCKS) == gen
+    outs = [g["out"] for g in gen]
+    start = outs.index(7)                    # (x = 7 at clock 1, back 128 clocks later)
+    assert outs[start:start + 4] == [7, 14, 21, 28]
+    at_once = _quiet(sums_at_once, {"x": 8})
+    assert "memory block" not in at_once.verilog
+    assert "values_99" in at_once.process.locals
+
+
+def test_a_long_list_used_unlike_a_memory_says_so():
+    with pytest.raises(process.ProcessError, match="read after it is written in the same clock"):
+        _quiet(misuses_a_long_list, {"x": 8})
+    with pytest.raises(process.ProcessError, match="too long for registers"):
+        _quiet(remakes_a_long_list, {"x": 8})
+
+
 @pytest.mark.sim
 def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -596,6 +657,8 @@ def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
     kept = _quiet(keeps_values, {"x": 8, "total": 12})
     clocks = [{"x": k} for k in range(60)]
     assert kept.TB_process()(clocks) == kept.GEN_process()(clocks)
+    ring = _quiet(delays, {"x": 8})
+    assert ring.TB_process()(_DELAY_CLOCKS) == ring.GEN_process()(_DELAY_CLOCKS)
 
 
 def test_a_parameter_is_a_constant_a_partial_its_value():

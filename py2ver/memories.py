@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import vprint
 from .ast_ir import Assignment, ModuleIR
@@ -139,10 +139,26 @@ class MemoriesMixin:
         writes = max((len(p["writes"]) for p in self._ram_ports.values()), default=0)
         return compute + max(writes, 1), {"issue": issue, "compute": compute}
 
+    def _process_memories(self) -> Dict[str, Dict[str, Any]]:
+        """A process's lists in memory blocks: each one's length, element format,
+        contents at the start, read ports ((address, data)) and write slots
+        ((enable, address, data))."""
+        out = {}
+        for mem, ram in self.rams.items():
+            init = self._ram_init[mem]
+            out[mem] = {"length": int(ram["length"]), "width": int(ram["elem"]["width"]),
+                        "signed": int(ram["elem"]["signed"]) == 1,
+                        "init": list(init) if isinstance(init, (list, tuple)) else [init] * int(ram["length"]),
+                        "reads": list(self._ram_ports[mem]["reads"]),
+                        "writes": list(self._ram_ports[mem]["writes"])}
+        return out
+
     @staticmethod
     def _rom_registers(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],
-                       attr: Dict[str, Dict[str, Any]]) -> ModuleIR:
-        """Tables whose value only goes into a register, read by a memory block.
+                       attr: Dict[str, Dict[str, Any]],
+                       memories: Optional[Dict[str, Dict[str, Any]]] = None) -> ModuleIR:
+        """Tables, and a process's lists, whose value only goes into a register,
+        read by a memory block.
 
         A memory block gives its value a clock after the address, so a table
         read used in the same clock stays logic (see _rom_arrays). But when the
@@ -156,15 +172,30 @@ class MemoriesMixin:
             r          a wire: r__table ? r__q : r__held
 
         This applies when the table's value is r's next value, or one of the
-        choices of it, and nothing else reads the value or that next value."""
+        choices of it, and nothing else reads the value or that next value.
+
+        A process's list in a memory block (memories) is read the same way: each
+        register that reads it has a copy of its own, and every copy takes each
+        write, on the clock's edge (process.py has made sure a clock writes it at
+        most once, and never reads it after writing it)."""
         regs = {}       # (a register -> its update's reset value, next value and hold's cast)
         for a in ir.assigns:
             m = re.fullmatch(r"rst \? (.+) : \(ce \? (\w+) : (\$(?:un)?signed)\((\w+)\)\)", a.right)
             if a.is_reg and m and m.group(4) == a.left:
                 regs[a.left] = (m.group(1), m.group(2), m.group(3))
-        tables = [t for t, rom in rom_reads.items() if "entries" in rom]
+        # What a register can be loaded from: a table read (its entries), or a
+        # memory's read port (the list's contents at the start; its address a wire)
+        sources = {t: rom for t, rom in rom_reads.items() if "entries" in rom}
+        memories = memories or {}
+        for mem, m in memories.items():
+            for raddr, rdata in m["reads"]:
+                sources[rdata] = {"width": m["width"], "signed": m["signed"], "entries": m["init"],
+                                  "address_bits": max(1, (m["length"] - 1).bit_length()),
+                                  "memory": mem, "address": raddr}
+        tables = list(sources)
         if not regs or not tables:
-            return ir
+            return MemoriesMixin._all_memory_reads_used(ir, memories)
+        rom_reads = sources
         by_left = {a.left: a for a in ir.assigns}
         readers: Dict[str, List[str]] = {}       # (a name -> the assignments that read it)
         for a in ir.assigns:
@@ -201,6 +232,7 @@ class MemoriesMixin:
             return found
 
         table_copies = {t: copies(t) for t in tables}          # (each table read's, once)
+        written: set = set()                                   # (memories with a copy written)
         removed: set = set()
         new_assigns: List[Assignment] = []
         items: List[str] = []
@@ -227,7 +259,8 @@ class MemoriesMixin:
                 reads = [t for t in tables if any(n[0] == "atom" and n[1] in table_copies[t]
                                                   for n in leaves(tree))]
                 same = {(tuple(rom_reads[t]["entries"]), rom_reads[t]["width"],
-                         bool(rom_reads[t].get("signed")), rom_reads[t]["address_bits"])
+                         bool(rom_reads[t].get("signed")), rom_reads[t]["address_bits"],
+                         rom_reads[t].get("memory"))
                         for t in reads}
                 if len(same) != 1:
                     continue
@@ -251,11 +284,15 @@ class MemoriesMixin:
             # (each read's address: its index, as _rom_arrays finds it)
             address = {}
             for t in reads:
-                index = set(re.findall(r"(?<![$\w'])[A-Za-z_]\w*", by_left[t].right))
-                if len(index) != 1:
-                    break
-                idx = index.pop()
-                iw = int(attr.get(idx, attr.get(rom_reads[t]["index"], {})).get("width", ab + 1))
+                if "address" in rom_reads[t]:              # (a memory's read port)
+                    idx = rom_reads[t]["address"]
+                    iw = int(attr.get(idx, {}).get("width", ab + 1))
+                else:
+                    index = set(re.findall(r"(?<![$\w'])[A-Za-z_]\w*", by_left[t].right))
+                    if len(index) != 1:
+                        break
+                    idx = index.pop()
+                    iw = int(attr.get(idx, attr.get(rom_reads[t]["index"], {})).get("width", ab + 1))
                 address[t] = f"{idx}[{ab - 1}:0]" if iw > ab else idx
             if len(address) != len(reads):
                 continue
@@ -297,16 +334,29 @@ class MemoriesMixin:
             # memory blocks)
             entries = list(info["entries"])
             mask = (1 << w) - 1
-            arr = f"{r}__rom"
-            items += [f"// Table in a memory block: {len(info['entries'])} x {w} bits, "
-                      f"its entry for {r} a clock after the address",
-                      f"reg [{w - 1}:0] {arr} [0:{len(entries) - 1}];",
-                      "initial begin"]
-            items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
-            items += ["end",
-                      f"reg [{w - 1}:0] {q};",
+            mem = info.get("memory")
+            arr = f"{r}__rom" if mem is None else f"{r}__{mem}"
+            if mem is None:
+                items.append(f"// Table in a memory block: {len(entries)} x {w} bits, "
+                             f"its entry for {r} a clock after the address")
+            else:
+                items.append(f"// The list {mem} in a memory block: {len(entries)} x {w} bits, "
+                             f"{r}'s copy (each write goes to every copy)")
+            items.append(f"reg [{w - 1}:0] {arr} [0:{len(entries) - 1}];")
+            if any(entries):
+                items.append("initial begin")
+                items += [f"  {arr}[{k}] = {w}'d{int(v) & mask};" for k, v in enumerate(entries)]
+                items.append("end")
+            else:
+                items += [f"integer {arr}__i;",
+                          f"initial for ({arr}__i = 0; {arr}__i < {len(entries)}; "
+                          f"{arr}__i = {arr}__i + 1) {arr}[{arr}__i] = {w}'d0;"]
+            items += [f"reg [{w - 1}:0] {q};",
                       f"wire [{ab - 1}:0] {q}__address = {addr};",
                       f"always @(posedge clk) if (ce && {flag}__load) {q} <= {arr}[{q}__address];"]
+            if mem is not None and memories[mem]["writes"]:
+                items.append(f"always @(posedge clk) if (ce && {mem}__wen) {arr}[{mem}__wa] <= {mem}__wd;")
+                written.add(mem)
             attr[held] = dict(attr[r])
             for n in (flag, f"{flag}__load", f"{flag}__next"):
                 attr[n] = {"width": 1, "signed": 0}
@@ -317,11 +367,40 @@ class MemoriesMixin:
                 Assignment(flag, f"rst ? 1'b0 : (ce ? {flag}__next : $unsigned({flag}))", True),
                 Assignment(r, f"{flag} ? {value} : {held}", False)]
             removed |= {r} | table
-        if not removed:
-            return ir
-        return ModuleIR(name=ir.name, inputs=ir.inputs, outputs=ir.outputs,
-                        assigns=[a for a in ir.assigns if a.left not in removed] + new_assigns,
-                        has_clk=ir.has_clk, items=list(ir.items) + items)
+        # A memory's write port: the clock's write (at most one is taken)
+        for mem in sorted(written):
+            m = memories[mem]
+            aw = max(1, (m["length"] - 1).bit_length())
+
+            def chosen(k: int, width: int) -> str:
+                expr = f"{width}'d0"
+                for we, *rest in reversed(m["writes"]):
+                    expr = f"({we}) ? ({rest[k]}) : ({expr})"
+                return expr
+            items += [f"// The list {mem}'s write: the clock's (at most one each clock)",
+                      f"wire {mem}__wen = " + " || ".join(f"({we})" for we, _a, _d in m["writes"]) + ";",
+                      f"wire [{aw - 1}:0] {mem}__wa = {chosen(0, aw)};",
+                      f"wire [{m['width'] - 1}:0] {mem}__wd = {chosen(1, m['width'])};"]
+        if removed:
+            ir = ModuleIR(name=ir.name, inputs=ir.inputs, outputs=ir.outputs,
+                          assigns=[a for a in ir.assigns if a.left not in removed] + new_assigns,
+                          has_clk=ir.has_clk, items=list(ir.items) + items)
+        return MemoriesMixin._all_memory_reads_used(ir, memories)
+
+    @staticmethod
+    def _all_memory_reads_used(ir: ModuleIR, memories: Dict[str, Dict[str, Any]]) -> ModuleIR:
+        """ir, once every read of a process's memory goes into a register (a read
+        whose value is used otherwise has no memory block to come from)."""
+        for mem, m in memories.items():
+            for _raddr, rdata in m["reads"]:
+                users = [a.left for a in ir.assigns
+                         if re.search(rf"(?<![$\w']){re.escape(rdata)}\b", a.right)]
+                if users:
+                    raise RuntimeError(
+                        f"The list '{mem}' is in a memory block, but a value read from it is used "
+                        f"in the clock it is read ({users[0]}): read it into a local, then yield "
+                        f"before using it")
+        return ir
 
     @staticmethod
     def _rom_arrays(ir: ModuleIR, rom_reads: Dict[str, Dict[str, Any]],

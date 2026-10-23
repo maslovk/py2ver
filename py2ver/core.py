@@ -409,6 +409,7 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         # Large constant tables are ROMs: in block RAM in a pipelined design without
         # state, else arrays read asynchronously (both readable by any simulator)
         f_visitor.rom_min = ROM_MIN
+        f_visitor.reads_after_writes = self.process is not None
         stateless = not any(isinstance(m, dict) and "next" in m for m in attr.values())
         ir = f_visitor.visit(tree)
 
@@ -470,7 +471,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         if self.state_map or self.rams or self.schedule:
             ir = self._lower_state(ir, f_visitor.attr)
         if ir.has_clk and not self._pipe:
-            ir = self._rom_registers(ir, f_visitor.rom_reads, f_visitor.attr)
+            ir = self._rom_registers(ir, f_visitor.rom_reads, f_visitor.attr,
+                                     self._process_memories() if self.process is not None else {})
         ir = self._rom_arrays(ir, f_visitor.rom_reads, f_visitor.attr)
         self.ir = ir
 
@@ -681,8 +683,13 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
 
         assigns = list(ir.assigns)
         # With a block RAM, a sample takes two clocks (read, then compute and
-        # write); state commits in the second one.
-        self.ram_phases, self._ram_schedule = self._schedule_rams(ir)
+        # write); state commits in the second one. A process's memory takes no
+        # clocks of its own: a read's value goes into a register, on the clock's
+        # edge, and a write lands then too (see memories._rom_registers).
+        if self.process is not None:
+            self.ram_phases, self._ram_schedule = 1, {}
+        else:
+            self.ram_phases, self._ram_schedule = self._schedule_rams(ir)
         fold = self.schedule or Schedule("none", 1)
         if self.schedule:
             self.ram_phases = fold.phases
@@ -760,7 +767,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
                      | ext_out | self._internal_ports],
             assigns=assigns,
             has_clk=True,
-            items=ext_items + list(ir.items) + self._phase_items() + self._ram_items()
+            items=ext_items + list(ir.items) + self._phase_items()
+                  + (self._ram_items() if self.process is None else [])
                   + self._rom_items(roms, attr, self.hdl_dir, self.hdl_files)
                   + self._rf_items(rfs, attr),
         )
