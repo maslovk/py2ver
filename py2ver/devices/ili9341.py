@@ -21,7 +21,7 @@ the chip not selected, and held in reset until it starts.
 """
 from typing import NamedTuple
 
-from ..protocol import SPI, spi_transfer
+from ..protocol import SPI, spi_transfer, stream_receive
 from .spi_target import save_png, spi_listen
 
 WIDTH, HEIGHT = 240, 320
@@ -36,6 +36,33 @@ RAMWR = 0x2C            # memory write: the pixels that follow fill the window
 MADCTL = 0x36           # memory access control: orientation and color order
 COLMOD = 0x3A           # pixel format
 
+# The panel's power, voltage and gamma settings, sent before waking it up (the
+# sequence the vendors' and Adafruit's drivers use; without it some modules
+# show nothing but their backlight). Each entry: a command, how many parameter
+# bytes follow, then those bytes.
+SETUP = (
+    0xEF, 3, 0x03, 0x80, 0x02,
+    0xCF, 3, 0x00, 0xC1, 0x30,              # power control B
+    0xED, 4, 0x64, 0x03, 0x12, 0x81,        # power-on sequence control
+    0xE8, 3, 0x85, 0x00, 0x78,              # driver timing control A
+    0xCB, 5, 0x39, 0x2C, 0x00, 0x34, 0x02,  # power control A
+    0xF7, 1, 0x20,                          # pump ratio control
+    0xEA, 2, 0x00, 0x00,                    # driver timing control B
+    0xC0, 1, 0x23,                          # power control 1: GVDD 4.6 V
+    0xC1, 1, 0x10,                          # power control 2
+    0xC5, 2, 0x3E, 0x28,                    # VCOM control 1
+    0xC7, 1, 0x86,                          # VCOM control 2
+    0x37, 1, 0x00,                          # vertical scroll start: 0
+    0xB1, 2, 0x00, 0x18,                    # frame rate: 79 Hz
+    0xB6, 3, 0x08, 0x82, 0x27,              # display function control
+    0xF2, 1, 0x00,                          # 3-gamma off
+    0x26, 1, 0x01,                          # gamma curve 1
+    0xE0, 15, 0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03,
+    0x0E, 0x09, 0x00,                       # positive gamma
+    0xE1, 15, 0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C,
+    0x31, 0x36, 0x0F,                       # negative gamma
+)
+
 
 class ILI9341(NamedTuple):
     """The display's settings.
@@ -44,14 +71,16 @@ class ILI9341(NamedTuple):
                   default runs SCLK at 8.3 MHz from a 50 MHz clock.
     cs_n, dc, reset_n:  the names of its other pins.
     madctl:       orientation and color order (0x48: portrait, BGR panels as most are).
-    wake_clocks:  how long to wait after reset and after waking up: 120 ms at 50 MHz.
+    wake_clocks:  how long the reset pulse lasts, and how long to wait after it, after
+                  waking up and after switching on: 150 ms at 50 MHz (as Adafruit's
+                  driver waits; the datasheet asks for 120 ms, some panels need more).
     """
     spi: SPI = SPI(3, mode=0, miso="")
     cs_n: str = "cs_n"
     dc: str = "dc"
     reset_n: str = "reset_n"
     madctl: int = 0x48
-    wake_clocks: int = 6_000_000
+    wake_clocks: int = 7_500_000
 
 
 def rgb565(red, green, blue):
@@ -78,20 +107,30 @@ def ili9341_data(port, lcd, value, bits=8):
 
 
 def ili9341_init(port, lcd):
-    """Reset the display, wake it up, set 16-bit color, and switch it on."""
+    """Reset the display, set up its panel, wake it up, set 16-bit color, and switch it on."""
     setattr(port, lcd.cs_n, 1)
     setattr(port, lcd.spi.sclk, lcd.spi.mode >> 1)
-    setattr(port, lcd.reset_n, 0)                   # a hardware reset (10 us at least)
-    yield 1000
+    setattr(port, lcd.reset_n, 0)                   # a hardware reset
+    yield lcd.wake_clocks
     setattr(port, lcd.reset_n, 1)
     yield lcd.wake_clocks
-    yield from ili9341_command(port, lcd, SLPOUT)
-    yield lcd.wake_clocks
-    yield from ili9341_command(port, lcd, COLMOD)
-    yield from ili9341_data(port, lcd, 0x55)        # 16 bits a pixel
+    k = 0
+    while k < len(SETUP):                           # the panel's settings, from the table
+        yield from ili9341_command(port, lcd, SETUP[k])
+        count = SETUP[k + 1]
+        k = k + 2
+        while count > 0 and k < len(SETUP):
+            yield from ili9341_data(port, lcd, SETUP[k])
+            k = k + 1
+            count = count - 1
     yield from ili9341_command(port, lcd, MADCTL)
     yield from ili9341_data(port, lcd, lcd.madctl)
+    yield from ili9341_command(port, lcd, COLMOD)
+    yield from ili9341_data(port, lcd, 0x55)        # 16 bits a pixel
+    yield from ili9341_command(port, lcd, SLPOUT)
+    yield lcd.wake_clocks
     yield from ili9341_command(port, lcd, DISPON)
+    yield lcd.wake_clocks
 
 
 def ili9341_window(port, lcd, x0, y0, x1, y1):
@@ -124,6 +163,29 @@ def ili9341_fill(port, lcd, x0, y0, x1, y1, color):
     yield lcd.spi.half
 
 
+def ili9341_display(port, lcd=ILI9341(), width=WIDTH, height=HEIGHT):
+    """A process that shows a stream of pixels: connect() it after a block that
+    sends them (see protocol.stream_send).
+
+    It wakes the display, then takes width x height colors from its input
+    stream (color, valid; it answers on ready), row by row from the top left,
+    and sends them to the screen; then the next picture, and so on.
+    """
+    port.ready = 0
+    yield from ili9341_init(port, lcd)
+    while True:
+        yield from ili9341_window(port, lcd, 0, 0, width - 1, height - 1)
+        setattr(port, lcd.dc, 1)
+        setattr(port, lcd.cs_n, 0)                  # one long write: the whole picture
+        remaining = width * height
+        while remaining > 0:
+            color = yield from stream_receive(port, data="color")
+            yield from spi_transfer(port, lcd.spi, color, 16)
+            remaining = remaining - 1
+        setattr(port, lcd.cs_n, 1)
+        yield lcd.spi.half
+
+
 # ---------------------------------------------------------------------------
 # A model of the display, for testbenches
 # ---------------------------------------------------------------------------
@@ -139,7 +201,8 @@ class ILI9341Model:
         screen.save("screen.png")    # the picture, to look at
 
     commands lists each command with its parameter bytes. awake and on say
-    whether the design woke the display up and switched it on.
+    whether the design woke the display up and switched it on, and written
+    counts the pixels written so far.
     """
 
     def __init__(self, lcd=ILI9341(), width=WIDTH, height=HEIGHT):
@@ -149,6 +212,7 @@ class ILI9341Model:
         self.commands = []
         self.awake = False
         self.on = False
+        self.written = 0
         self._window = (0, 0, width - 1, height - 1)
         self._x = self._y = 0
         self._half = None                           # the first byte of a pixel
@@ -185,6 +249,7 @@ class ILI9341Model:
             self._half = byte
             return
         color, self._half = (self._half << 8) | byte, None
+        self.written += 1
         x0, y0, x1, y1 = self._window
         if 0 <= self._y < self.height and 0 <= self._x < self.width and self._y <= y1:
             self.pixels[self._y][self._x] = color

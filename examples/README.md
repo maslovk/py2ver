@@ -39,6 +39,8 @@ board's pins); each file's first lines list them.
 | [accelerometer.py](accelerometer.py) | the DE0-Nano's ADXL345 accelerometer, read over I2C |
 | [adc.py](adc.py) | the DE0-Nano's ADC, read over SPI |
 | [lcd.py](lcd.py) | a test picture on an ILI9341 TFT display; the model saves it as a PNG |
+| [mandelbrot.py](mandelbrot.py) | a Mandelbrot set generator, one iteration a clock, streaming RGB565 pixels for a display |
+| [mandelbrot_lcd.py](mandelbrot_lcd.py) | the generator connected to the ILI9341 display: two blocks joined by a stream |
 
 ## Signal processing
 

@@ -361,6 +361,37 @@ def jtag_print_hex(port, value, digits, data="tx_data", send="tx_send", room="tx
 
 
 # ---------------------------------------------------------------------------
+# Streams: handing values from one block to the next
+#
+# Three wires: data, valid (the sender has a value) and ready (the receiver
+# can take one). A value moves in the first clock cycle in which both valid
+# and ready are high; both sides see that same cycle. Connect two processes'
+# wires with connect(), for example
+#     wires={"display.color": "fractal.color", "display.valid": "fractal.valid",
+#            "fractal.ready": "display.ready"}
+# ---------------------------------------------------------------------------
+
+def stream_send(port, value, data="data", valid="valid", ready="ready"):
+    """Hand `value` to the next block, and wait until it has taken it."""
+    setattr(port, data, value)
+    setattr(port, valid, 1)
+    yield
+    while not getattr(port, ready):
+        yield
+    setattr(port, valid, 0)
+
+
+def stream_receive(port, data="data", valid="valid", ready="ready"):
+    """Take the next value from the block before, waiting for one, and return it."""
+    setattr(port, ready, 1)
+    yield
+    while not getattr(port, valid):
+        yield
+    setattr(port, ready, 0)
+    return getattr(port, data)
+
+
+# ---------------------------------------------------------------------------
 # For testbenches
 # ---------------------------------------------------------------------------
 

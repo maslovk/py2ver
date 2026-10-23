@@ -9,7 +9,7 @@ from py2ver.devices import adxl345 as X
 from py2ver.devices.adc128s022 import (ADC128S022, adc128s022_idle, adc128s022_model,
                                        adc128s022_read)
 from py2ver.devices.eeprom24 import eeprom_model, eeprom_read, eeprom_write
-from py2ver.devices.ili9341 import (ILI9341, ILI9341Model, ili9341_fill, ili9341_init,
+from py2ver.devices.ili9341 import (SETUP, ILI9341, ILI9341Model, ili9341_fill, ili9341_init,
                                     ili9341_pixel, ili9341_window, rgb565)
 from py2ver.protocol import I2C, SPI, alongside, together, wait_until
 
@@ -146,8 +146,14 @@ def test_an_ili9341_drawn_on(sim, monkeypatch, tmp_path):
         yield from alongside(wait_until(dut, "done"), screen.run(dut))
     _check(p, tb, sim)
     assert screen.awake and screen.on
-    assert [c for c, _ in screen.commands[:4]] == [0x11, 0x3A, 0x36, 0x29]
-    assert screen.commands[1][1] == [0x55]                      # 16 bits a pixel
+    setup, k = [], 0                                            # (the panel's settings first)
+    while k < len(SETUP):
+        setup.append((SETUP[k], list(SETUP[k + 2:k + 2 + SETUP[k + 1]])))
+        k += 2 + SETUP[k + 1]
+    n = len(setup)
+    assert screen.commands[:n] == setup
+    assert [c for c, _ in screen.commands[n:n + 4]] == [0x36, 0x3A, 0x11, 0x29]
+    assert screen.commands[n + 1][1] == [0x55]                  # 16 bits a pixel
     assert [row[1:4] for row in screen.pixels[2:4]] == [[RED] * 3] * 2
     assert [row[5:7] for row in screen.pixels[0:2]] == [[RED, GREEN], [BLUE, GREY]]
     assert sum(c != 0 for row in screen.pixels for c in row) == 10

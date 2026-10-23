@@ -112,13 +112,25 @@ When a value really can grow without end (`total = total + port.x`), py2ver
 stops with an error naming every such variable and the line where it is
 first assigned. Give those widths in attr: `{"total": 16}`.
 
+Two habits keep widths easy to work out:
+
+- Compute from a loop's variable rather than adding up in the loop:
+  `x = x0 + col * step` is bounded because `col` is, while `x = x + step`
+  in a loop is not (py2ver doesn't count a loop's rounds).
+- Count down with `while n > 0`, not `while n != 0`.
+
+Some limits are beyond it: in a Mandelbrot loop `|z| <= 2` bounds `zx` and
+`zy` together, which a range for each can't express. Then give the widths
+(`examples/mandelbrot.py` does, with the reasoning).
+
 Use the names that `explain()` shows (section 6). Two kinds of local are
 renamed:
 
 - A local with the same name as a pin is renamed with `_v`: `data` becomes
   `data_v`, because `port.data` is a pin.
 - A local of a step is prefixed with the step's name: `n` in `edge` becomes
-  `edge_n` (section 3).
+  `edge_n` (section 3). In attr it can go by its own name, `{"n": 8}`, as
+  long as only one step has an `n` (and the process itself doesn't).
 
 ## 3. Steps, parameters and the protocol library
 
@@ -174,6 +186,8 @@ mosi="mosi", miso="miso")` or `I2C(q=125, scl="scl", sda="sda")`:
 | `jtag_send(port, byte)` | sends a byte to the PC over the JTAG UART (section 9) |
 | `jtag_print(port, b"text")` | sends a constant message to the PC: a debug console |
 | `jtag_print_hex(port, value, digits)` | sends a number to the PC in hexadecimal |
+| `stream_send(port, value, data="data")` | hands a value to the next block (connected with `connect()`): sets `data` and `valid`, and waits for the other's `ready`; one value a clock cycle at best |
+| `stream_receive(port, data="data")` | takes the next value from the block before, waiting for its `valid`: `value = yield from stream_receive(port)` |
 | `together(*steps)` | in testbenches only: runs steps at the same time, and returns when every one has returned, with a list of their values (section 5) |
 | `alongside(main, *models)` | in testbenches only: runs `main` with chip models beside it, and returns `main`'s value as soon as it returns; the models may run forever |
 
@@ -474,7 +488,7 @@ driver step takes the port, then the bus's record:
 | `adxl345` (accelerometer, I2C) | `adxl345_start(port, bus)` → `nack`; `adxl345_id(port, bus)` → `id, nack`; `adxl345_read_xyz(port, bus)` → `x, y, z, nack` | `adxl345_model(dut, registers(x, y, z), transfers)` |
 | `adc128s022` (ADC, SPI) | `adc128s022_read(port, adc, channel)` → its 16 bits (4 zeros, 12 of result); `adc128s022_frame(...)` | `adc128s022_model(values, frames)` |
 | `eeprom24` (24LC02, I2C) | `eeprom_read(port, bus, offset)` → `value, nack`; `eeprom_write(port, bus, offset, value)` → `nack`, its write cycle waited for | `eeprom_model(dut, mem, transfers, write_clocks=5000)` |
-| `ili9341` (240 x 320 display, SPI) | `ili9341_init(port, lcd)`; `ili9341_fill(port, lcd, x0, y0, x1, y1, color)`; `ili9341_window(...)` then `ili9341_pixel(port, lcd, color)` for each pixel; `rgb565(r, g, b)` | `ILI9341Model()`: `.run(dut)` keeps the picture, `.save("screen.png")` |
+| `ili9341` (240 x 320 display, SPI) | `ili9341_init(port, lcd)`; `ili9341_fill(port, lcd, x0, y0, x1, y1, color)`; `ili9341_window(...)` then `ili9341_pixel(port, lcd, color)` for each pixel; `rgb565(r, g, b)`; `ili9341_display`, a whole process that shows a stream of pixels (connect it after a block that sends them) | `ILI9341Model()`: `.run(dut)` keeps the picture, `.save("screen.png")` |
 | `i2c_target` | | `i2c_memory(dut, mem, transfers, address)`: any chip of registers on I2C |
 | `spi_target` | | `spi_listen(dut, bus, cs_n, on_word)`: the bit-level part of a chip that listens on SPI |
 

@@ -641,8 +641,15 @@ def _expand(func: Any) -> Tuple[ast.FunctionDef, str]:
                                f"{p.name}=...))")
         values[p.name] = p.default
     fd = _source(base)
-    ex = _Expander(port, {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)})
+    own = {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)}
+    ex = _Expander(port, own)
     fd.body = ex.body(base, fd, {port: port}, values)
+    # (each step local's name as written, for attr and messages: escape_count_xx -> xx,
+    # where only one step has an xx and the process has none of its own)
+    fd._plain = {full: plain for plain, fulls in ex.plain.items()
+                 if len(fulls) == 1 and plain not in own for full in fulls}
+    fd._ambiguous = {plain: sorted(fulls) for plain, fulls in ex.plain.items()
+                     if len(fulls) > 1 and plain not in own}
     return fd, port
 
 
@@ -657,6 +664,7 @@ class _Expander:
         self.used = set(used)
         self.stack: List[Callable] = []
         self.names: Dict[Callable, Dict[str, str]] = {}
+        self.plain: Dict[str, Set[str]] = {}     # a step local's name -> its full names
 
     def body(self, base: Callable, fd: ast.FunctionDef, rename: Dict[str, str],
              values: Dict[str, Any]) -> List[ast.stmt]:
@@ -841,6 +849,7 @@ class _Expander:
                     name = f"{base.__name__}{k}_{n}"
                 self.used.add(name)
                 names[n] = name
+                self.plain.setdefault(n, set()).add(name)
             self.names[base] = names
         stored = _stored(fd.body)
         rename = {n: names[n] for n in stored}
@@ -1213,6 +1222,18 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     opens = _opens(attr)
     inputs, outputs = _pins_of(fd, port, opens)
     opens &= set(outputs)
+    # A step's local may be given in attr by its own name ({'xx': 20} for the
+    # xx of a step escape_count): its full name is escape_count_xx.
+    full_of = {plain: full for full, plain in fd._plain.items()}
+    for key in list(attr):
+        if key in inputs or key in outputs:
+            continue
+        if key in fd._ambiguous:
+            raise ProcessError(f"{fd.name}: '{key}' in attr is a local of several steps "
+                               f"({', '.join(fd._ambiguous[key])}): give it by one of those "
+                               f"names")
+        if key in full_of:
+            attr.setdefault(full_of[key], {}).update(attr.pop(key))
     # An output set to a constant before the first yield has that value from
     # reset (unless attr gives its 'init').
     for o, v in _reset_values(fd, port).items():
@@ -1385,7 +1406,8 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     # Its attr: the pins as given, the outputs registers (their working values the
     # same format; without a width, followed from what's written), the locals'
     # widths followed from what's assigned to them
-    widths = _flow_widths(segments, done, local_names, inputs, outputs, attr, ns, fd.name)
+    widths = _flow_widths(segments, done, local_names, inputs, outputs, attr, ns, fd.name,
+                          fd._plain)
     out_attr: Dict[str, Dict[str, Any]] = {}
     for p in inputs:
         out_attr[p] = dict(attr[p])
@@ -1569,7 +1591,8 @@ GIVE_UP_AFTER = 64            # and this often: a range still growing grows with
 
 
 def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], inputs, outputs,
-                 attr, ns, fname: str) -> Dict[str, Dict[str, Any]]:
+                 attr, ns, fname: str, plain: Optional[Dict[str, str]] = None
+                 ) -> Dict[str, Dict[str, Any]]:
     """
     Each local's format: attr's, or every value assigned to it, as followed
     through each state's clock: a state's registers' ranges at its start, the
@@ -1591,8 +1614,10 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
     fixed[PC] = (0, done)
 
     def user_name(v: str) -> str:
-        """A register's name as written (o__q: the output o)."""
-        return v[:-3] if v.endswith("__q") else v
+        """A register's name as written (o__q: the output o; escape_count_xx: xx,
+        the one step local of that name, as attr may give it)."""
+        v = v[:-3] if v.endswith("__q") else v
+        return (plain or {}).get(v, v)
 
     def where_of(v: str) -> str:
         """Where a register is first assigned (o__q: o__n)."""
@@ -1601,7 +1626,7 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
 
     def tests_of(v: str) -> List[int]:
         """The constants a register is tested against, and one either side."""
-        b = user_name(v)
+        b = v[:-3] if v.endswith("__q") else v
         return sorted(thresholds.get(b, set()) | thresholds.get(f"{b}__n", set()))
 
     def start_of(env: Dict[str, Range]) -> Dict[str, Range]:
@@ -1771,6 +1796,19 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
             if new == start[j]:
                 continue
             changes[j] += 1
+            # A value past MAX_BITS can't be built, and its range never shrinks
+            # again: stop now, before squaring makes its bounds astronomically long.
+            huge = sorted(v for v, r in new.items()
+                          if max(abs(r[0]), abs(r[1])) >> MAX_BITS
+                          and (start[j] is None or r != start[j].get(v)))
+            if len(huge) == 1:
+                raise ProcessError(f"{where_of(huge[0])}: {_unbounded(user_name(huge[0]))}")
+            if huge:
+                each = ", ".join(f"'{user_name(v)}' ({where_of(v)})" for v in huge)
+                raise ProcessError(
+                    f"{fname}: py2ver can't tell how many bits {each} need: nothing in the "
+                    f"code limits their values. Give each a width in attr, or limit it "
+                    f"with a test such as `while x > 0` (rather than `while x != 0`).")
             if changes[j] > WIDEN_AFTER and start[j] is not None:
                 # (still growing: to the constants it's tested against; one growing past
                 # them, or without any, long after: without end)

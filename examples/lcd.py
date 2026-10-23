@@ -9,8 +9,10 @@
 #   python examples/lcd.py --sim        # also simulate the generated Verilog
 #   python examples/lcd.py --pins       # build it for the board
 #
-# Wiring for --pins (the DE0-Nano's GPIO_1 header, 3.3 V logic):
-#   GPIO_1[0] SCK, GPIO_1[1] SDI (MOSI), GPIO_1[2] CS, GPIO_1[3] D/C, GPIO_1[4] RESET
+# Wiring for --pins: the DE0-Nano's GPIO_1 header (JP2), 3.3 V logic:
+#   SCK -> JP2 pin 2 (GPIO_1[0]), SDI/MOSI -> 4 (GPIO_1[1]), CS -> 5 (GPIO_1[2]),
+#   DC/RS -> 6 (GPIO_1[3]), RESET -> 7 (GPIO_1[4]), VCC and LED -> 29 (3.3 V), GND -> 30
+#   (see examples/mandelbrot_lcd.py for the module's own pin numbers)
 import functools
 import os
 import sys

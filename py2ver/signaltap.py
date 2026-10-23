@@ -160,6 +160,9 @@ def capture(project: Path, stp_tool: str, trigger: Optional[Dict[str, Any]] = No
     names: a signal's name in the record (byte_ -> byte)."""
     fields = read_map(project / "signaltap.txt")
     stp = make_stp(project, stp_tool, "capture", condition(trigger, fields))
+    # (the instance's name as Quartus made it: its number isn't always the same)
+    named = re.search(r'<instance name="([^"]+)"', stp.read_text(encoding="utf-8"))
+    instance = named.group(1) if named else INSTANCE
     log = f"log_{int(time.time() * 1000)}"
     for f in ("capture.csv", "capture.vcd"):
         (project / f).unlink(missing_ok=True)
@@ -168,11 +171,11 @@ def capture(project: Path, stp_tool: str, trigger: Optional[Dict[str, Any]] = No
         f"open_session -name {stp.name}\n"
         "set hw [lindex [get_hardware_names] 0]\n"
         "set dev [lindex [get_device_names -hardware_name $hw] 0]\n"
-        f"run -instance {INSTANCE} -signal_set signal_set_1 -trigger trigger_1 -data_log {log} "
+        f"run -instance {instance} -signal_set signal_set_1 -trigger trigger_1 -data_log {log} "
         f"-timeout {int(timeout)} -hardware_name $hw -device_name $dev\n"
-        f"export_data_log -instance {INSTANCE} -signal_set signal_set_1 -trigger trigger_1 "
+        f"export_data_log -instance {instance} -signal_set signal_set_1 -trigger trigger_1 "
         f"-data_log {log} -filename capture.csv -format csv\n"
-        f"export_data_log -instance {INSTANCE} -signal_set signal_set_1 -trigger trigger_1 "
+        f"export_data_log -instance {instance} -signal_set signal_set_1 -trigger trigger_1 "
         f"-data_log {log} -filename capture.vcd -format vcd\n"
         "close_session\n", encoding="utf-8")
     proc = subprocess.Popen([stp_tool, "-t", tcl.name], cwd=project, stdout=subprocess.PIPE,
@@ -190,7 +193,7 @@ def capture(project: Path, stp_tool: str, trigger: Optional[Dict[str, Any]] = No
         raise TimeoutError(f"SignalTap: the trigger {trigger} didn't happen in {timeout:g} s")
     if proc.returncode != 0 or not (project / "capture.csv").exists():
         raise RuntimeError("SignalTap capture failed: " + "\n".join(
-            l for l in text.splitlines() if "rror" in l)[-1000:])
+            l for l in text.splitlines() if "rror" in l or "ERROR" in l)[-1000:])
     return read_capture(project, fields, names or {})
 
 
