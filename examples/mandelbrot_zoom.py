@@ -1,11 +1,12 @@
 # A Mandelbrot animation on an ILI9341 display: zooming in on a point, frame
-# after frame, and starting over.
+# after frame, then back out, and in again.
 #
 #   mandelbrot_zoom (examples/mandelbrot.py) --color/valid/ready--> ili9341_display
 #
-# Each frame the distance between pixels shrinks by 1/16 (a 6% zoom), about 7
-# frames a second at 8.3 MHz SPI, and 24 fraction bits allow a 30,000x zoom
-# before starting again (about 160 frames).
+# Each frame the distance between pixels changes by 1/32 (a 3% zoom), in to a
+# 2,000x zoom (about 240 frames) and back out. With SPI at 25 MHz that is
+# 10 to 17 frames a second: as fast as the link at first, then as fast as one
+# escape loop can compute (a pixel in the set takes all MAX_ITER steps).
 #
 #   python examples/mandelbrot_zoom.py          # a few frames on a small screen: mandelbrot_zoom.png
 #   python examples/mandelbrot_zoom.py --sim    # also simulate the generated Verilog
@@ -20,9 +21,15 @@ import mandelbrot as M  # noqa: E402
 from mandelbrot_lcd import PINS  # noqa: E402
 from py2ver import connect  # noqa: E402
 from py2ver.devices.ili9341 import HEIGHT, ILI9341, WIDTH, ili9341_display  # noqa: E402
+from py2ver.protocol import SPI  # noqa: E402
+
+# SCK at 25 MHz: beyond the datasheet's 10 MHz for writes, as Adafruit's driver
+# runs these modules (24 MHz); checked on the board with short jumper wires. If
+# the picture is noisy, use SPI(2, ...): 12.5 MHz.
+LCD = ILI9341(spi=SPI(1, mode=0, miso=""))
 
 
-def zoom_on_screen(lcd=ILI9341(), area=M.ZOOM, width=WIDTH, height=HEIGHT, max_iter=M.MAX_ITER):
+def zoom_on_screen(lcd=LCD, area=M.ZOOM, width=WIDTH, height=HEIGHT, max_iter=M.MAX_ITER):
     """The zooming generator feeding the display."""
     fractal = functools.partial(M.mandelbrot_zoom, area=area, width=width, height=height,
                                 max_iter=max_iter, colors=M.palette(max_iter))

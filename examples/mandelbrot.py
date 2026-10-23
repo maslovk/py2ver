@@ -130,24 +130,26 @@ class Zoom(NamedTuple):
     cx, cy:    the point the picture stays centered on
     start:     the first frame's distance between neighboring pixels
     smallest:  the distance at which it starts over
-    shrink:    each frame the distance shrinks by 1/2**shrink (4: by 1/16)
+    shrink:    each frame the distance shrinks by 1/2**shrink (5: by 1/32, 3%)
     """
     cx: int
     cy: int
     start: int
     smallest: int
-    shrink: int = 4
+    shrink: int = 5
     frac: int = ZOOM_FRAC
 
 
-def zoom(x=-0.743643887, y=0.131825904, start_width=3.2, end_width=0.0001, width=WIDTH,
-         frac=ZOOM_FRAC):
+def zoom(x=-0.743643887, y=0.131825904, start_width=3.2, end_width=0.0016, width=WIDTH,
+         frac=ZOOM_FRAC, shrink=5):
     """A Zoom into the point (x, y): the picture first start_width across, then
-    narrower each frame until it is end_width across. (The default point is in
-    the "seahorse valley".)"""
+    narrower each frame (by 1/2**shrink) until it is end_width across. The
+    default point is in the "seahorse valley", and the default end a 2,000x
+    zoom: deeper, MAX_ITER steps can't tell the set's edge from the set, and
+    the picture turns black."""
     scale = 1 << frac
     return Zoom(round(x * scale), round(y * scale), round(start_width / width * scale),
-                max(1, round(end_width / width * scale)), frac=frac)
+                max(1, round(end_width / width * scale)), shrink=shrink, frac=frac)
 
 
 ZOOM = zoom()
@@ -155,12 +157,14 @@ ZOOM = zoom()
 
 def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER,
                     colors=PALETTE):
-    """An animation: a picture after another, each zoomed in a little more on area's point.
+    """An animation: a picture after another, zooming in on area's point, then
+    back out again, and in again, and so on.
 
     Output stream: color (RGB565), valid; input: ready, as mandelbrot()'s.
     """
     port.valid = 0
     step = area.start
+    zooming_in = 1
     while True:
         x0 = area.cx - step * (width // 2)       # the top-left pixel, from the center
         y0 = area.cy + step * (height // 2)
@@ -172,10 +176,18 @@ def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_IT
                                          # the escape loop's (one multiplier per clock)
                 n = yield from escape_count(port, cx, cy, max_iter, area.frac)
                 yield from stream_send(port, colors[n], data="color")
-        step = step - (step >> area.shrink) - 1  # zoom in (by 1 at least: once step is
-                                                 # under 2**shrink, step >> shrink is 0)
-        if step < area.smallest:
-            step = area.start                    # and start over
+        # The next frame's step: smaller zooming in, larger zooming out (by 1 at
+        # least either way: once step is under 2**shrink, step >> shrink is 0)
+        if zooming_in:
+            step = step - (step >> area.shrink) - 1
+            if step <= area.smallest:
+                step = area.smallest             # the deepest: turn around
+                zooming_in = 0
+        else:
+            step = step + (step >> area.shrink) + 1
+            if step >= area.start:
+                step = area.start                # the whole view again: turn around
+                zooming_in = 1
 
 
 ZOOM_ATTR = {"ready": 1, **escape_widths(ZOOM_FRAC)}

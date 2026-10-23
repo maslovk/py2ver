@@ -77,16 +77,17 @@ def test_a_zoom_frame_after_frame(sim, monkeypatch, tmp_path):
                 shots.append(shot)
             return shots
         return tb
-    shots = p.check(frames(4), verilog=sim).value
+    shots = p.check(frames(9), verilog=sim).value
     assert shots[0] != shots[1] != shots[2]                     # (each zoomed in further)
-    assert shots[3] == shots[0]                                 # (and from the start again)
+    assert shots[8] == shots[0]                                 # (and back out to the start)
 
 
 @pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
-def test_a_zoom_starts_over_even_from_tiny_steps(sim, monkeypatch, tmp_path):
-    # Steps under 2**shrink, where step >> shrink is 0: the zoom used to stop
-    # shrinking at 15, short of smallest (7), stuck on one frame for ever. (4
-    # fraction bits: pixels far apart, so each step's frame looks different.)
+def test_a_zoom_turns_around_at_both_ends(sim, monkeypatch, tmp_path):
+    # In to the smallest step, out to the start, in again; even with steps under
+    # 2**shrink, where step >> shrink is 0 (the zoom once stopped shrinking at
+    # 15, short of smallest, 7: stuck on one frame for ever). 4 fraction bits:
+    # pixels far apart, so each step's frame looks different.
     monkeypatch.chdir(tmp_path)
     w, h, iters = 4, 3, 4
     area = M.Zoom(cx=-8, cy=0, start=40, smallest=7, shrink=4, frac=4)
@@ -102,8 +103,11 @@ def test_a_zoom_starts_over_even_from_tiny_steps(sim, monkeypatch, tmp_path):
                 shots.append(shot)
             return shots
         return tb
-    shots = p.check(frames(45), verilog=sim).value
-    assert shots[19] != shots[0] and shots[20:40] == shots[0:20]    # (20 frames, then again)
+    shots = p.check(frames(60), verilog=sim).value
+    deepest = [[iters] * w for _ in range(h)]                       # (all in the set)
+    assert shots[19] == deepest and shots[20] == shots[18]          # (in, and turning back)
+    assert shots[39] == shots[0]                                    # (out to the start)
+    assert shots[58] == deepest                                     # (and in again)
 
 
 def test_a_stream_hands_on_every_value_once():
