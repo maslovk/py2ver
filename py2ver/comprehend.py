@@ -23,6 +23,8 @@ import ast
 import copy
 from typing import Any, Dict, List, Optional, Tuple
 
+from .names import walk_code
+
 
 class _Expand(ast.NodeTransformer):
     def __init__(self, lengths: Dict[str, int], ns: Dict[str, Any]) -> None:
@@ -358,7 +360,7 @@ def expand_comprehensions(tree: ast.Module, attr: Dict[str, Any],
                           ns: Dict[str, Any]) -> ast.Module:
     """The module with every list comprehension / generator expression written out."""
     if not any(isinstance(n, (ast.ListComp, ast.GeneratorExp, ast.DictComp))
-               for n in ast.walk(tree)):
+               for n in walk_code(tree)):
         return tree
     lengths = {k: int(m["length"]) for k, m in (attr or {}).items()
                if isinstance(m, dict) and "length" in m}

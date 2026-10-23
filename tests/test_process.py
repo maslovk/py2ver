@@ -537,6 +537,53 @@ def test_a_table_s_negative_index_counts_from_the_end():
     assert PATH[-50] in {g["out"] for g in gen}
 
 
+def keeps_values(port):
+    values = [0] * 8                         # (a list local: a register per element)
+    while True:
+        for i in range(8):
+            values[i] = port.x + i           # (a variable index: the element it is)
+            yield
+        values[-1] = values[0] + 100         # (a constant one, from the end as in Python)
+        total = 0
+        for i in range(len(values)):
+            v = values[i]
+            yield
+            total = total + v
+        port.out = total
+        yield
+
+
+def test_a_list_local_is_a_register_per_element():
+    p = _quiet(keeps_values, {"x": 8, "total": 12})
+    assert [n for n in p.process.locals if n.startswith("values")] == [f"values_{k}" for k in range(8)]
+    assert p.process.attr["values_0"]["width"] == 8                 # (x + 0: each its own width)
+    assert p.process.attr["values_7"]["width"] == 9
+    clocks = [{"x": k} for k in range(60)]
+    assert p.PY_process()(clocks) == p.GEN_process()(clocks)
+    steady = p.GEN_process()([{"x": 4}] * 40)
+    assert steady[-1]["out"] == sum(range(4, 11)) + 104             # (4..10, and 4 + 100 last)
+
+
+def whole_list(port):
+    values = [0] * 4
+    port.out = values
+    yield
+
+
+def two_lengths(port):
+    values = [0] * 4
+    yield
+    values = [0] * 5
+    yield
+
+
+def test_what_a_list_local_can_t_do_says_so():
+    with pytest.raises(process.ProcessError, match="used by its elements"):
+        _quiet(whole_list, None)
+    with pytest.raises(process.ProcessError, match="different lengths"):
+        _quiet(two_lengths, None)
+
+
 @pytest.mark.sim
 def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -546,6 +593,9 @@ def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
     assert q.TB_process()([{}] * 250) == q.GEN_process()([{}] * 250)
     end = _quiet(reads_from_the_end, None)
     assert end.TB_process()([{}] * 250) == end.GEN_process()([{}] * 250)
+    kept = _quiet(keeps_values, {"x": 8, "total": 12})
+    clocks = [{"x": k} for k in range(60)]
+    assert kept.TB_process()(clocks) == kept.GEN_process()(clocks)
 
 
 def test_a_parameter_is_a_constant_a_partial_its_value():

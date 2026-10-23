@@ -41,11 +41,34 @@ wire with within wor xnor xor
 """.split())
 
 
+def is_table(node: ast.AST) -> bool:
+    """Is node a table, a tuple of constants? Nothing in one is a name, a call or
+    anything else a pass changes, and one may be long (a network's weights): the
+    passes don't go through its entries. (Found out once per node.)"""
+    if not isinstance(node, ast.Tuple):
+        return False
+    if not hasattr(node, "_table"):
+        node._table = all(isinstance(e, ast.Constant) for e in node.elts)
+    return node._table
+
+
+def walk_code(tree: ast.AST):
+    """Every node of the tree, as ast.walk, but not the entries of its tables."""
+    todo = [tree]
+    while todo:
+        node = todo.pop()
+        yield node
+        if not is_table(node):
+            todo.extend(ast.iter_child_nodes(node))
+
+
 def rename_keywords(tree: ast.Module) -> Tuple[ast.Module, Dict[str, str]]:
     """Rename keyword identifiers in the module's first function; returns (tree, py -> hw)."""
-    tree = copy.deepcopy(tree)
-    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-    used |= {a.arg for a in ast.walk(tree) if isinstance(a, ast.arg)}
+    tables = [n for n in walk_code(tree) if is_table(n)]
+    tree = copy.deepcopy(tree, {id(t): t for t in tables})      # (the tables shared, not copied)
+    nodes = list(walk_code(tree))
+    used = {n.id for n in nodes if isinstance(n, ast.Name)}
+    used |= {a.arg for a in nodes if isinstance(a, ast.arg)}
     mapping: Dict[str, str] = {}
 
     def hw(name: str) -> str:
@@ -59,7 +82,7 @@ def rename_keywords(tree: ast.Module) -> Tuple[ast.Module, Dict[str, str]]:
             mapping[name] = new
         return mapping[name]
 
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Name):
             node.id = hw(node.id)
         elif isinstance(node, ast.arg):

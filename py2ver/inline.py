@@ -34,6 +34,7 @@ import textwrap
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .hwtypes import strip_helper_annotations
+from .names import is_table
 
 _BUILTINS = {"range", "min", "max", "abs", "complex"}
 
@@ -54,6 +55,7 @@ class _Inliner:
         self.globals = globals_
         self.counter = itertools.count()
         self.stack: List[str] = []
+        self.tables: Dict[str, ast.Tuple] = {}   # (a module-level table's one tuple node)
 
     # --- lookups ---
     def _helper(self, name: str) -> Optional[ast.FunctionDef]:
@@ -75,8 +77,12 @@ class _Inliner:
     def _constants(self, locals_: Set[str]):
         """Transformer replacing names of module-level int constants with values."""
         g = self.globals
+        tables = self.tables
 
         class _Consts(ast.NodeTransformer):
+            def visit_Tuple(self, node: ast.Tuple):
+                return node if is_table(node) else self.generic_visit(node)
+
             def visit_Name(self, node: ast.Name):
                 if not isinstance(node.ctx, ast.Load) or node.id in locals_:
                     return node
@@ -85,10 +91,12 @@ class _Inliner:
                     return ast.copy_location(ast.Constant(value=int(value)), node)
                 if (isinstance(value, (tuple, list)) and value
                         and all(isinstance(v, int) for v in value)):
-                    # A module-level table becomes a literal (a ROM when indexed by a variable)
-                    table = ast.Tuple(elts=[ast.Constant(value=int(v)) for v in value],
-                                      ctx=ast.Load())
-                    return ast.copy_location(table, node)
+                    # A module-level table becomes a literal (a ROM when indexed by a
+                    # variable): one node wherever it's read, as nothing changes it
+                    if node.id not in tables:
+                        tables[node.id] = ast.Tuple(
+                            elts=[ast.Constant(value=int(v)) for v in value], ctx=ast.Load())
+                    return tables[node.id]
                 return node
 
             def visit_Call(self, node: ast.Call):
@@ -151,6 +159,9 @@ class _Inliner:
         inliner = self
 
         class _Calls(ast.NodeTransformer):
+            def visit_Tuple(self, node: ast.Tuple):
+                return node if is_table(node) else self.generic_visit(node)
+
             def visit_Call(self, call: ast.Call):
                 self.generic_visit(call)  # inner calls first
                 if not isinstance(call.func, ast.Name):

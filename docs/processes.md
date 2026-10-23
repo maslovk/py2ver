@@ -156,6 +156,30 @@ The local can also be set to other values elsewhere (`x = 0`). The Julia
 paths in `examples/mandelbrot.py` are read this way. Their two tables of 360
 entries take 25,600 memory bits, where as logic they took about 3,700 LUTs.
 
+A table's values can also come from a record's field (`net.weights[i]`), so a
+network's weights, worked out before building, can be given as a parameter.
+`examples/dreaming_digits.py` has a table of 50,176 weights.
+
+### Lists
+
+A local can be a list of fixed length, made as `[0] * n` or written out
+(`[a, b, c]`). Each element is a register of its own, with its own width:
+
+```python
+neurons = [0] * 64
+for j in range(64):
+    ...
+    neurons[j] = max(0, total)       # sets the element j is
+...
+x = neurons[j]                       # reads it
+n = len(neurons)                     # 64
+```
+
+An index can be a variable or a constant, and a negative one counts from the
+end, as in Python. A list can only be used through its elements and its
+length: it can't be passed to a step or assigned to another name. Each
+element is a register, so a list suits tens of values, not thousands.
+
 ## 3. Steps, parameters and the protocol library
 
 A step that a protocol takes more than once can be written as a generator of

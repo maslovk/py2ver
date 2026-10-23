@@ -200,6 +200,7 @@ class MemoriesMixin:
             choices(node, lambda n: found.append(n) or n)
             return found
 
+        table_copies = {t: copies(t) for t in tables}          # (each table read's, once)
         removed: set = set()
         new_assigns: List[Assignment] = []
         items: List[str] = []
@@ -211,11 +212,11 @@ class MemoriesMixin:
             chain = [nxt]
             while copied(chain[-1]) is not None and chain[-1] not in rom_reads:
                 chain.append(copied(chain[-1]))
-            rom = next((t for t in tables if chain[-1] in copies(t)), None)
+            rom = next((t for t in tables if chain[-1] in table_copies[t]), None)
             select = None
             if rom is not None:                   # (the next value is the table's value)
                 reads = [rom]
-                chain = chain[:min(k for k, c in enumerate(chain) if c in copies(rom))]
+                chain = chain[:min(k for k, c in enumerate(chain) if c in table_copies[rom])]
                 tree = None
             else:
                 a = by_left.get(chain[-1])
@@ -223,7 +224,7 @@ class MemoriesMixin:
                 if tree is None:
                     continue
                 # (the choices may read one table at several places: one memory block)
-                reads = [t for t in tables if any(n[0] == "atom" and n[1] in copies(t)
+                reads = [t for t in tables if any(n[0] == "atom" and n[1] in table_copies[t]
                                                   for n in leaves(tree))]
                 same = {(tuple(rom_reads[t]["entries"]), rom_reads[t]["width"],
                          bool(rom_reads[t].get("signed")), rom_reads[t]["address_bits"])
@@ -231,7 +232,7 @@ class MemoriesMixin:
                 if len(same) != 1:
                     continue
                 select = chain[-1]
-            read_of = {c: t for t in reads for c in copies(t)}    # (a copy -> its read)
+            read_of = {c: t for t in reads for c in table_copies[t]}    # (a copy -> its read)
             table = set(read_of)
             if select is not None:
                 # (the table's value only a choice, not in a condition or a sum)
@@ -291,8 +292,10 @@ class MemoriesMixin:
                 value = f"{{{fill}, {q}}}"
             else:
                 value = f"{q}[{rw - 1}:0]" if rw < w else q
+            # (as long as the table, not padded to a power of two: it is read only
+            # when Python reads it, at an index in range; a long table takes fewer
+            # memory blocks)
             entries = list(info["entries"])
-            entries += [entries[-1]] * ((1 << ab) - len(entries))
             mask = (1 << w) - 1
             arr = f"{r}__rom"
             items += [f"// Table in a memory block: {len(info['entries'])} x {w} bits, "

@@ -37,6 +37,8 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .names import walk_code
+
 _MISSING = object()
 
 
@@ -692,14 +694,14 @@ def scalarize(tree: ast.Module, attr: Dict[str, Any], ns: Dict[str, Any]):
     fd = tree.body[0]
     if not isinstance(fd, ast.FunctionDef):
         return tree, attr
-    has = any(isinstance(n, (ast.Dict, ast.DictComp)) for n in ast.walk(fd)) \
+    has = any(isinstance(n, (ast.Dict, ast.DictComp)) for n in walk_code(fd)) \
         or any(isinstance(m, dict) and "shape" in m for m in attr.values()) \
         or any(isinstance(n, ast.List) and any(
             isinstance(e, (ast.List, ast.Tuple, ast.BinOp, ast.Call)) for e in n.elts)
-               for n in ast.walk(fd)) \
-        or any(isinstance(n, ast.Name) and isinstance(ns.get(n.id), dict) for n in ast.walk(fd)) \
+               for n in walk_code(fd)) \
+        or any(isinstance(n, ast.Name) and isinstance(ns.get(n.id), dict) for n in walk_code(fd)) \
         or any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "dict"
-               for n in ast.walk(fd))
+               for n in walk_code(fd))
     if not has:
         return tree, attr
     tree = copy.deepcopy(tree)

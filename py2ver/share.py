@@ -507,14 +507,14 @@ def _interval(n: ast.expr, rng: Dict[str, Tuple[int, int]],
             return _fmt_range(attr[n.value.id])
         if isinstance(n.value, ast.Tuple):
             t = n.value
-            if id(t) not in _TABLE_HULLS or _TABLE_HULLS[id(t)][0] is not t:
-                if all(isinstance(e, ast.Constant) and isinstance(e.value, (int, bool))
+            known = _TABLE_HULLS.get(id(t))
+            if known is not None and known[0] is t:
+                return known[1]                         # (a table's range, found once)
+            if not all(isinstance(e, ast.Constant) and isinstance(e.value, (int, bool))
                        for e in t.elts):
-                    vals = [int(e.value) for e in t.elts]
-                    hull = (min(vals), max(vals))
-                else:
-                    hull = _hull(*[iv(e) for e in t.elts])
-                _TABLE_HULLS[id(t)] = (t, hull)       # (a table's range, once: they are long)
+                return _hull(*[iv(e) for e in t.elts])  # (signals: their ranges now)
+            vals = [int(e.value) for e in t.elts]
+            _TABLE_HULLS[id(t)] = (t, (min(vals), max(vals)))
             return _TABLE_HULLS[id(t)][1]
     if isinstance(n, ast.BinOp):
         (a, b), (c, d) = iv(n.left), iv(n.right)

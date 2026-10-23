@@ -41,6 +41,8 @@ import copy
 import itertools
 from typing import Any, Dict, List, Optional, Set
 
+from .names import walk_code
+
 MAX_STATIC = 1 << 16          # largest iteration count worked out for a counting loop
 
 
@@ -53,7 +55,7 @@ class _Ctx:
 
 def _has(node: ast.AST, kinds) -> bool:
     """node contains one of kinds (not counting nested functions)."""
-    return any(isinstance(n, kinds) for n in ast.walk(node))
+    return any(isinstance(n, kinds) for n in walk_code(node))
 
 
 def _name(i: int, n: int) -> str:
@@ -271,7 +273,7 @@ def _constants_before(fd: ast.FunctionDef) -> Dict[int, Dict[str, int]]:
 def needs_structuring(fd: ast.FunctionDef) -> bool:
     if _has(fd, (ast.While, ast.Break, ast.Continue)):
         return True
-    returns = [n for n in ast.walk(fd) if isinstance(n, ast.Return)]
+    returns = [n for n in walk_code(fd) if isinstance(n, ast.Return)]
     return len(returns) > 1 or (len(returns) == 1 and fd.body and returns[0] is not fd.body[-1])
 
 
@@ -283,7 +285,7 @@ def structure_function(fd: ast.FunctionDef, bound: Optional[int] = None) -> ast.
     used = {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)} | {a.arg for a in fd.args.args}
     st = _Structure(bound, used)
     st.before = _constants_before(fd)
-    returns = [n for n in ast.walk(fd) if isinstance(n, ast.Return)]
+    returns = [n for n in walk_code(fd) if isinstance(n, ast.Return)]
     early = len(returns) > 1 or (returns and returns[0] is not fd.body[-1])
     pre: List[ast.stmt] = []
     if early:

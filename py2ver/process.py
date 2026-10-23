@@ -72,6 +72,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+from .names import is_table, walk_code
+
 PC, WAIT = "__pc", "__wait"
 MAX_BITS = 64                 # a local wider than this: its width from attr
 
@@ -607,6 +609,21 @@ def _env(base: Callable) -> Dict[str, Any]:
     return env
 
 
+def _copy(node: Any) -> Any:
+    """A deep copy of node (a tree, or a list of them) that shares its tables: nothing
+    changes a table, and a copy of a long one (a network's weights) for every
+    statement and every value followed would take a lot of memory and time."""
+    memo: Dict[int, Any] = {}
+    todo = list(node) if isinstance(node, list) else [node]
+    while todo:
+        n = todo.pop()
+        if is_table(n):
+            memo[id(n)] = n                     # (copy.deepcopy keeps what memo has)
+        elif isinstance(n, ast.AST):
+            todo.extend(ast.iter_child_nodes(n))
+    return copy.deepcopy(node, memo)
+
+
 def _stored(stmts: List[ast.stmt]) -> Set[str]:
     return {n.id for s in stmts for n in ast.walk(s)
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
@@ -749,6 +766,8 @@ class _Expander:
                     a = n.args[0]
                     if isinstance(a, ast.Tuple) and all(isinstance(e, ast.Constant) for e in a.elts):
                         return ast.copy_location(ast.Constant(len(a.elts)), n)
+                    if isinstance(a, ast.Name) and a.id in _TABLES:      # (a long table, named)
+                        return ast.copy_location(ast.Constant(len(_TABLES[a.id])), n)
                     if isinstance(a, ast.Constant) and isinstance(a.value, (str, bytes)):
                         return ast.copy_location(ast.Constant(len(a.value)), n)
                 # (getattr(port, 'start'): port.start)
@@ -807,7 +826,7 @@ class _Expander:
                     return n.body if n.test.value else n.orelse
                 return n
         out: List[ast.stmt] = []
-        for s in copy.deepcopy(fd.body):
+        for s in _copy(fd.body):
             r = _T().visit(s)
             out += r if isinstance(r, list) else [r]
         for s in out:                   # (a record: its fields read, or given to a step; no more)
@@ -930,14 +949,37 @@ def _resolved(e: ast.expr, env: Dict[str, Any], local: Set[str]) -> Any:
     return None
 
 
+TABLE_NAME_MIN = 64          # a constant tuple this long is named in the code, not written out
+_TABLES: Dict[str, tuple] = {}           # (a long table's name in the code -> its values)
+_TABLE_NAMES: Dict[tuple, str] = {}      # (and back)
+_TABLE_NODES: Dict[str, ast.Tuple] = {}  # (and as one tuple node, for following its range)
+
+
 def _value_node(v: Any) -> ast.expr:
     """A constant as code: an int or a string as itself; bytes, a tuple: a table of
-    ints (text[i] a table read); a record: itself, its fields read as they're used."""
+    ints (text[i] a table read), a long one by a name (_table1) bound to it in the
+    step's namespace, so that the passes over the code don't go through every
+    entry; a record: itself, its fields read as they're used."""
     if _record(v):
         return ast.Constant(v)
     if isinstance(v, (bytes, bytearray, tuple)):
-        return ast.Tuple(elts=[ast.Constant(int(b)) for b in v], ctx=ast.Load())
+        values = tuple(int(b) for b in v)
+        if len(values) < TABLE_NAME_MIN:
+            return ast.Tuple(elts=[ast.Constant(b) for b in values], ctx=ast.Load())
+        name = _TABLE_NAMES.get(values)
+        if name is None:
+            name = _TABLE_NAMES[values] = f"_table{len(_TABLES) + 1}"
+            _TABLES[name] = values
+        return ast.Name(id=name, ctx=ast.Load())
     return ast.Constant(v)
+
+
+def _table_node(name: str) -> ast.Tuple:
+    """The named table as a tuple node, made once (its range is then found once)."""
+    if name not in _TABLE_NODES:
+        _TABLE_NODES[name] = ast.Tuple(elts=[ast.Constant(b) for b in _TABLES[name]],
+                                       ctx=ast.Load())
+    return _TABLE_NODES[name]
 
 
 def _is_port(e: ast.expr, port: str) -> bool:
@@ -1070,7 +1112,7 @@ class _Lower:
             target, returns = self.steps[-1]
             if isinstance(target, ast.Tuple):                   # (a, b = ...: return x, y)
                 c.emit("stmt", ast.copy_location(ast.Assign(
-                    targets=[copy.deepcopy(target)], value=copy.deepcopy(s.value)), s))
+                    targets=[_copy(target)], value=_copy(s.value)), s))
             elif target is not None and s.value is not None \
                     and not (isinstance(s.value, ast.Name) and s.value.id == target.id):
                 c.emit("stmt", _assign(target.id, s.value, s))
@@ -1131,7 +1173,7 @@ class _Lower:
             top = c.here()
             skip = c.emit("jump_unless", ast.Compare(
                 left=ast.Name(id=v, ctx=ast.Load()), ops=[ast.Lt() if step > 0 else ast.Gt()],
-                comparators=[copy.deepcopy(stop)]), -1)
+                comparators=[_copy(stop)]), -1)
             self.loops.append(([], []))
             self.body(s.body)
             breaks, continues = self.loops.pop()
@@ -1176,7 +1218,7 @@ def _assign(name: str, value: ast.expr, like: Optional[ast.AST] = None) -> ast.A
 
 
 def _assign_bare(name: str, value: ast.expr) -> ast.Assign:
-    return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=copy.deepcopy(value))
+    return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=_copy(value))
 
 
 def _desugar(fd: ast.FunctionDef, port: str, inputs: Set[str], outputs: Set[str],
@@ -1195,7 +1237,7 @@ def _desugar(fd: ast.FunctionDef, port: str, inputs: Set[str], outputs: Set[str]
 
         def visit_AugAssign(self, n: ast.AugAssign):
             self.generic_visit(n)
-            load = copy.deepcopy(n.target)
+            load = _copy(n.target)
             load.ctx = ast.Load()
             for x in ast.walk(load):
                 if hasattr(x, "ctx"):
@@ -1206,6 +1248,119 @@ def _desugar(fd: ast.FunctionDef, port: str, inputs: Set[str], outputs: Set[str]
             return out
     _T().visit(fd)
     ast.fix_missing_locations(fd)
+
+
+def _list_items(e: ast.expr) -> Optional[List[ast.expr]]:
+    """The items of a list written out ([a, b, c]) or repeated ([0] * 8), else None."""
+    if isinstance(e, ast.List):
+        return list(e.elts)
+    if isinstance(e, ast.BinOp) and isinstance(e.op, ast.Mult):
+        for items, count in ((e.left, e.right), (e.right, e.left)):
+            if isinstance(items, ast.List) and isinstance(count, ast.Constant) \
+                    and type(count.value) is int:
+                return [_copy(x) for x in items.elts * count.value]
+    return None
+
+
+def _expand_lists(fd: ast.FunctionDef) -> Dict[str, int]:
+    """In place: each list local (values = [0] * 8) as a register per element,
+    values_0 to values_7. values[i] = x sets the element i is (an if for each
+    element when i is a variable); values[i] reads it (a selection of the
+    elements); len(values) is its length. Returns each list's length."""
+    lengths: Dict[str, int] = {}
+    for n in ast.walk(fd):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            items = _list_items(n.value)
+            if items is None:
+                continue
+            name = n.targets[0].id
+            if lengths.get(name, len(items)) != len(items):
+                raise ProcessError(f"{_at(n)}: {fd.name}: the list '{name}' is made twice with "
+                                   f"different lengths ({lengths[name]} and {len(items)}); a "
+                                   f"list's length is fixed")
+            lengths[name] = len(items)
+    if not lengths:
+        return lengths
+
+    def constant(index: ast.expr, name: str, at: ast.AST) -> Optional[int]:
+        """A constant index as the element it is (-1: the last), else None."""
+        try:
+            k = ast.literal_eval(index)
+        except ValueError:
+            return None
+        if type(k) is not int:
+            return None
+        n = lengths[name]
+        if not -n <= k < n:
+            raise ProcessError(f"{_at(at)}: {fd.name}: index {k} is outside the list '{name}' "
+                               f"({n} elements)")
+        return k % n
+
+    def element(name: str, k: int, ctx: ast.expr_context) -> ast.Name:
+        return ast.Name(id=f"{name}_{k}", ctx=ctx)
+
+    class _T(ast.NodeTransformer):
+        def visit_Assign(self, s: ast.Assign):
+            s.value = self.visit(s.value)
+            target = s.targets[0]
+            if len(s.targets) == 1 and isinstance(target, ast.Name) and target.id in lengths:
+                items = _list_items(s.value)
+                if items is None:
+                    raise ProcessError(f"{_at(s)}: {fd.name}: the list '{target.id}' can only be "
+                                       f"set as a whole to a list ([0] * n), or an element at a "
+                                       f"time ({target.id}[i] = ...)")
+                return [ast.copy_location(ast.Assign(targets=[element(target.id, k, ast.Store())],
+                                                     value=v), s) for k, v in enumerate(items)]
+            if len(s.targets) == 1 and isinstance(target, ast.Subscript) \
+                    and isinstance(target.value, ast.Name) and target.value.id in lengths:
+                name = target.value.id
+                index = self.visit(target.slice)
+                k = constant(index, name, s)
+                if k is not None:
+                    return ast.copy_location(ast.Assign(targets=[element(name, k, ast.Store())],
+                                                        value=s.value), s)
+                # (a variable index: the element it is, an if for each)
+                chain: List[ast.stmt] = [ast.Pass()]
+                for k in reversed(range(lengths[name])):
+                    test = ast.Compare(left=_copy(index), ops=[ast.Eq()],
+                                       comparators=[ast.Constant(k)])
+                    test._element = True     # (not a limit of the index: see _flow_widths)
+                    write = ast.Assign(targets=[element(name, k, ast.Store())],
+                                       value=_copy(s.value))
+                    chain = [ast.If(test=test, body=[write], orelse=chain)]
+                return ast.copy_location(chain[0], s)
+            s.targets = [self.visit(t) for t in s.targets]
+            return s
+
+        def visit_Subscript(self, e: ast.Subscript):
+            if isinstance(e.value, ast.Name) and e.value.id in lengths \
+                    and isinstance(e.ctx, ast.Load):
+                name = e.value.id
+                index = self.visit(e.slice)
+                k = constant(index, name, e)
+                if k is not None:
+                    return element(name, k, ast.Load())
+                elements = [element(name, j, ast.Load()) for j in range(lengths[name])]
+                return ast.Subscript(value=ast.Tuple(elts=elements, ctx=ast.Load()),
+                                     slice=index, ctx=ast.Load())
+            return self.generic_visit(e)
+
+        def visit_Call(self, c: ast.Call):
+            if isinstance(c.func, ast.Name) and c.func.id == "len" and len(c.args) == 1 \
+                    and isinstance(c.args[0], ast.Name) and c.args[0].id in lengths:
+                return ast.Constant(lengths[c.args[0].id])
+            return self.generic_visit(c)
+
+        def visit_Name(self, n: ast.Name):
+            if n.id in lengths:
+                raise ProcessError(f"{_at(n)}: {fd.name}: the list '{n.id}' can be used by "
+                                   f"its elements ({n.id}[i]) and its length (len({n.id})), "
+                                   f"not as a whole")
+            return n
+
+    _T().visit(fd)
+    ast.fix_missing_locations(fd)
+    return lengths
 
 
 def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Process:
@@ -1259,6 +1414,13 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
             n.id = f"{n.id}_v"
     used |= {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)}
     _desugar(fd, port, set(inputs), set(outputs), opens)
+    # (a list local: a register per element; its width in attr each element's)
+    for name, n in _expand_lists(fd).items():
+        if name in attr:
+            given = attr.pop(name)
+            for k in range(n):
+                attr.setdefault(f"{name}_{k}", dict(given))
+    used |= {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)}
     counter = [0]
 
     def fresh(base: str) -> str:
@@ -1320,7 +1482,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
             kind, *rest = code[i]
             if kind == "stmt":
                 s = rest[0]
-                out.append(copy.deepcopy(s))
+                out.append(_copy(s))
                 # (a local set to a constant: known for the rest of the clock)
                 known = {k: v for k, v in known.items() if k not in _stored([s])}
                 if isinstance(s, ast.Assign) and len(s.targets) == 1 \
@@ -1337,7 +1499,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
                     i = i + 1 if decided else target
                     continue
                 when_true, when_false = _facts(test, pins_in, one_bit)
-                out.append(ast.If(test=copy.deepcopy(test),
+                out.append(ast.If(test=_copy(test),
                                   body=segment(i + 1, seen, {**known, **when_true}) or [ast.Pass()],
                                   orelse=segment(target, seen, {**known, **when_false})
                                   or [ast.Pass()]))
@@ -1348,7 +1510,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
                     wait: ast.expr = ast.Constant(0)
                 else:
                     waits.append(n)
-                    wait = ast.BinOp(left=copy.deepcopy(n), op=ast.Sub(), right=ast.Constant(1))
+                    wait = ast.BinOp(left=_copy(n), op=ast.Sub(), right=ast.Constant(1))
                 st = state_of(i + 1)
                 origin.setdefault(st, rest[1])
                 out += [_assign(WAIT, wait), _assign(PC, ast.Constant(st))]
@@ -1400,7 +1562,7 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
                        orelse=chain))
     returned = outputs + [PC, WAIT] + local_names + [f"{o}__n" for o in outputs]
     params = inputs + [PC, WAIT] + local_names + [f"{o}__q" for o in outputs]
-    ns = dict(base.__globals__)
+    ns = dict(base.__globals__, **_TABLES)       # (the long tables by their names too)
     # (the module's name: the generator's)
     step, step_fd, source = _function(fd.name, params, body, returned, ns, base.__qualname__)
 
@@ -1572,14 +1734,26 @@ def _bound(e: ast.expr, widths, attr, ns) -> Tuple[int, int]:
 
 
 def _constants(e: ast.expr, ns: Dict[str, Any]) -> ast.expr:
-    """e with the module's integer constants (BIT) as their values."""
+    """e with the module's integer constants (BIT) as their values, a named
+    table as its tuple (the same node each time) and len() of one as its length."""
     class _C(ast.NodeTransformer):
+        def visit_Tuple(self, n: ast.Tuple):
+            return n if is_table(n) else self.generic_visit(n)
+
+        def visit_Call(self, n: ast.Call):
+            if isinstance(n.func, ast.Name) and n.func.id == "len" and len(n.args) == 1 \
+                    and isinstance(n.args[0], ast.Name) and n.args[0].id in _TABLES:
+                return ast.Constant(len(_TABLES[n.args[0].id]))
+            return self.generic_visit(n)
+
         def visit_Name(self, n: ast.Name):
+            if n.id in _TABLES and isinstance(n.ctx, ast.Load):
+                return _table_node(n.id)
             v = ns.get(n.id)
             if isinstance(v, int) and not isinstance(v, bool) and isinstance(n.ctx, ast.Load):
                 return ast.Constant(v)
             return n
-    return _C().visit(copy.deepcopy(e))
+    return _C().visit(_copy(e))
 
 
 Range = Tuple[int, int]
@@ -1644,12 +1818,15 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
         for n in ast.walk(ast.Module(body=seg, type_ignores=[])):
             if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name):
                 first.setdefault(n.targets[0].id, n)
-                # (the constants in what's assigned, too: min(pos + 1, 255))
-                for c in ast.walk(_constants(n.value, ns)):
+                # (the constants in what's assigned, too: min(pos + 1, 255); not a
+                # table's entries)
+                for c in walk_code(_constants(n.value, ns)):
                     if isinstance(c, ast.Constant) and type(c.value) is int:
                         thresholds.setdefault(n.targets[0].id, set()).update(
                             {c.value - 1, c.value, c.value + 1})
-            if isinstance(n, ast.Compare):
+            # (a list's element chosen by its index, i == 0, i == 1, ...: these
+            # don't limit i, and a constant for each would widen it a step at a time)
+            if isinstance(n, ast.Compare) and not getattr(n, "_element", False):
                 for a, b in ((n.left, n.comparators[0]), (n.comparators[0], n.left)):
                     b = _constants(b, ns)
                     if isinstance(a, ast.Name) and isinstance(b, ast.Constant) \
@@ -1796,7 +1973,7 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
     # (each state's registers at its start; the first's: their initial values)
     start: Dict[int, Optional[Dict[str, Range]]] = {k: None for k in range(len(segments))}
     start[0] = dict(init)
-    changes = {k: 0 for k in start}
+    changes: Dict[Tuple[int, str], int] = {}          # (how often a state's register grew)
     todo = [0]
     while todo:
         k = todo.pop(0)
@@ -1811,7 +1988,6 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
             new = join(start[j], arrived)
             if new == start[j]:
                 continue
-            changes[j] += 1
             # A value past MAX_BITS can't be built, and its range never shrinks
             # again: stop now, before squaring makes its bounds astronomically long.
             huge = sorted(v for v, r in new.items()
@@ -1825,18 +2001,25 @@ def _flow_widths(segments: List[List[ast.stmt]], done: int, names: List[str], in
                     f"{fname}: py2ver can't tell how many bits {each} need: nothing in the "
                     f"code limits their values. Give each a width in attr, or limit it "
                     f"with a test such as `while x > 0` (rather than `while x != 0`).")
-            if changes[j] > WIDEN_AFTER and start[j] is not None:
-                # (still growing: to the constants it's tested against; one growing past
-                # them, or without any, long after: without end)
+            if start[j] is not None:
+                # A register still growing: to the constants it's tested against; one
+                # growing past them, or without any, long after: without end. (Each
+                # register counted on its own: many registers each settling once,
+                # list elements, don't make the others look as if they keep growing.)
                 widened, unbounded = {}, []
                 for v, r in new.items():
                     old = start[j][v]
+                    if r != old:
+                        changes[(j, v)] = changes.get((j, v), 0) + 1
+                    if r == old or changes[(j, v)] <= WIDEN_AFTER:
+                        widened[v] = r
+                        continue
                     ts = tests_of(v)
                     hi = r[1] if r[1] == old[1] else next((t for t in ts if t >= r[1]), r[1])
                     lo = r[0] if r[0] == old[0] else next((t for t in reversed(ts) if t <= r[0]),
                                                           r[0])
                     widened[v] = (lo, hi)
-                    if r != old and changes[j] > GIVE_UP_AFTER:
+                    if changes[(j, v)] > GIVE_UP_AFTER:
                         unbounded.append(v)
                 if len(unbounded) == 1:
                     v = unbounded[0]
@@ -2028,7 +2211,7 @@ def _compile_system(s: System, attr: Dict[str, Any]) -> Process:
             if n in pr.outputs:
                 return ext[(p, n)]
             return f"{p}_{n}" if n in own else n
-        fd = copy.deepcopy(pr.tree)
+        fd = _copy(pr.tree)
         for n in ast.walk(fd):
             if isinstance(n, ast.Name):
                 n.id = name_of(n.id)
@@ -2049,6 +2232,7 @@ def _compile_system(s: System, attr: Dict[str, Any]) -> Process:
         for g, v in _unwrap(f)[0].__globals__.items():
             ns.setdefault(g, v)
         states += pr.states
+    ns.update(_TABLES)                            # (the long tables by their names too)
     clash = set(state) & set(ext.values())
     if clash or len(set(params)) != len(params):
         raise ProcessError(f"{s.name}: a pin named as a process's state ({sorted(clash)}): "
