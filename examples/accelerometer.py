@@ -14,17 +14,20 @@ from py2ver.devices.adxl345 import (ADDRESS as ADXL345, POWER_CTL,  # noqa: E402
                                     adxl345_read_xyz, adxl345_start, signed16)
 from py2ver.protocol import I2C, i2c_read_register, jtag_print, jtag_print_hex  # noqa: E402
 
-BUS = I2C(q=50_000_000 // 100_000 // 4)  # 100 kHz (a quarter of SCL: 125 clocks); scl, sda
-ADDRESSES = (0x53, 0x1D, 0x50)           # the ADXL345 (its ALT ADDRESS low, or high); an EEPROM
+BUS = I2C(q=50_000_000 // 100_000 // 4)  # 100 kHz at 50 MHz, on the pins scl and sda
+ADDRESSES = (0x53, 0x1D, 0x50)           # where an ADXL345 can be (two choices), and the EEPROM
 
 
 def i2c_probe(port, bus=BUS):
-    """At reset: register 0 of each address in ADDRESSES read and printed (an
-    ADXL345's: its id, 0xE5), with its acknowledge."""
+    """Look for devices on the bus: read register 0 at each address in ADDRESSES,
+    and print what came back and whether anyone answered.
+
+    (An ADXL345 answers with its id, 0xE5.)
+    """
     port.scl = 1
     port.sda = 1
-    port.cs_n = 1                        # (the ADXL345's CS high: I2C)
-    yield 50_000                         # (1 ms: the bus settled)
+    port.cs_n = 1                        # the ADXL345 talks I2C while its CS is high
+    yield 50_000                         # give the bus 1 ms to settle
     yield from jtag_print(port, b"i2c probe\n")
     for k in range(len(ADDRESSES)):
         address = ADDRESSES[k]
@@ -46,13 +49,16 @@ PERIOD = 10_000_000                      # 0.2 s at 50 MHz between readings
 
 
 def print_axis(port, name, value):
+    """Print a label and a 4-digit hexadecimal reading, such as x=0x0003."""
     yield from jtag_print(port, name)
     yield from jtag_print_hex(port, value, 4)
 
 
 def accelerometer(port, bus=BUS, period=PERIOD):
-    """The ADXL345 measuring (+-2 g: 1 g about 256), its X, Y and Z printed
-    every period."""
+    """Start the ADXL345, then print its X, Y and Z every period.
+
+    At its +-2 g range, 1 g reads as about 256 (0x0100).
+    """
     port.scl = 1
     port.sda = 1
     port.cs_n = 1
@@ -72,6 +78,7 @@ def accelerometer(port, bus=BUS, period=PERIOD):
         yield period
 
 
+# scl and sda are open drain; for the board, each port is put on its pin
 ATTR = {"scl": {"open_drain": True}, "sda": {"open_drain": True}, "tx_room": 1}
 PINS = dict(ATTR, scl=dict(ATTR["scl"], pin="I2C_SCLK"), sda=dict(ATTR["sda"], pin="I2C_SDAT"),
             cs_n="G_SENSOR_CS_N", tx_data="JTAG_TX_DATA", tx_send="JTAG_TX_VALID",
@@ -79,9 +86,11 @@ PINS = dict(ATTR, scl=dict(ATTR["scl"], pin="I2C_SCLK"), sda=dict(ATTR["sda"], p
 
 
 def with_a_memory(mem, address=0x50, transfers=1, until=b"done\n"):
-    """A testbench: the design on a bus with a chip of registers at address
-    (py2ver.devices' model: an ADXL345's registers can be its bytes); what it
-    printed, up to until."""
+    """A testbench: the design on a bus with a chip of registers at `address`.
+
+    mem holds the chip's registers (an ADXL345's, say). Returns everything the
+    design printed, up to and including `until`.
+    """
     from py2ver.devices.i2c_target import i2c_memory
     from py2ver.protocol import together
 

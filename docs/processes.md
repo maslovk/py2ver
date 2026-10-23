@@ -363,23 +363,22 @@ prints each state with the line where it waits, and every register's
 width (here the guide's code was run as `guide.py`):
 
 ```text
-uart_rx: 6 states (a state waits at its yield: a clock, or yield n's n)
-  0  guide.py:40  def uart_rx(port, bit=BIT):  (the start)
-  1  py2ver/protocol.py:19  yield  (in wait_until from guide.py:45)
+uart_rx: 6 states. Each state is a place where the generator waits: a yield (one clock cycle) or a yield n (n cycles).
+  0  guide.py:40  def uart_rx(port, bit=BIT):  (where it starts)
+  1  py2ver/protocol.py:40  yield  (in wait_until, called from guide.py:45)
   2  guide.py:46  yield bit // 2                                  # to the middle of the start bit
-  3  py2ver/protocol.py:70  yield clocks  (in shift_in from guide.py:49)
+  3  py2ver/protocol.py:97  yield clocks  (in shift_in, called from guide.py:49)
   4  guide.py:50  yield bit                                       # the middle of the stop bit
   5  guide.py:54  yield
-bits (the outputs, the locals and the state: registers):
+Widths in bits (the outputs, the local variables and the control are registers):
   inputs   rx 1
   outputs  valid 1, data 8, error 1
   locals   data_v 8, shift_in_i 4
-  state    __pc 3, __wait 9  (__pc: the state; __wait: the clocks a yield n has left)
-  (data_v: the local data (named apart from the pin port.data))
+  control  __pc 3, __wait 9  (__pc is the current state; __wait counts down a yield n)
+  Note: data_v is the local variable data, renamed so that it doesn't clash with the pin port.data.
 ```
 
-A state inside a step shows the step and where it was used from. `__pc` is
-the state register and `__wait` counts down the clocks of a `yield n`. For a
+A state inside a step shows the step and where it was called from. For a
 connected design, `explain()` shows each process in turn.
 
 ## 7. Connect processes
@@ -764,8 +763,8 @@ with board.jtag_uart(q) as link:
     cap = board.CAPTURE(q, trigger={"valid": 1, "byte": ord("Z")},
                         during=lambda: link.write(b"Z"))
 print(cap.show())
-#    -512  byte=65, valid=0, ..., __pc_out=1   [__pc_out: ... (in wait_until from examples/jtag_echo.py:26)]
-#       0  byte=90, valid=1, __pc_out=3   [__pc_out: examples/jtag_echo.py:33  yield]
+#    -512  byte=65, valid=0, ..., __pc_out=1   [__pc_out: ... (in wait_until, called from examples/jtag_echo.py:27)]
+#       0  byte=90, valid=1, __pc_out=3   [__pc_out: examples/jtag_echo.py:34  yield]
 #       1  byte=65, valid=0, ready=0, send=1, __pc_out=1   [...]
 #       2  ready=1, send=0
 cap.write_vcd("capture.vcd")                   # for GTKWave or Surfer

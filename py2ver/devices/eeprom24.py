@@ -1,34 +1,38 @@
 """
-A 24LC02-like I2C EEPROM: 256 bytes (2 Kbit), at 0x50 (the DE0-Nano's; a
-24LC02B answers 0x50 to 0x57 alike). Erased, it reads 0xFF. A write takes the
-chip up to 5 ms, and it doesn't answer meanwhile: eeprom_write() waits for it
-by asking (acknowledge polling).
+A 24LC02-style I2C EEPROM: 256 bytes that keep their values without power.
+
+The DE0-Nano has one at address 0x50. An erased byte reads 0xFF. After a
+write the chip needs up to 5 ms to store the byte, and ignores the bus until
+it's done; eeprom_write() waits for that by asking the chip until it answers
+again (acknowledge polling).
 
     value, nack = yield from eeprom_read(port, bus, 0x10)
-    nack = yield from eeprom_write(port, bus, 0x10, 0x42)   # (written: the chip keeps it)
+    nack = yield from eeprom_write(port, bus, 0x10, 0x42)   # permanent!
 """
 from ..protocol import (I2C, i2c_read_register, i2c_start, i2c_stop, i2c_write_byte,
                         i2c_write_register)
 from .i2c_target import i2c_memory
 
 ADDRESS = 0x50
-POLLS = 255                     # (asked at most: 255 at 100 kHz, some 25 ms; its write, 5 at most)
+MAX_POLLS = 255     # about 25 ms at 100 kHz; a write takes at most 5 ms
 
 
 def eeprom_read(port, bus, offset, address=ADDRESS):
-    """The byte at offset; nack, 1 if the chip didn't answer."""
+    """Read the byte at `offset`. Returns (value, nack); nack is 1 if the chip didn't answer."""
     value, nack = yield from i2c_read_register(port, bus, address, offset)
     return value, nack
 
 
 def eeprom_write(port, bus, offset, value, address=ADDRESS):
-    """value written at offset, and the chip's write waited for (it answers its
-    address again once done); nack, 1 if it didn't answer the write, or never
-    after."""
+    """Write `value` at `offset`, and wait until the chip has stored it.
+
+    Returns nack: 1 if the chip didn't take the write, or never finished it.
+    """
     nack = yield from i2c_write_register(port, bus, address, offset, value)
+    # While the chip is busy storing the byte, it doesn't answer its address.
     busy = 1 - nack
     polls = 0
-    while busy and polls < POLLS:
+    while busy and polls < MAX_POLLS:
         yield from i2c_start(port, bus)
         busy = yield from i2c_write_byte(port, bus, address << 1)
         yield from i2c_stop(port, bus)
@@ -36,10 +40,18 @@ def eeprom_write(port, bus, offset, value, address=ADDRESS):
     return nack | busy
 
 
+# ---------------------------------------------------------------------------
+# A model of the chip, for testbenches
+# ---------------------------------------------------------------------------
+
 def eeprom_model(dut, mem, transfers, address=ADDRESS, write_clocks=5000, bus=I2C()):
-    """A testbench step playing the EEPROM (mem: offset -> byte; missing, 0xFF):
-    each write taking write_clocks clocks, the chip deaf to the bus meanwhile;
-    until transfers bytes have gone either way; their log."""
+    """A testbench step that plays the EEPROM on the bus.
+
+    mem holds its bytes (offset -> value; a missing one reads 0xFF). After
+    each write the model ignores the bus for `write_clocks` clock cycles, as
+    the real chip does. It stops after `transfers` bytes have been written or
+    read, and returns a log of them.
+    """
     log = yield from i2c_memory(dut, mem, transfers, address, bus=bus,
                                 write_clocks=write_clocks)
     return log

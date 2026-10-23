@@ -1,14 +1,16 @@
 """
-The ADC128S022: 8 inputs of 12 bits, on SPI (mode 3: SCLK idle high, data out
-on its falling edge, taken on its rising), 0.8 to 3.2 MHz. In a frame (CS low,
-16 clocks of SCLK) it takes the next channel's number in bits 13..11 of the
-word it's sent, and sends back 4 zeros and the 12-bit result of the channel
-the frame before chose.
+The ADC128S022 analog-to-digital converter: 8 inputs, 12 bits, on SPI.
 
-    ADC = ADC128S022()                                # 2.5 MHz at 50 MHz; sclk, mosi, miso, cs_n
-    value = yield from adc128s022_read(port, ADC, 5)  # input 5
+It uses SPI mode 3 (SCLK idles high) at 0.8 to 3.2 MHz. Each frame is 16 SCLK
+pulses with CS low. In a frame the chip is told which input to convert next,
+and sends back the result for the input chosen in the frame before. So reading
+one input takes two frames, which adc128s022_read() does for you:
 
-Its pins idle from reset (attr: {'cs_n': {'init': 1}, 'sclk': {'init': 1}}).
+    ADC = ADC128S022()                                  # 2.5 MHz SCLK at 50 MHz
+    value = yield from adc128s022_read(port, ADC, 5)    # input 5
+
+Give its pins their idle levels from reset in attr:
+{'cs_n': {'init': 1}, 'sclk': {'init': 1}}.
 """
 from typing import NamedTuple
 
@@ -16,36 +18,46 @@ from ..protocol import SPI, spi_transfer, wait_until
 
 
 class ADC128S022(NamedTuple):
-    """The ADC's settings: its SPI bus (mode 3; half: 10 clocks, 2.5 MHz at 50
-    MHz), and its chip select's pin."""
+    """The ADC's settings: its SPI bus and the name of its chip-select pin.
+
+    The default bus runs SCLK at 2.5 MHz from a 50 MHz clock (half=10).
+    """
     spi: SPI = SPI(10, mode=3)
     cs_n: str = "cs_n"
 
 
 def adc128s022_frame(port, adc, channel):
-    """One frame: channel chosen for the next; the 16 bits that came back (4
-    zeros, then the result of the channel chosen the frame before: the zeros
-    say the frame was in step)."""
+    """Run one frame: choose `channel` for the next frame, and return what came back.
+
+    What comes back is 16 bits: 4 zeros, then the 12-bit result for the
+    channel chosen in the previous frame. If the top 4 bits aren't zero, the
+    frame was out of step.
+    """
     setattr(port, adc.cs_n, 0)
     yield adc.spi.half
-    got = yield from spi_transfer(port, adc.spi, channel << 11, 16)
+    received = yield from spi_transfer(port, adc.spi, channel << 11, 16)
     setattr(port, adc.cs_n, 1)
     yield adc.spi.half
-    return got
+    return received
 
 
 def adc128s022_read(port, adc, channel):
-    """The channel read: chosen in a frame, its result the next's."""
+    """Read one input: choose it in one frame, and take its result from the next."""
     yield from adc128s022_frame(port, adc, channel)
     value = yield from adc128s022_frame(port, adc, channel)
     return value
 
 
+# ---------------------------------------------------------------------------
+# A model of the chip, for testbenches
+# ---------------------------------------------------------------------------
+
 def adc128s022_model(values, frames, adc=ADC128S022()):
-    """A testbench step playing the ADC with these 8 inputs' values, for frames
-    frames: in each, the result of the channel chosen the frame before out on
-    MISO (4 zeros first, a bit at each falling edge, the first as CS falls), the
-    next channel taken from MOSI at the rising edges."""
+    """A testbench step that plays the ADC, with `values` on its 8 inputs.
+
+    Like the real chip, it answers each frame with the result for the
+    channel chosen in the frame before, and it stops after `frames` frames.
+    """
     sclk, mosi, miso = adc.spi.sclk, adc.spi.mosi, adc.spi.miso
 
     def chip(dut):
@@ -54,14 +66,14 @@ def adc128s022_model(values, frames, adc=ADC128S022()):
         for _ in range(frames):
             yield from wait_until(dut, adc.cs_n, 0)
             word = values[chosen] & 0xFFF
-            setattr(dut, miso, (word >> 15) & 1)                # (the first, as CS falls)
-            got = 0
+            setattr(dut, miso, (word >> 15) & 1)              # the first bit goes out as CS falls
+            command = 0
             for i in range(16):
-                yield from wait_until(dut, sclk, 0)             # falling: the next bit
+                yield from wait_until(dut, sclk, 0)           # on each falling edge: the next bit out
                 if i:
                     setattr(dut, miso, (word >> (15 - i)) & 1)
-                yield from wait_until(dut, sclk, 1)             # rising: taken
-                got = (got << 1) | getattr(dut, mosi)
-            chosen = (got >> 11) & 7
+                yield from wait_until(dut, sclk, 1)           # on each rising edge: a bit in
+                command = (command << 1) | getattr(dut, mosi)
+            chosen = (command >> 11) & 7
             yield from wait_until(dut, adc.cs_n, 1)
     return chip

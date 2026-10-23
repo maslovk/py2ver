@@ -113,24 +113,25 @@ class Process:
     probes: List[str] = field(default_factory=list)      # (its state: ports, with probes=True)
 
     def explain(self) -> str:
-        """Its states, each where in the generator it waits, and its registers."""
+        """A readable description: each state with the line of the generator
+        where it waits, then every register and its width."""
         if self.parts:
             return "\n\n".join(f"{p}: " + pr.explain() for p, pr in self.parts.items())
         name = getattr(_unwrap(self.func)[0], "__name__", "?")
-        lines = [f"{name}: {self.states} states (a state waits at its yield: a clock, or "
-                 f"yield n's n)"]
+        lines = [f"{name}: {self.states} states. Each state is a place where the generator "
+                 f"waits: a yield (one clock cycle) or a yield n (n cycles)."]
         width = len(str(len(self.where)))
         lines += [f"  {k:>{width}}  {w}" for k, w in enumerate(self.where)]
 
         def bits(names):
             return ", ".join(f"{n} {self.attr[n]['width']}" for n in names)
-        lines += ["bits (the outputs, the locals and the state: registers):",
+        lines += ["Widths in bits (the outputs, the local variables and the control are registers):",
                   f"  inputs   {bits(self.inputs)}" if self.inputs else "  inputs   -",
                   f"  outputs  {bits(self.outputs)}",
                   f"  locals   {bits(self.locals)}" if self.locals else "  locals   -",
-                  f"  state    {bits([PC, WAIT])}  ({PC}: the state; {WAIT}: the clocks a "
-                  f"yield n has left)"]
-        lines += [f"  ({n})" for n in self.notes]
+                  f"  control  {bits([PC, WAIT])}  ({PC} is the current state; {WAIT} counts "
+                  f"down a yield n)"]
+        lines += [f"  Note: {n}." for n in self.notes]
         return "\n".join(lines)
 
 
@@ -1350,15 +1351,18 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     longest = max([_bound(n, widths, attr, ns)[1] for n in waits] + [1])
     out_attr[WAIT] = {"signed": 0, "width": max(1, (longest - 1).bit_length()), "next": WAIT,
                       "internal": True}
-    where = [f"{_at(fd)}  {_line(fd)}  (the start)"]
+    where = [f"{_at(fd)}  {_line(fd)}  (where it starts)"]
     for st in range(1, done):
         y = origin[st]
-        # (a step's: which, used from where: wait_until from ps2.py:21, in falling_edge ...)
-        chain = ", ".join(f"in {name} from {site}" for name, site in getattr(y, "_in", ()))
+        # A yield inside a step: say which step, and where it was called from
+        # ("in wait_until, called from ps2.py:21; in falling_edge, called from ...").
+        chain = "; ".join(f"in {name}, called from {site}"
+                          for name, site in getattr(y, "_in", ()))
         where.append(f"{_at(y)}  {_line(y)}" + (f"  ({chain})" if chain else ""))
     if ends:
-        where.append("(the end: the generator returned)")
-    notes = [f"{v}: the local {v[:-2]} (named apart from the pin port.{v[:-2]})"
+        where.append("(where it ends: the generator has returned)")
+    notes = [f"{v} is the local variable {v[:-2]}, renamed so that it doesn't clash "
+             f"with the pin port.{v[:-2]}"
              for v in local_names if v.endswith("_v") and v[:-2] in inputs + outputs]
     return Process(func=func, step=step, attr=out_attr, inputs=inputs, outputs=outputs,
                    locals=local_names, states=n_states, source=source, widths=widths,

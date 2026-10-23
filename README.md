@@ -31,38 +31,35 @@ USB-UART adapter.
 ```python
 from py2ver import Py2ver
 
-# Standard Python function
-def foo(arg1, arg2):
-    a = arg1 + arg2
-    b = arg1 - arg2
-    c = arg1 * arg2
-    d = arg1 / arg2
-    return a, b, c, d
+# A plain Python function: py2ver uses it exactly as written.
+def arithmetic(x, y):
+    total = x + y
+    difference = x - y
+    product = x * y
+    quotient = x // y
+    return total, difference, product, quotient
 
-# Attributes for Verilog generation
-attr = {'arg1': {'signed': 0, 'width': 8},
-        'arg2': {'signed': 0, 'width': 8},
-        'a': {'signed': 0, 'width': 9, 'type': 'reg'},
-        'b': {'signed': 1, 'width': 9},
-        'c': {'signed': 0, 'width': 9},
-        'd': {'signed': 0, 'width': 9}}
+# Everything about the hardware goes here: how many bits each value has.
+attr = {
+    "x": 8,                                     # unsigned, 8 bits: 0 .. 255
+    "y": 8,
+    "total": 9,                                 # up to 255 + 255 = 510
+    "difference": {"signed": 1, "width": 9},    # -255 .. 255
+    "product": 16,
+    "quotient": 8,
+}
 
-p = Py2ver(foo, attr)      # writes hdl/main.v
+p = Py2ver(arithmetic, attr)      # writes the Verilog to hdl/main.v
+print(p.verilog)                  # ... and here it is
 
-foo_tb = p.TB()            # cocotb + Icarus simulation
-print(foo_tb(3, 1))
+# Run the Verilog in a simulator (cocotb + Icarus) and compare with Python:
+vectors = [(3, 1), (7, 2), (255, 255)]
+print(p.TB_batch()(vectors))      # [(4, 2, 3, 3), (9, 5, 14, 3), (510, 0, 65025, 1)]
+print(p.PY_batch()(vectors))      # the same, from Python
 
-# Many input vectors in a single simulation run (much faster than
-# calling foo_tb in a loop, which rebuilds and reruns the sim each time)
-foo_batch = p.TB_batch()
-print(foo_batch([(3, 1), (7, 2), (255, 255)]))   # list of output tuples
-
-foo_hw = p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin'})
-print(foo_hw(3, 1))        # synthesizes, programs the board, runs over UART
-
-# or with only the USB-Blaster: over the board's JTAG UART, many vectors at once
-p.HW({'QUARTUS_DIR': '/opt/intelFPGA/22.1std/quartus/bin', 'LINK': 'jtag'})
-print(p.HW_batch()([(3, 1), (7, 2), (255, 255)]))
+# On a DE0-Nano board (needs Quartus), over the USB-Blaster that programs it:
+p.HW({"QUARTUS_DIR": "/opt/intelFPGA/22.1std/quartus/bin", "LINK": "jtag"})
+print(p.HW_batch()(vectors))
 ```
 
 Generated files (`hdl/`, `sim_build/`, `tb.py`, `results/`, `hw/`, `syn/`) are written

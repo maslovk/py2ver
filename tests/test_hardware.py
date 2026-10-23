@@ -143,7 +143,7 @@ def test_a_signaltap_capture_from_the_board(quartus):
     at, after = cap.rows[cap.trigger], cap.rows[cap.trigger + 1]
     assert at["valid"] == 1 and at["byte"] == ord("Q")              # (the byte, taken)
     assert after["send"] == 1 and after["out"] == ord("Q") and after["ready"] == 0
-    assert "jtag_echo.py:33" in cap.show()                         # (its state, by its line)
+    assert "jtag_echo.py:34" in cap.show()                         # (its state, by its line)
 
 
 @pytest.mark.hardware

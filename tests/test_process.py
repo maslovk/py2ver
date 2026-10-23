@@ -468,12 +468,14 @@ def test_what_steps_and_wires_can_t_be_says_so():
 def test_a_process_says_what_it_built():
     text = _quiet(U.uart_rx, U.RX).explain()
     assert text.startswith("uart_rx: 6 states")                       # (no end: it never returns)
-    assert "(the end" not in text
+    assert "where it ends" not in text
     assert "yield bit // 2" in text and "uart.py:" in text            # (each state: its yield)
     # (a step's: which, and where it's used)
-    assert "(in wait_until from examples/uart.py:" in text and "(in read_byte from " in text
+    assert "(in wait_until, called from examples/uart.py:" in text
+    assert "(in read_byte, called from " in text
     assert "outputs  valid 1, data 8, error 1" in text                # (followed: no attr)
-    assert "data_v: the local data (named apart from the pin port.data)" in text
+    assert ("Note: data_v is the local variable data, renamed so that it doesn't clash with "
+            "the pin port.data.") in text
     echo = _quiet(U.echo(), None).explain()
     assert "rx: uart_rx: 6 states" in echo and "tx: uart_tx: 5 states" in echo
 
