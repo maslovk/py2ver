@@ -294,6 +294,13 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
                 pin_widths(attr, list(_inspect.signature(func).parameters))
             except (TypeError, ValueError):
                 pass
+        # (on the board: an output driving its pins only while another output is 1,
+        # {'dq_out': {'tristate': 'dq_oe'}}; an output that is the clock, inverted,
+        # {'dram_clk': {'clock': 'inverted'}})
+        self._tristates = {k: v["tristate"] for k, v in (attr or {}).items()
+                           if isinstance(v, dict) and v.get("tristate")}
+        self._clock_outputs = {k: v["clock"] for k, v in (attr or {}).items()
+                               if isinstance(v, dict) and v.get("clock")}
         # (returned values that are 'internal': a register's next value, no port)
         self._internal = {k for k, v in (attr or {}).items()
                           if isinstance(v, dict) and v.get("internal")}
@@ -350,6 +357,9 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         self._pins = {self._hw_name.get(k, k): v for k, v in self._pins.items()}
         self._opens = {self._hw_name.get(k, k): self._hw_name.get(v, v)
                        for k, v in getattr(self, "_opens", {}).items()}
+        self._tristates = {self._hw_name.get(k, k): self._hw_name.get(v, v)
+                           for k, v in self._tristates.items()}
+        self._clock_outputs = {self._hw_name.get(k, k): v for k, v in self._clock_outputs.items()}
         self._call_inputs, self._cplx_params = fe.call_inputs, fe.cplx_params
         self._fx_types, self._model = fe.fx_types, fe.model
         self._shapes = fe.shapes             # lists of lists: (rows, ...) per argument

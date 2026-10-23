@@ -202,11 +202,16 @@ class PinsMixin:
             raise ValueError(f"A pin for no port: {sorted(unknown)} (ports: "
                              f"{[p.name for p in self.ir.inputs + self.ir.outputs]})")
         opens = getattr(self, "_opens", {})
+        tristates = getattr(self, "_tristates", {})
         taken: Dict[str, str] = {}
         for port, ps in {**ins, **outs}.items():
             for pin in ps:
-                # (an open-drain pin: its drive and its line on one pin)
-                if pin in taken and opens.get(taken[pin]) != port and opens.get(port) != taken[pin]:
+                # (an open-drain pin: its drive and its line on one pin; a tri-state
+                # output's pins, an input's too: a bus both ways, DRAM_DQ)
+                shared = (opens.get(taken.get(pin)) == port or opens.get(port) == taken.get(pin)
+                          or (taken.get(pin) in tristates and port in ins)
+                          or (port in tristates and taken.get(pin) in ins))
+                if pin in taken and not shared:
                     raise ValueError(f"{pin} is both {taken[pin]}'s and {port}'s")
                 taken[pin] = port
         for port, ps in outs.items():
@@ -281,16 +286,26 @@ class PinsMixin:
                 conns.append(f".{p.name}({p.name}_s2)")
             else:
                 conns.append(f".{p.name}({p.width}'d0)")
-        for p in self.ir.outputs:
+        tristates = getattr(self, "_tristates", {})
+        clock_outputs = getattr(self, "_clock_outputs", {})
+        for p in self.ir.outputs:                   # (every wire declared before any is used)
             rng = f"[{p.width - 1}:0] " if p.width > 1 else ""
             lines.append(f"    wire {rng}{p.name}_w;")
             conns.append(f".{p.name}({p.name}_w)")
+        for p in self.ir.outputs:
             for i, pin in enumerate(outs.get(p.name, [])):
                 if pin in _JTAG:                    # (to the JTAG UART)
                     lines.append(f"    assign {_JTAG[pin][2]} = {p.name}_w;")
                     continue
                 if p.name in opens:                 # (open drain: low, or let go)
                     lines.append(f"    assign {pin} = {p.name}_w ? 1'bz : 1'b0;")
+                    continue
+                if p.name in clock_outputs:         # (the clock itself, inverted: an SDRAM's)
+                    lines.append(f"    assign {pin} = ~clk;")
+                    continue
+                if p.name in tristates:             # (driven while the enable is 1, else let go)
+                    bit = f"[{i}]" if p.width > 1 else ""
+                    lines.append(f"    assign {pin} = {tristates[p.name]}_w ? {p.name}_w{bit} : 1'bz;")
                     continue
                 lines.append(f"    assign {pin} = {p.name}_w" + (f"[{i}];" if p.width > 1 else ";"))
         # (a GPIO pin no output drives: floating; an LED: off)
@@ -387,7 +402,11 @@ class PinsMixin:
             for pin in outs.get(o, []):
                 qsf += f"set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to {pin}\n"
         (project_dir / f"{name}.qsf").write_text(qsf, encoding="utf-8")
-        shutil.copy(DEFAULT_TEMPLATE_DIR / "hw" / "de0_nano_sdc.txt", project_dir / "DE0_Nano.SDC")
+        sdc = (DEFAULT_TEMPLATE_DIR / "hw" / "de0_nano_sdc.txt").read_text(encoding="utf-8")
+        if any("DRAM_CLK" in outs.get(o, []) for o in getattr(self, "_clock_outputs", {})):
+            from .syn import _SDRAM_SDC       # (the SDRAM's timing, its clock on DRAM_CLK)
+            sdc += _SDRAM_SDC.replace("[get_ports clk]", "[get_ports CLOCK_50]")
+        (project_dir / "DE0_Nano.SDC").write_text(sdc, encoding="utf-8")
         (project_dir / "DE0_Nano.v").write_text(self.board_top(signaltap), encoding="utf-8")
         if signaltap:
             (project_dir / "signaltap.txt").write_text(
