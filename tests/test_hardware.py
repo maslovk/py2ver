@@ -55,7 +55,7 @@ def test_an_accelerometer_read_on_a_bus():
     # (an ADXL345's registers played by examples/i2c.py's memory: X, Y, Z from 0x32)
     mem = {0x32: 0x03, 0x33: 0x00, 0x34: 0xF1, 0x35: 0xFF, 0x36: 0x1F, 0x37: 0x01}
     import functools
-    p = _quiet(functools.partial(A.accelerometer, q=4, period=100), A.ATTR)
+    p = _quiet(functools.partial(A.accelerometer, bus=A.I2C(q=4), period=100), A.ATTR)
     text = p.check(A.with_a_memory(mem, A.ADXL345, transfers=8, until=b"z=0x011F\n"),
                    verilog=False).value
     assert text == b"adxl345: measuring\nx=0x0003 y=0xFFF1 z=0x011F\n"

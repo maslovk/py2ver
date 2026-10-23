@@ -36,7 +36,9 @@ attr gives the pins their widths ('width', 'signed', an output's 'init': its
 value after reset) and, if their values can't be followed, the locals' too.
 
 Parameters after the port are constants: their defaults, or a partial's
-(functools.partial(uart_tx, bit=217): the same transmitter, twice the baud).
+(functools.partial(uart_tx, bit=217): the same transmitter, twice the baud);
+a record of them too (a NamedTuple, a dataclass: a bus's settings), its fields
+read where it's used (bus.q).
 A step of a protocol written once is a generator of its own, used with
 `yield from` (its body in the process where it's used; its value, `return`ed,
 with `x = yield from ...`):
@@ -59,6 +61,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import dataclasses
 import functools
 import inspect
 import linecache
@@ -593,7 +596,8 @@ def _stored(stmts: List[ast.stmt]) -> Set[str]:
 
 class _Inline(ast.stmt):
     """A step's generator in the process where it's used (yield from): its
-    returns leave it, the value to target (a Name, or None)."""
+    returns leave it, the value to target (a Name; a Tuple of them, the values of
+    a return a, b; or None)."""
     _fields = ("body", "target")
 
 
@@ -645,9 +649,13 @@ class _Expander:
         for name, v in values.items():
             if isinstance(v, (bytes, bytearray)):
                 v = tuple(v)                          # (a message: a table of its bytes)
-            if not isinstance(v, (int, str, tuple)):
+            if not isinstance(v, (int, str, tuple)) and not _record(v):
                 raise ProcessError(f"{fd.name}: the parameter '{name}' is {v!r}: a constant (an "
-                                   f"int, bytes) or the port")
+                                   f"int, bytes, a record of them: a NamedTuple, a dataclass) "
+                                   f"or the port")
+            if _record(v) and name in stored:
+                raise ProcessError(f"{fd.name}: the parameter '{name}' is a record (its fields "
+                                   f"constants): it can't be assigned")
             if name in stored:                       # (a parameter changed: a local)
                 pre.append(_assign(rename.get(name, name), _value_node(v)))
             else:
@@ -663,14 +671,49 @@ class _Expander:
                     if n.id in consts:
                         return ast.copy_location(_value_node(consts[n.id]), n)
                     v = env.get(n.id)
-                    # (the module's constants: an int, bytes, a tuple of ints, a table)
-                    if n.id not in stored and (isinstance(v, (int, bytes)) or (
+                    # (the module's constants: an int, bytes, a tuple of ints, a table, a record)
+                    if n.id not in stored and (isinstance(v, (int, bytes)) or _record(v) or (
                             isinstance(v, tuple) and v and all(type(e) is int for e in v))):
                         return ast.copy_location(_value_node(v), n)
                 return n
 
+            # (a record's field: its value)
+            def visit_Attribute(self, n: ast.Attribute):
+                self.generic_visit(n)
+                if isinstance(n.value, ast.Constant) and _record(n.value.value):
+                    rec = n.value.value
+                    if not isinstance(n.ctx, ast.Load):
+                        raise ProcessError(f"{_at(n)}: {type(rec).__name__}'s fields are "
+                                           f"constants: '{n.attr}' can't be assigned")
+                    if not hasattr(rec, n.attr):
+                        raise ProcessError(f"{_at(n)}: {type(rec).__name__} has no field "
+                                           f"'{n.attr}'")
+                    v = getattr(rec, n.attr)
+                    if not isinstance(v, (int, str, bytes)) and not _record(v) and not (
+                            isinstance(v, tuple) and all(type(e) is int for e in v)):
+                        raise ProcessError(f"{_at(n)}: {type(rec).__name__}.{n.attr} is {v!r}: "
+                                           f"a record's fields are constants (ints, strings, "
+                                           f"bytes, records)")
+                    return ast.copy_location(_value_node(v), n)
+                return n
+
             def visit_Call(self, n: ast.Call):
                 self.generic_visit(n)
+                # (a record of constants: SPI(half, 3), half a constant; made here)
+                cls = env.get(n.func.id) if isinstance(n.func, ast.Name) \
+                    and n.func.id not in rename else None
+                if _record_type(cls):
+                    args = n.args + [k.value for k in n.keywords]
+                    if not all(isinstance(a, ast.Constant) for a in args) \
+                            or any(k.arg is None for k in n.keywords):
+                        raise ProcessError(f"{_at(n)}: {cls.__name__}(...) of constants (a "
+                                           f"record's fields are)")
+                    try:
+                        rec = cls(*[a.value for a in n.args],
+                                  **{k.arg: k.value.value for k in n.keywords})
+                    except TypeError as e:
+                        raise ProcessError(f"{_at(n)}: {e}") from None
+                    return ast.copy_location(ast.Constant(rec), n)
                 # (len of a constant: its length)
                 if isinstance(n.func, ast.Name) and n.func.id == "len" and len(n.args) == 1:
                     a = n.args[0]
@@ -702,9 +745,13 @@ class _Expander:
             def visit_Assign(self, n: ast.Assign):
                 self.generic_visit(n)
                 if isinstance(n.value, ast.YieldFrom):
-                    if len(n.targets) != 1 or not isinstance(n.targets[0], ast.Name):
-                        raise ProcessError(f"{_at(n)}: x = yield from ..., x a name")
-                    return ex.inline(n.value, n.targets[0], env, n)
+                    t = n.targets[0] if len(n.targets) == 1 else None
+                    # (a, b = yield from ...: a step returning a, b)
+                    if not (isinstance(t, ast.Name) or isinstance(t, ast.Tuple) and t.elts
+                            and all(isinstance(e, ast.Name) for e in t.elts)):
+                        raise ProcessError(f"{_at(n)}: x = yield from ..., x a name (or names: "
+                                           f"x, y = yield from ...)")
+                    return ex.inline(n.value, t, env, n)
                 return n
 
             # (constants' arithmetic: its value, mode & 1 for a step's mode)
@@ -733,9 +780,15 @@ class _Expander:
         for s in copy.deepcopy(fd.body):
             r = _T().visit(s)
             out += r if isinstance(r, list) else [r]
+        for s in out:                   # (a record: its fields read, or given to a step; no more)
+            for n in ast.walk(s):
+                if isinstance(n, ast.Constant) and _record(n.value):
+                    raise ProcessError(f"{_at(n)}: a {type(n.value).__name__} is a record of "
+                                       f"constants: read its fields (bus.q), or give it to a "
+                                       f"step; it isn't a value")
         return pre + out
 
-    def inline(self, y: ast.YieldFrom, target: Optional[ast.Name], env: Dict[str, Any],
+    def inline(self, y: ast.YieldFrom, target: Optional[ast.expr], env: Dict[str, Any],
                at: ast.stmt) -> _Inline:
         call = y.value
         fn = env.get(call.func.id) if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) \
@@ -776,8 +829,9 @@ class _Expander:
                 values[name] = v                         # (a default)
             elif _is_port(v, self.port) and name not in stored:
                 rename[name] = self.port
-            elif isinstance(v, ast.Constant) and isinstance(v.value, (int, str, bytes)):
-                values[name] = v.value
+            elif isinstance(v, ast.Constant) and (isinstance(v.value, (int, str, bytes))
+                                                  or _record(v.value)):
+                values[name] = v.value                   # (a record too: given on as it is)
             elif isinstance(v, ast.Tuple) and all(isinstance(e, ast.Constant) for e in v.elts):
                 values[name] = tuple(e.value for e in v.elts)   # (a constant table, passed on)
             elif isinstance(v, ast.Name) and name not in stored:
@@ -788,9 +842,22 @@ class _Expander:
         for name in values:
             if name in stored:
                 rename[name] = names[name]
-        # (a step that returns one local: that local the target itself, no copy of it)
         rets = [n.value for n in ast.walk(fd) if isinstance(n, ast.Return)]
-        if target is not None and rets and all(isinstance(r, ast.Name) and r.id == rets[0].id
+        if target is not None:
+            # (values to names: a return of as many, each)
+            k = len(target.elts) if isinstance(target, ast.Tuple) else 1
+            for r in [n for n in ast.walk(fd) if isinstance(n, ast.Return)]:
+                got = len(r.value.elts) if isinstance(r.value, ast.Tuple) else (
+                    0 if r.value is None else 1)
+                if got != k and not (got == 0 and k == 1):
+                    def say(n):
+                        return {0: "nothing", 1: "one value"}.get(n, f"{n} values")
+                    raise ProcessError(
+                        f"{_at(at)}: {base.__name__} returns {say(got)} ({_at(r)}), "
+                        f"{say(k)} assigned here (several: return a, b, and "
+                        f"a, b = yield from ...)")
+        # (a step that returns one local: that local the target itself, no copy of it)
+        if isinstance(target, ast.Name) and rets and all(isinstance(r, ast.Name) and r.id == rets[0].id
                                                for r in rets) \
                 and rets[0].id in stored and rets[0].id not in sig.parameters \
                 and target.id not in rename.values():    # (x = yield from f(port, x): a copy)
@@ -806,9 +873,24 @@ class _Expander:
         return node
 
 
+def _record(v: Any) -> bool:
+    """A record of constants (a NamedTuple's, a dataclass's: a bus's settings): its
+    fields read where it's used (bus.q), it given on to steps as it is."""
+    return (isinstance(v, tuple) and hasattr(type(v), "_fields")) or (
+        dataclasses.is_dataclass(v) and not isinstance(v, type))
+
+
+def _record_type(v: Any) -> bool:
+    """A record's class (SPI(half, 3) builds one where it's used, of constants)."""
+    return isinstance(v, type) and (dataclasses.is_dataclass(v) or (
+        issubclass(v, tuple) and hasattr(v, "_fields")))
+
+
 def _value_node(v: Any) -> ast.expr:
     """A constant as code: an int or a string as itself; bytes, a tuple: a table of
-    ints (text[i] a table read)."""
+    ints (text[i] a table read); a record: itself, its fields read as they're used."""
+    if _record(v):
+        return ast.Constant(v)
     if isinstance(v, (bytes, bytearray, tuple)):
         return ast.Tuple(elts=[ast.Constant(int(b)) for b in v], ctx=ast.Load())
     return ast.Constant(v)
@@ -877,7 +959,7 @@ class _Lower:
     def __init__(self, fresh: Callable[[str], str]) -> None:
         self.code = _Code()
         self.loops: List[Tuple[List[int], List[int]]] = []   # (breaks, continues) to patch
-        self.steps: List[Tuple[Optional[str], List[int]]] = []  # (an inlined step's target, its returns)
+        self.steps: List[Tuple[Optional[ast.expr], List[int]]] = []  # (an inlined step's target, its returns)
         self.fresh = fresh
 
     def body(self, stmts: List[ast.stmt]) -> None:
@@ -900,7 +982,7 @@ class _Lower:
         if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
             return                                              # (a docstring)
         if isinstance(s, _Inline):                              # (a step: yield from)
-            self.steps.append((s.target.id if s.target is not None else None, []))
+            self.steps.append((s.target, []))
             self.body(s.body)
             _, returns = self.steps.pop()
             for at in returns:
@@ -908,9 +990,12 @@ class _Lower:
             return
         if isinstance(s, ast.Return) and self.steps:            # (out of the step)
             target, returns = self.steps[-1]
-            if target is not None and s.value is not None \
-                    and not (isinstance(s.value, ast.Name) and s.value.id == target):
-                c.emit("stmt", _assign(target, s.value, s))
+            if isinstance(target, ast.Tuple):                   # (a, b = ...: return x, y)
+                c.emit("stmt", ast.copy_location(ast.Assign(
+                    targets=[copy.deepcopy(target)], value=copy.deepcopy(s.value)), s))
+            elif target is not None and s.value is not None \
+                    and not (isinstance(s.value, ast.Name) and s.value.id == target.id):
+                c.emit("stmt", _assign(target.id, s.value, s))
             returns.append(c.emit("jump", -1))
             return
         if isinstance(s, ast.Return):

@@ -18,18 +18,19 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py2ver.protocol import (i2c_read_byte, i2c_start, i2c_stop, i2c_write_byte,  # noqa: E402
-                             wait_until)
+from py2ver.protocol import (I2C, i2c_read_byte, i2c_start, i2c_stop,  # noqa: E402
+                             i2c_write_byte, wait_until)
 
 CLOCK = 50_000_000
 Q = CLOCK // 100_000 // 4              # a quarter of a 100 kHz SCL period: 125 clocks
+BUS = I2C(q=Q)                         # (its pins: scl, sda)
 
 
 # ----------------------------- the master -----------------------------
 # (the bus's steps, as its spec says: py2ver.protocol's i2c_start, i2c_stop,
 # i2c_write_byte, i2c_read_byte, ...)
 
-def i2c_master(port, q=Q):
+def i2c_master(port, bus=BUS):
     """port.start (a clock high): a register of the device at port.address (7 bits)
     written (port.value) or, with port.read, read (into port.got); port.nack if
     an acknowledge was missing, port.done high a clock when it's over. SCL and SDA
@@ -45,17 +46,17 @@ def i2c_master(port, q=Q):
         read = port.read
         value = port.value
         port.busy = 1
-        yield from i2c_start(port, q)
-        n1 = yield from i2c_write_byte(port, address << 1, q)    # the device, to write
-        n2 = yield from i2c_write_byte(port, register, q)        # the register's number
+        yield from i2c_start(port, bus)
+        n1 = yield from i2c_write_byte(port, bus, address << 1)  # the device, to write
+        n2 = yield from i2c_write_byte(port, bus, register)      # the register's number
         if read:
-            yield from i2c_start(port, q)                        # a repeated start
-            n3 = yield from i2c_write_byte(port, (address << 1) | 1, q)   # the device, to read
-            got = yield from i2c_read_byte(port, 1, q)           # one byte, the last
+            yield from i2c_start(port, bus)                      # a repeated start
+            n3 = yield from i2c_write_byte(port, bus, (address << 1) | 1)   # the device, to read
+            got = yield from i2c_read_byte(port, bus, 1)         # one byte, the last
             port.got = got
         else:
-            n3 = yield from i2c_write_byte(port, value, q)
-        yield from i2c_stop(port, q)
+            n3 = yield from i2c_write_byte(port, bus, value)
+        yield from i2c_stop(port, bus)
         port.nack = n1 | n2 | n3
         port.done = 1
         yield
@@ -201,7 +202,7 @@ if __name__ == "__main__":
            (0x50, 0x12, 1, 0),               # read register 0x12 back
            (0x51, 0x00, 0, 0x55)]            # no device at 0x51: no acknowledge
     q = 4 if "--fast" in sys.argv[1:] else Q
-    p = Py2ver(functools.partial(i2c_master, q=q), ATTR)
+    p = Py2ver(functools.partial(i2c_master, bus=I2C(q=q)), ATTR)
     run = p.check(with_memory(ops, {}, 2, stretch=3 * q), verilog="--sim" in sys.argv[1:])
     done, log = run.value
     print(f"{len(run.inputs):,} clocks: the master got {[(hex(g), n) for g, n in done]} "

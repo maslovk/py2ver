@@ -359,7 +359,9 @@ model, and `TB_process()` runs the generated Verilog, all a clock at a time.
 the board. It covers:
 
 - writing a protocol, and the rules for loops, ifs and widths;
-- steps with `yield from`, and the library in `py2ver.protocol`
+- steps with `yield from` (returning one value or several: `value, nack =
+  yield from ...`), records of constants as their parameters (a bus's
+  settings: `SPI(...)`, `I2C(...)`), and the library in `py2ver.protocol`
   (`wait_until`, `wait_edge`, `shift_in`, `shift_out`, `uart_send`,
   `uart_receive`, `spi_transfer`, `i2c_start`, `i2c_read_register`, ..., `jtag_print`,
   `debounced`);

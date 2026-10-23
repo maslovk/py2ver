@@ -12,7 +12,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py2ver.protocol import jtag_print, jtag_print_hex, spi_transfer  # noqa: E402
+from py2ver.protocol import SPI, jtag_print, jtag_print_hex, spi_transfer  # noqa: E402
 
 HALF = 10                                # 2.5 MHz SCLK at 50 MHz (the ADC: 0.8 to 3.2)
 PERIOD = 10_000_000                      # 0.2 s at 50 MHz between sweeps
@@ -23,7 +23,7 @@ def adc_frame(port, channel, half):
     the result of the channel chosen before)."""
     port.cs_n = 0
     yield half
-    got = yield from spi_transfer(port, channel << 11, 16, half, 3)
+    got = yield from spi_transfer(port, SPI(half, mode=3), channel << 11, 16)   # (its pins: sclk, mosi, miso)
     port.cs_n = 1
     yield half
     return got

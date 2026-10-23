@@ -204,6 +204,183 @@ def test_a_step_in_hardware(monkeypatch, tmp_path):
     assert p.TB_process()(clocks) == p.GEN_process()(clocks)
 
 
+def divides(port, n, d):
+    """n // d and n % d, by subtraction a clock at a time."""
+    q = 0
+    while n >= d:
+        n = n - d
+        q = q + 1
+        yield
+    return q, n
+
+
+def swapped(port, x, y):
+    yield
+    return y, x
+
+
+def early(port, x):
+    if x > 100:
+        return 0, 1                          # (before its yield)
+    yield
+    return x, x + 1
+
+
+def divider(port):
+    a, b = 1, 2
+    while True:
+        q, r = yield from divides(port, port.n, port.d)
+        port.q = q
+        port.r = r
+        a, b = yield from swapped(port, a, b)   # (its names the caller's own: at once, as Python)
+        port.a = a
+        lo, hi = yield from early(port, port.n)
+        port.lo = lo
+        port.hi = hi
+        yield
+
+
+DIVIDER = {"n": 8, "d": 8, "q": 8, "r": 8, "a": 2, "b": 2, "lo": 8, "hi": 9, "divides_q": 8}
+
+
+SEGMENT = 100       # (clocks each n, d is held: a pass, 35 at most with d >= 8, done in it)
+
+
+def _divisions():
+    r = random.Random(3)
+    pairs = [(r.randrange(256), r.randrange(8, 40)) for _ in range(12)]
+    return pairs, [{"n": n, "d": d} for n, d in pairs for _ in range(SEGMENT)]
+
+
+def test_a_step_returns_several_values():
+    p = _quiet(divider, DIVIDER)
+    pairs, clocks = _divisions()
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    for k, (n, d) in enumerate(pairs):
+        g = gen[(k + 1) * SEGMENT - 1]
+        assert (g["q"], g["r"]) == divmod(n, d)
+        assert (g["lo"], g["hi"]) == ((0, 1) if n > 100 else (n, n + 1))
+    assert {g["a"] for g in gen[SEGMENT:]} == {1, 2}               # (swapped: each time)
+
+
+@pytest.mark.sim
+def test_a_step_s_values_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = _quiet(divider, DIVIDER)
+    clocks = _divisions()[1]
+    assert p.TB_process()(clocks) == p.GEN_process()(clocks)
+
+
+def one_value(port):
+    yield
+    return 5
+
+
+def wants_two(port):
+    while True:
+        a, b = yield from one_value(port)
+        port.x = a
+        yield
+
+
+def wants_one(port):
+    while True:
+        x = yield from swapped(port, 1, 0)
+        port.x = x
+        yield
+
+
+def test_values_a_step_returns_are_as_many_as_assigned():
+    one = {"x": {"width": 1}}
+    with pytest.raises(process.ProcessError, match="one_value returns one value .*, 2 values "
+                                                   "assigned here"):
+        process.compile_process(wants_two, one)
+    with pytest.raises(process.ProcessError, match="swapped returns 2 values .*, one value "
+                                                   "assigned here"):
+        process.compile_process(wants_one, one)
+
+
+from dataclasses import dataclass  # noqa: E402
+from typing import NamedTuple  # noqa: E402
+
+
+class Line(NamedTuple):
+    pin: str = "out"
+    clocks: int = 3
+
+
+@dataclass(frozen=True)
+class Board:
+    line: Line
+    level: int = 1
+
+
+BOARD = Board(Line("out", 2))
+
+
+def pulse_on(port, line, level):
+    setattr(port, line.pin, level)
+    yield line.clocks
+    setattr(port, line.pin, 1 - level)
+    yield line.clocks
+
+
+def board_pulses(port, board=BOARD):
+    while True:
+        yield from pulse_on(port, board.line, board.level)     # (a record's field, a record)
+        yield from pulse_on(port, BOARD.line, 0)               # (the module's)
+        yield from pulse_on(port, Line("out", board.line.clocks + 1), 1)   # (made here)
+        yield
+
+
+def test_a_record_s_fields_are_constants_where_it_s_used():
+    for p, first in [(_quiet(board_pulses, {"out": 1}), 2),
+                     (_quiet(functools.partial(board_pulses, board=Board(Line("out", 4))),
+                             {"out": 1}), 4)]:
+        clocks = [{}] * 60
+        gen = p.GEN_process()(clocks)
+        assert p.PY_process()(clocks) == gen
+        line = [g["out"] for g in gen]
+        assert line[1:1 + first + 1] == [1] * first + [0]          # (its clocks: the record's)
+    assert "board" not in p.process.locals and "line" not in " ".join(p.process.locals)
+
+
+def assigns_a_field(port, line=Line()):
+    line.clocks = 4
+    yield
+
+
+def keeps_a_record(port, line=Line()):
+    x = line
+    port.out = 1
+    yield x
+
+
+def wrong_field(port, line=Line()):
+    yield line.clock
+
+
+def not_constants(port):
+    n = port.n
+    yield from pulse_on(port, Line("out", n), 1)
+
+
+def test_a_record_is_constants_or_says_so():
+    one = {"out": {"width": 1}}
+    with pytest.raises(process.ProcessError, match="Line's fields are constants: 'clocks' can't"):
+        process.compile_process(assigns_a_field, one)
+    with pytest.raises(process.ProcessError, match="a Line is a record of constants: read its "
+                                                   "fields"):
+        process.compile_process(keeps_a_record, one)
+    with pytest.raises(process.ProcessError, match="Line has no field 'clock'"):
+        process.compile_process(wrong_field, one)
+    with pytest.raises(process.ProcessError, match=r"Line\(\.\.\.\) of constants"):
+        process.compile_process(not_constants, {"out": 1, "n": 4})
+    with pytest.raises(process.ProcessError, match="a record of them"):
+        process.compile_process(functools.partial(board_pulses, board=1.5), one)
+
+
 def test_a_parameter_is_a_constant_a_partial_its_value():
     half = U.BIT // 2
     tx = _quiet(functools.partial(U.uart_tx, bit=half), U.TX)

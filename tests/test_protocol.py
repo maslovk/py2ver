@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from py2ver import Py2ver, process
-from py2ver.protocol import (debounced, shift_in, shift_out, spi_transfer, together,
+from py2ver.protocol import (SPI, debounced, shift_in, shift_out, spi_transfer, together,
                              uart_receive, uart_send, wait_edge, wait_until)
 
 # Steps of protocols (protocol.py), used by processes and by testbenches written as
@@ -364,7 +364,7 @@ def test_an_open_drain_pin_reads_its_line():
 def test_an_i2c_master_writes_and_reads_a_memory(sim, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     ops = [(0x50, 0x12, 0, 0xAB), (0x50, 0x12, 1, 0), (0x51, 0x00, 0, 0x55)]
-    p = _quiet(functools.partial(I2C.i2c_master, q=4), I2C.ATTR)
+    p = _quiet(functools.partial(I2C.i2c_master, bus=I2C.I2C(q=4)), I2C.ATTR)
     run = p.check(I2C.with_memory(ops, {}, 2, stretch=12), verilog=sim)
     done, log = run.value
     assert log == [("write", 0x12, 0xAB), ("read", 0x12, 0xAB)]
@@ -435,7 +435,7 @@ def spi_loop(port, mode=0):
         word = port.word
         port.cs_n = 0
         yield 3
-        got = yield from spi_transfer(port, word, 12, 3, mode)
+        got = yield from spi_transfer(port, SPI(3, mode), word, 12)   # (a record made here)
         port.cs_n = 1
         port.got = got
         port.done = 1

@@ -11,15 +11,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py2ver.protocol import (i2c_read_byte, i2c_read_register, i2c_start,  # noqa: E402
-                             i2c_stop, i2c_write_byte, i2c_write_register, jtag_print,
-                             jtag_print_hex)
+from py2ver.protocol import (I2C, i2c_read_register, i2c_read_registers,  # noqa: E402
+                             i2c_write_register, jtag_print, jtag_print_hex)
 
-Q = 50_000_000 // 100_000 // 4           # a quarter of a 100 kHz SCL period: 125 clocks
+BUS = I2C(q=50_000_000 // 100_000 // 4)  # 100 kHz (a quarter of SCL: 125 clocks); scl, sda
 ADDRESSES = (0x53, 0x1D, 0x50)           # the ADXL345 (its ALT ADDRESS low, or high); an EEPROM
 
 
-def i2c_probe(port, q=Q):
+def i2c_probe(port, bus=BUS):
     """At reset: register 0 of each address in ADDRESSES read and printed (an
     ADXL345's: its id, 0xE5), with its acknowledge."""
     port.scl = 1
@@ -29,12 +28,12 @@ def i2c_probe(port, q=Q):
     yield from jtag_print(port, b"i2c probe\n")
     for k in range(len(ADDRESSES)):
         address = ADDRESSES[k]
-        got = yield from i2c_read_register(port, address, 0, q)
+        got, nack = yield from i2c_read_register(port, bus, address, 0)
         yield from jtag_print(port, b"0x")
         yield from jtag_print_hex(port, address, 2)
         yield from jtag_print(port, b": register 0 = 0x")
-        yield from jtag_print_hex(port, got & 255, 2)
-        if got >> 8:
+        yield from jtag_print_hex(port, got, 2)
+        if nack:
             yield from jtag_print(port, b" (no acknowledge)\n")
         else:
             yield from jtag_print(port, b" (acknowledged)\n")
@@ -53,35 +52,24 @@ def print_axis(port, name, value):
     yield from jtag_print_hex(port, value, 4)
 
 
-def accelerometer(port, q=Q, period=PERIOD):
+def accelerometer(port, bus=BUS, period=PERIOD):
     """The ADXL345 measuring (+-2 g: 1 g about 256), its X, Y and Z read (one
     transfer of 6 bytes, so they belong together) and printed every period."""
     port.scl = 1
     port.sda = 1
     port.cs_n = 1
     yield 50_000
-    nack = yield from i2c_write_register(port, ADXL345, POWER_CTL, 0x08, q)
+    nack = yield from i2c_write_register(port, bus, ADXL345, POWER_CTL, 0x08)
     yield from jtag_print(port, b"adxl345: ")
     if nack:
         yield from jtag_print(port, b"no answer\n")
     else:
         yield from jtag_print(port, b"measuring\n")
     while True:
-        yield from i2c_start(port, q)
-        yield from i2c_write_byte(port, ADXL345 << 1, q)
-        yield from i2c_write_byte(port, DATAX0, q)
-        yield from i2c_start(port, q)
-        yield from i2c_write_byte(port, (ADXL345 << 1) | 1, q)
-        x0 = yield from i2c_read_byte(port, 0, q)
-        x1 = yield from i2c_read_byte(port, 0, q)
-        y0 = yield from i2c_read_byte(port, 0, q)
-        y1 = yield from i2c_read_byte(port, 0, q)
-        z0 = yield from i2c_read_byte(port, 0, q)
-        z1 = yield from i2c_read_byte(port, 1, q)
-        yield from i2c_stop(port, q)
-        yield from print_axis(port, b"x=0x", x0 | (x1 << 8))
-        yield from print_axis(port, b" y=0x", y0 | (y1 << 8))
-        yield from print_axis(port, b" z=0x", z0 | (z1 << 8))
+        xyz, nack = yield from i2c_read_registers(port, bus, ADXL345, DATAX0, 6)
+        yield from print_axis(port, b"x=0x", xyz & 0xFFFF)
+        yield from print_axis(port, b" y=0x", (xyz >> 16) & 0xFFFF)
+        yield from print_axis(port, b" z=0x", xyz >> 32)
         yield from jtag_print(port, b"\n")
         yield period
 
@@ -132,7 +120,7 @@ if __name__ == "__main__":
     import functools
     from py2ver import Py2ver
 
-    p = Py2ver(functools.partial(i2c_probe, q=4), ATTR)
+    p = Py2ver(functools.partial(i2c_probe, bus=I2C(q=4)), ATTR)
     print(p.check(with_a_memory({0: 0x42}), verilog=False).value.decode())
     if "--pins" in sys.argv[1:]:
         board = Py2ver(i2c_probe, PINS)
