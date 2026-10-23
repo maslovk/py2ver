@@ -520,12 +520,13 @@ class FunctionVisitor(ast.NodeVisitor):
         return self._select(elems, node.slice)
 
     def _rom_read(self, values: List[int], index: ast.expr) -> str | None:
-        """values[index] as a ROM read (an array indexed by the low address bits),
-        if every index Python allows reads the same entry that way: an index that
-        can't be negative, one clamped as fixed.py writes a table index
-        (max(0, min(n - 1, ...))), or any for a power-of-two table (the low bits of
-        -k are n - k). Out-of-range indices, an IndexError in Python, read some
-        entry (the array is padded to a power of two)."""
+        """values[index] as a ROM read (an array indexed by the low address bits).
+        Every index Python allows reads its entry: one that can't be negative,
+        one clamped as fixed.py writes a table index (max(0, min(n - 1, ...))),
+        or any for a power-of-two table (the low bits of -k are n - k), as they
+        are; any other index plus n when it is negative. Out-of-range indices,
+        an IndexError in Python, read some entry (the array is padded to a power
+        of two)."""
         try:
             self._eval_int(index)
             return None                                    # a constant index
@@ -544,7 +545,8 @@ class FunctionVisitor(ast.NodeVisitor):
                    and node.args[1].args[0].value == n - 1)
         idx = self._temp(self.visit(index))
         if not (clamped or n & (n - 1) == 0 or not self._attrs(idx).get("signed")):
-            return None
+            # (an index that may be negative counts from the end, as in Python)
+            idx = self._temp(f"((({idx}) < 0) ? (({idx}) + {n}) : ({idx}))")
         lo, hi = min(values), max(values)
         if lo >= 0:
             fmt = {"width": max(1, hi.bit_length()), "signed": 0}

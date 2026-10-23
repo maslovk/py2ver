@@ -519,6 +519,24 @@ def test_a_table_whose_entry_waits_for_a_clock_is_a_memory_block():
     assert "memory block" not in at_once.verilog
 
 
+def reads_from_the_end(port):
+    k = 0
+    while True:
+        x = PATH[k - 50]                     # (negative for k < 50: from the end, as in Python)
+        yield
+        port.out = x
+        k = 0 if k == len(PATH) - 1 else k + 1
+
+
+def test_a_table_s_negative_index_counts_from_the_end():
+    p = _quiet(reads_from_the_end, None)
+    assert "Table in a memory block: 100 x 11 bits" in p.verilog
+    clocks = [{}] * 250
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    assert PATH[-50] in {g["out"] for g in gen}
+
+
 @pytest.mark.sim
 def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
@@ -526,6 +544,8 @@ def test_a_table_in_a_memory_block_in_hardware(monkeypatch, tmp_path):
     assert p.TB_process()(_PATH_CLOCKS) == p.GEN_process()(_PATH_CLOCKS)
     q = _quiet(reads_path_at_once, None)
     assert q.TB_process()([{}] * 250) == q.GEN_process()([{}] * 250)
+    end = _quiet(reads_from_the_end, None)
+    assert end.TB_process()([{}] * 250) == end.GEN_process()([{}] * 250)
 
 
 def test_a_parameter_is_a_constant_a_partial_its_value():
