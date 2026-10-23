@@ -40,10 +40,9 @@ def test_picture(port, lcd=LCD, width=WIDTH, height=HEIGHT):
         yield
 
 
-# The pins start idle: chip not selected, not in reset
-ATTR = {"cs_n": {"init": 1}, "reset_n": {"init": 1}}
-PINS = dict(ATTR, sclk="GPIO_1[0]", mosi="GPIO_1[1]", cs_n={"init": 1, "pin": "GPIO_1[2]"},
-            dc="GPIO_1[3]", reset_n={"init": 1, "pin": "GPIO_1[4]"}, done="LED[0]")
+# On the board: which pin each port goes to (the design has no inputs, so no attr)
+PINS = {"sclk": "GPIO_1[0]", "mosi": "GPIO_1[1]", "cs_n": "GPIO_1[2]", "dc": "GPIO_1[3]",
+        "reset_n": "GPIO_1[4]", "done": "LED[0]"}
 
 
 def until_done(screen):
@@ -62,12 +61,12 @@ if __name__ == "__main__":
     # A small, fast screen for the simulation: 32 x 24 pixels, short waits.
     quick = LCD._replace(wake_clocks=50)
     screen = ILI9341Model(quick, width=32, height=24)
-    p = Py2ver(functools.partial(test_picture, lcd=quick, width=32, height=24), ATTR)
+    p = Py2ver(functools.partial(test_picture, lcd=quick, width=32, height=24))
     run = p.check(until_done(screen), verilog="--sim" in sys.argv[1:])
     screen.save("lcd.png", scale=10)
     print(f"Drew the test picture in {len(run.inputs):,} clock cycles; "
           f"the display is {'on' if screen.on else 'OFF'}. The picture: lcd.png")
     if "--pins" in sys.argv[1:]:
-        board = Py2ver(test_picture, PINS)
+        board = Py2ver(test_picture, pins=PINS)
         print(board.PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))

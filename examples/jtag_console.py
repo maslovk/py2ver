@@ -102,9 +102,9 @@ def session(presses=2, switches=0b1010, bounce=4):
 if __name__ == "__main__":
     from py2ver import Py2ver
 
-    p = Py2ver(board_console(bounce=4), PINS)
+    p = Py2ver(board_console(bounce=4), pins=PINS)
     print(p.check(session(), verilog="--sim" in sys.argv[1:]).value.decode())
     if "--pins" in sys.argv[1:]:
-        board = Py2ver(board_console(), PINS)
+        board = Py2ver(board_console(), pins=PINS)
         print(board.PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))

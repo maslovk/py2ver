@@ -6,7 +6,8 @@ import pytest
 
 from py2ver import Py2ver
 from py2ver.devices import adxl345 as X
-from py2ver.devices.adc128s022 import ADC128S022, adc128s022_model, adc128s022_read
+from py2ver.devices.adc128s022 import (ADC128S022, adc128s022_idle, adc128s022_model,
+                                       adc128s022_read)
 from py2ver.devices.eeprom24 import eeprom_model, eeprom_read, eeprom_write
 from py2ver.devices.ili9341 import (ILI9341, ILI9341Model, ili9341_fill, ili9341_init,
                                     ili9341_pixel, ili9341_window, rgb565)
@@ -93,9 +94,8 @@ QUICK_ADC = ADC128S022(SPI(2, mode=3))
 
 
 def two_inputs(port, adc=QUICK_ADC):
-    port.cs_n = 1
-    port.sclk = 1
     port.done = 0
+    yield from adc128s022_idle(port, adc)
     yield 4
     a = yield from adc128s022_read(port, adc, 5)
     b = yield from adc128s022_read(port, adc, 2)
@@ -110,7 +110,7 @@ def two_inputs(port, adc=QUICK_ADC):
 def test_an_adc128s022_read_input_by_input(sim, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     values = [0x111 * k for k in range(8)]
-    p = _quiet(two_inputs, {"miso": 1, "cs_n": {"init": 1}, "sclk": {"init": 1}})
+    p = _quiet(two_inputs, {"miso": 1})                         # (idle from reset: as it sets them)
     (a, b), _ = _check(p, with_chip(until_done("a", "b"),
                                     adc128s022_model(values, 4, QUICK_ADC)), sim).value
     assert (a, b) == (values[5], values[2])                # (the frame's 4 zeros: 12 bits)
@@ -140,7 +140,7 @@ def draws(port, lcd=QUICK_LCD):
 def test_an_ili9341_drawn_on(sim, monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     screen = ILI9341Model(QUICK_LCD, width=8, height=4)
-    p = _quiet(draws, {"cs_n": {"init": 1}, "reset_n": {"init": 1}})
+    p = _quiet(draws, {})
 
     def tb(dut):
         yield from alongside(wait_until(dut, "done"), screen.run(dut))

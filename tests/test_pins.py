@@ -159,6 +159,20 @@ def test_the_jtag_uart_s_pins():
     assert pin_width("JTAG_RX_DATA") == 8 and pin_width("JTAG_TX_VALID") == 1
 
 
+def test_pins_given_apart_from_attr():
+    # pins=: the same board as each port's 'pin' in attr, merged with the rest of attr
+    assert _quiet(J.jtag_echo, None, pins=J.PINS).board_top() == \
+        _quiet(J.jtag_echo, J.PINS).board_top()
+    p = _quiet(U.uart_rx, {"rx": 1}, pins={"rx": "GPIO_0_RX", "data": "LED[7:0]"})
+    assert p.board_top() == _receiver().board_top()
+    with pytest.raises(ValueError, match="'rx' is on GPIO_0_RX here, but on KEY\\[0\\] in attr"):
+        _quiet(U.uart_rx, {"rx": "KEY[0]"}, pins={"rx": "GPIO_0_RX"})
+    with pytest.raises(ValueError, match="needs a pin's name, such as 'LED\\[0\\]'"):
+        _quiet(U.uart_rx, {"rx": 1}, pins={"rx": 3})
+    with pytest.raises(ValueError, match="A pin for no port: \\['led'\\]"):
+        _quiet(U.uart_rx, {"rx": 1}, pins={"rx": "GPIO_0_RX", "led": "LED[0]"})
+
+
 @pytest.mark.sim
 @pytest.mark.skipif(not shutil.which("iverilog"), reason="needs Icarus")
 def test_an_echo_over_the_jtag_uart_on_the_board(monkeypatch, tmp_path):

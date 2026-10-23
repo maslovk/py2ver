@@ -169,10 +169,14 @@ class _Runner:
 
     def __init__(self, func: Callable, attr: Dict[str, Any]) -> None:
         self.opens = _opens(attr)
-        self.ins, self.outs = _pins(func, self.opens)
+        fd, port = _expand(func)
+        self.ins, self.outs = _pins_of(fd, port, self.opens)
         self.opens &= set(self.outs)
         init = {o: attr.get(o) if isinstance(attr.get(o), dict) else {} for o in self.outs}
-        start = {o: int(init[o].get("init", 1 if o in self.opens else 0)) for o in self.outs}
+        # (from reset: attr's 'init', else what the generator sets before its first yield)
+        resets = _reset_values(fd, port)
+        start = {o: int(init[o].get("init", resets.get(o, 1 if o in self.opens else 0)))
+                 for o in self.outs}
         self.port = _Port({**{n: 0 for n in self.ins}, **{f"{o}_in": 1 for o in self.opens},
                            **{o: v for o, v in start.items() if o not in self.opens}},
                           self.opens, {o: start[o] for o in self.opens})
@@ -922,6 +926,40 @@ def _is_str(e: ast.expr) -> bool:
     return isinstance(e, ast.Constant) and isinstance(e.value, str)
 
 
+def _reset_values(fd: ast.FunctionDef, port: str) -> Dict[str, int]:
+    """The outputs the generator sets to a constant before its first yield, and
+    those constants: the values the outputs have from reset.
+
+    Only the straight run of statements at the start counts, steps included;
+    it stops at the first yield, loop or if, since what comes after may happen
+    later. An output set to something not constant there gets no value here.
+    """
+    found: Dict[str, int] = {}
+
+    def walk(stmts: Sequence[ast.stmt]) -> bool:
+        """True once the walk reached something that may take time."""
+        for s in stmts:
+            if isinstance(s, _Inline):
+                if walk(s.body):
+                    return True
+                continue
+            if isinstance(s, (ast.Pass, ast.Expr)) and not _yields([s]):
+                continue                                # a docstring, a call
+            if isinstance(s, ast.Assign) and not _yields([s]):
+                for t in s.targets:
+                    if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
+                            and t.value.id == port:
+                        if isinstance(s.value, ast.Constant) and isinstance(s.value.value, int):
+                            found[t.attr] = int(s.value.value)
+                        else:
+                            found.pop(t.attr, None)
+                continue
+            return True
+        return False
+    walk(fd.body)
+    return found
+
+
 def _pins(func: Any, opens: Set[str] = frozenset()) -> Tuple[List[str], List[str]]:
     """(inputs, outputs) of the generator's port: its attributes read and never
     written, and written, in the order they first appear; an open-drain pin
@@ -1163,6 +1201,11 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None) -> Pr
     opens = _opens(attr)
     inputs, outputs = _pins_of(fd, port, opens)
     opens &= set(outputs)
+    # An output set to a constant before the first yield has that value from
+    # reset (unless attr gives its 'init').
+    for o, v in _reset_values(fd, port).items():
+        if o in outputs:
+            attr.setdefault(o, {}).setdefault("init", v)
     # (an open-drain pin: a bit; its drive let go after reset; its line an input)
     for o in opens:
         if int(attr[o].get("width", 1)) != 1:

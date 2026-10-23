@@ -40,7 +40,7 @@ def test_an_adc_read_over_spi():
 
 @pytest.mark.hardware
 def test_the_board_s_adc_answers_in_frame(quartus):
-    p = _quiet(D.adc_reader, D.PINS)
+    p = _quiet(D.adc_reader, D.ATTR, pins=D.PINS)
     p.PINS(quartus)
     p.PROGRAM(quartus)
     with p.jtag_uart(quartus) as link:
@@ -66,7 +66,7 @@ def test_an_accelerometer_read_on_a_bus():
 
 @pytest.mark.hardware
 def test_the_board_s_accelerometer_feels_gravity(quartus):
-    p = _quiet(A.accelerometer, A.PINS)
+    p = _quiet(A.accelerometer, A.ATTR, pins=A.PINS)
     p.PINS(quartus)
     p.PROGRAM(quartus)
     with p.jtag_uart(quartus) as link:
@@ -133,7 +133,7 @@ def test_a_capture_read_back(tmp_path):
 
 @pytest.mark.hardware
 def test_a_signaltap_capture_from_the_board(quartus):
-    p = _quiet(J.jtag_echo, J.PINS, probes=True)
+    p = _quiet(J.jtag_echo, None, pins=J.PINS, probes=True)
     p.PINS(quartus, signaltap=True)
     p.PROGRAM(quartus)
     with p.jtag_uart(quartus) as link:

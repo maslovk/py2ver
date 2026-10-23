@@ -402,6 +402,41 @@ def test_steps_constants_and_records_by_their_module():
     assert [g["out"] for g in gen] == [0] * 4 + [8] * 3 + [0] * 5
 
 
+def sets_then_waits(port):
+    port.a = 1                   # a constant before the first yield: a's value from reset
+    port.b = 5
+    port.c = port.x              # not a constant: c starts at 0
+    if port.x:
+        port.d = 1               # after an if: d starts at 0
+    yield
+    while True:
+        port.a = 0
+        port.b = port.x
+        yield
+
+
+def _starts(p):
+    clocks = [{"x": 2}] * 4
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    return gen
+
+
+def test_an_output_starts_at_what_is_set_before_the_first_yield():
+    first = _starts(_quiet(sets_then_waits, {"x": 3}))[0]
+    assert (first["a"], first["b"], first["c"], first["d"]) == (1, 5, 0, 0)
+    overridden = _starts(_quiet(sets_then_waits, {"x": 3, "a": {"init": 0}}))[0]
+    assert overridden["a"] == 0                                 # (attr's 'init' wins)
+
+
+@pytest.mark.sim
+def test_an_output_s_value_from_reset_in_hardware(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    p = _quiet(sets_then_waits, {"x": 3})
+    clocks = [{"x": 2}] * 4
+    assert p.TB_process()(clocks) == p.GEN_process()(clocks)
+
+
 def test_a_parameter_is_a_constant_a_partial_its_value():
     half = U.BIT // 2
     tx = _quiet(functools.partial(U.uart_tx, bit=half), U.TX)

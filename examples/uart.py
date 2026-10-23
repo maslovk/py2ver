@@ -88,9 +88,9 @@ def echo():
                    wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
 
 
-# The widths of the inputs; py2ver works out the outputs' widths itself.
-# tx starts high, because the line is high when idle.
-TX = {"start": 1, "data": 8, "tx": {"init": 1}}
+# The widths of the inputs; py2ver works out the outputs' widths itself. (tx is
+# high from reset, because uart_tx sets it to 1 before its first yield.)
+TX = {"start": 1, "data": 8}
 RX = {"rx": 1}
 
 # For the board: the line comes in on GPIO_0_RX and goes back out on GPIO_0_TX,
@@ -157,7 +157,7 @@ if __name__ == "__main__":
 
     if "--pins" in args:
         signaltap = "--signaltap" in args
-        board = Py2ver(echo(), ECHO_PINS, probes=signaltap)
+        board = Py2ver(echo(), pins=ECHO_PINS, probes=signaltap)
         print(board.PINS(quartus, signaltap=signaltap))
         print("Program syn/uart_echo_pins/DE0_Nano.sof to put it on the board"
               + (" (SignalTap's bits are listed in syn/uart_echo_pins/signaltap.txt)"

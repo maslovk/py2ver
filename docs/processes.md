@@ -64,13 +64,17 @@ The rules:
 ## 2. Build it
 
 ```python
-tx = Py2ver(uart_tx, {"start": 1, "data": 8, "tx": {"init": 1}})
+tx = Py2ver(uart_tx, {"start": 1, "data": 8})
 ```
 
 The second argument, attr, gives each input its width: `8` is short for
 `{"width": 8}`. You don't give widths to outputs or locals; py2ver follows
-the values written to them (see "Widths" below). An output's `"init"` is its
-value after reset (here the line is high from the start).
+the values written to them (see "Widths" below).
+
+An output's value right after reset is the constant the generator gives it
+before its first `yield`: here `port.tx = 1`, so the line is high from the
+start. Any other output starts at 0. To start an output at something else,
+give it an `"init"` in attr: `{"tx": {"init": 1}}`.
 
 Run it a clock at a time. Each clock's inputs are a dict; an input left out
 is 0. Each clock's outputs come back as a dict:
@@ -298,7 +302,7 @@ from py2ver.protocol import together, uart_receive, uart_send
 def echo(bit=BIT):
     """Every byte received on rx, sent back on tx."""
     return connect(rx=(functools.partial(uart_rx, bit=bit), {"rx": 1}),
-                   tx=(functools.partial(uart_tx, bit=bit), {"tx": {"init": 1}}),
+                   tx=(functools.partial(uart_tx, bit=bit), {}),
                    name="uart_echo",
                    wires={"tx.data": "rx.data", "tx.start": "rx.valid"})
 
@@ -520,12 +524,16 @@ the other devices on the bus in a testbench.
 
 ## 9. Put it on the board
 
-A port's attr can name a DE0-Nano pin. A string is short for `{"pin": ...}`:
+Say which DE0-Nano pin each port goes to with `pins=`, apart from attr:
 
 ```python
-board = Py2ver(echo(), {"rx": "GPIO_0_RX", "tx": "GPIO_0_TX", "data": "LED"})
+board = Py2ver(echo(), pins={"rx": "GPIO_0_RX", "tx": "GPIO_0_TX", "data": "LED"})
 print(board.board_top())        # the board's top module, with the design inside
 ```
+
+The same can go in attr instead: a string there is a pin (`{"rx": "GPIO_0_RX"}`),
+and a dict can hold one with the rest (`{"sda": {"open_drain": True, "pin":
+"I2C_SDAT"}}`). With `pins=`, attr keeps only the widths and the like.
 
 ```py
 board.PINS({"QUARTUS_DIR": "/opt/intelFPGA/22.1std/quartus/bin"})
@@ -594,7 +602,7 @@ def presses(port):
 
 button = connect(db=(functools.partial(debounced, clocks=500_000), {"raw": 1}),   # 10 ms
                  key=(presses, {}),
-                 tx=(uart_tx, {"tx": {"init": 1}}),
+                 tx=(uart_tx, {}),
                  name="button_tx",
                  wires={"key.key": "db.clean", "tx.start": "key.pulse",
                         "tx.data": "key.count"})

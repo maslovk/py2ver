@@ -7,10 +7,8 @@ and sends back the result for the input chosen in the frame before. So reading
 one input takes two frames, which adc128s022_read() does for you:
 
     ADC = ADC128S022()                                  # 2.5 MHz SCLK at 50 MHz
+    yield from adc128s022_idle(port, ADC)               # first: CS and SCLK idle from reset
     value = yield from adc128s022_read(port, ADC, 5)    # input 5
-
-Give its pins their idle levels from reset in attr:
-{'cs_n': {'init': 1}, 'sclk': {'init': 1}}.
 """
 from typing import NamedTuple
 
@@ -24,6 +22,16 @@ class ADC128S022(NamedTuple):
     """
     spi: SPI = SPI(10, mode=3)
     cs_n: str = "cs_n"
+
+
+def adc128s022_idle(port, adc):
+    """Put CS and SCLK at their idle levels (not selected; SCLK high in mode 3).
+
+    Called first thing, before any other yield, it makes them idle from reset.
+    """
+    setattr(port, adc.cs_n, 1)
+    setattr(port, adc.spi.sclk, adc.spi.mode >> 1)
+    yield
 
 
 def adc128s022_frame(port, adc, channel):

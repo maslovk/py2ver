@@ -180,6 +180,24 @@ def _check_options(given: Dict[str, bool]) -> None:
             raise error(message)
 
 
+def _with_pins(attr: Dict[str, Any] | None, pins: Dict[str, str]) -> Dict[str, Any]:
+    """attr with each port's board pin from `pins` added, as {'pin': ...}."""
+    out = {k: dict(v) if isinstance(v, dict) else v for k, v in (attr or {}).items()}
+    for port, pin in pins.items():
+        if not isinstance(pin, str):
+            raise ValueError(f"pins: the port '{port}' needs a pin's name, such as 'LED[0]' "
+                             f"or 'GPIO_1[3]', not {pin!r}")
+        entry = out.setdefault(port, {})
+        if not isinstance(entry, dict):
+            raise ValueError(f"pins: the port '{port}' is {entry!r} in attr; give it its "
+                             f"width and the rest there as a dict")
+        if entry.get("pin", pin) != pin:
+            raise ValueError(f"pins: the port '{port}' is on {pin} here, but on "
+                             f"{entry['pin']} in attr")
+        entry["pin"] = pin
+    return out
+
+
 class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixin, ProcessMixin,
              PinsMixin):
     """Main pipeline for Python → Verilog + optional testbench + Quartus + UART HW I/O."""
@@ -195,7 +213,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
                  stages: bool = False, stage_options: Dict[str, Any] | None = None,
                  multipliers: int | None = None, rate: float | None = None,
                  clock: float = DEFAULT_CLK_FREQ, sequential: bool = False,
-                 sdram: Any = None, write: bool = True, probes: bool = False) -> None:
+                 sdram: Any = None, write: bool = True, probes: bool = False,
+                 pins: Dict[str, str] | None = None) -> None:
         """
         func: the function, as written (a method, numpy code, a torch module
         for its forward(), or a function looping over batches: one step of
@@ -230,6 +249,9 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         probes: a process's state (its state's number __pc, its wait __wait, its
         locals' next values) as ports too, for SignalTap on the board
         (PINS(signaltap=True) records them).
+        pins: which board pin each port goes to, for PINS():
+        {'led': 'LED[0]', 'tx': 'GPIO_0_TX', 'data': 'LED'} (see pins.py for the
+        names). The same as giving each port {'pin': ...} in attr.
         write: write the Verilog to hdl/ in the current directory now; with
         write=False nothing is written until a simulation, a project or
         write_hdl() needs it, and the Verilog is in self.verilog (every file
@@ -248,6 +270,8 @@ class Py2ver(MemoriesMixin, ReferenceMixin, SimulationMixin, BoardMixin, SynMixi
         func = _callable(func)                       # (a torch module: its forward)
         if attr is not None:                         # (8: a width; 'LED[7:0]': a pin)
             attr = normalize_attr(attr)
+        if pins:
+            attr = _with_pins(attr, pins)
         # (the board's pins of the ports, attr 'pin': PINS(), see pins.py)
         self._pins = {k: v["pin"] for k, v in (attr or {}).items()
                       if isinstance(v, dict) and "pin" in v}

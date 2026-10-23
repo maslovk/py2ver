@@ -16,8 +16,8 @@ top to bottom:
     for ...:
         yield from ili9341_pixel(port, LCD, color)
 
-Give the pins their idle levels from reset in attr:
-{'cs_n': {'init': 1}, 'reset_n': {'init': 1}}.
+Called first thing, ili9341_init() also gives the pins their levels from reset:
+the chip not selected, and held in reset until it starts.
 """
 from typing import NamedTuple
 

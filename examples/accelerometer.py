@@ -78,11 +78,12 @@ def accelerometer(port, bus=BUS, period=PERIOD):
         yield period
 
 
-# scl and sda are open drain; for the board, each port is put on its pin
+# scl and sda are open drain
 ATTR = {"scl": {"open_drain": True}, "sda": {"open_drain": True}, "tx_room": 1}
-PINS = dict(ATTR, scl=dict(ATTR["scl"], pin="I2C_SCLK"), sda=dict(ATTR["sda"], pin="I2C_SDAT"),
-            cs_n="G_SENSOR_CS_N", tx_data="JTAG_TX_DATA", tx_send="JTAG_TX_VALID",
-            tx_room="JTAG_TX_READY")
+
+# On the board: the I2C bus and the accelerometer's CS, and the JTAG UART for the console
+PINS = {"scl": "I2C_SCLK", "sda": "I2C_SDAT", "cs_n": "G_SENSOR_CS_N",
+        "tx_data": "JTAG_TX_DATA", "tx_send": "JTAG_TX_VALID", "tx_room": "JTAG_TX_READY"}
 
 
 def with_a_memory(mem, address=0x50, transfers=1, until=b"done\n"):
@@ -126,6 +127,6 @@ if __name__ == "__main__":
     p = Py2ver(functools.partial(i2c_probe, bus=I2C(q=4)), ATTR)
     print(p.check(with_a_memory({0: 0x42}), verilog=False).value.decode())
     if "--pins" in sys.argv[1:]:
-        board = Py2ver(i2c_probe, PINS)
+        board = Py2ver(i2c_probe, ATTR, pins=PINS)
         print(board.PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))

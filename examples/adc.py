@@ -8,7 +8,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py2ver.devices.adc128s022 import ADC128S022, adc128s022_model, adc128s022_read  # noqa: E402
+from py2ver.devices.adc128s022 import (ADC128S022, adc128s022_idle,  # noqa: E402
+                                       adc128s022_model, adc128s022_read)
 from py2ver.protocol import jtag_print, jtag_print_hex  # noqa: E402
 
 ADC = ADC128S022()                       # 2.5 MHz SCLK at 50 MHz (the ADC: 0.8 to 3.2)
@@ -18,8 +19,7 @@ PERIOD = 10_000_000                      # 0.2 s at 50 MHz between sweeps
 def adc_reader(port, adc=ADC, period=PERIOD):
     """Every period, each of the 8 inputs read and printed (as 4 hex digits:
     the first, the frame's 4 leading zeros, always 0)."""
-    setattr(port, adc.cs_n, 1)
-    setattr(port, adc.spi.sclk, adc.spi.mode >> 1)        # (SCLK's idle level: high, mode 3)
+    yield from adc128s022_idle(port, adc)
     yield 1000
     yield from jtag_print(port, b"adc128s022\n")
     while True:
@@ -33,10 +33,11 @@ def adc_reader(port, adc=ADC, period=PERIOD):
         yield period
 
 
-ATTR = {"miso": 1, "tx_room": 1, "cs_n": {"init": 1}, "sclk": {"init": 1}}   # (idle from reset)
-PINS = dict(ATTR, cs_n={"init": 1, "pin": "ADC_CS_N"}, sclk={"init": 1, "pin": "ADC_SCLK"},
-            mosi="ADC_SADDR", miso="ADC_SDAT", tx_data="JTAG_TX_DATA", tx_send="JTAG_TX_VALID",
-            tx_room="JTAG_TX_READY")
+ATTR = {"miso": 1, "tx_room": 1}         # the inputs' widths
+
+# On the board: the ADC's own pins, and the JTAG UART's for the console
+PINS = {"cs_n": "ADC_CS_N", "sclk": "ADC_SCLK", "mosi": "ADC_SADDR", "miso": "ADC_SDAT",
+        "tx_data": "JTAG_TX_DATA", "tx_send": "JTAG_TX_VALID", "tx_room": "JTAG_TX_READY"}
 
 
 def sweep(values, adc=ADC):
@@ -77,5 +78,5 @@ if __name__ == "__main__":
     p = Py2ver(functools.partial(adc_reader, adc=fast, period=100), ATTR)
     print(p.check(sweep(values, fast), verilog="--sim" in sys.argv[1:]).value.decode())
     if "--pins" in sys.argv[1:]:
-        print(Py2ver(adc_reader, PINS).PINS({"QUARTUS_DIR": os.environ.get(
+        print(Py2ver(adc_reader, ATTR, pins=PINS).PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))

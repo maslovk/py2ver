@@ -65,7 +65,7 @@ if __name__ == "__main__":
 
     args = sys.argv[1:]
     signaltap = "--signaltap" in args
-    p = Py2ver(jtag_echo, PINS, probes=signaltap)
+    p = Py2ver(jtag_echo, pins=PINS, probes=signaltap)
     run = p.check(pc(b"hello"), verilog="--sim" in args)
     print(f"Typed b'hello', got back {run.value!r} ({len(run.inputs)} clock cycles)")
     if "--pins" in args:
