@@ -555,7 +555,8 @@ def keeps_values(port):
 
 def test_a_list_local_is_a_register_per_element():
     p = _quiet(keeps_values, {"x": 8, "total": 12})
-    assert [n for n in p.process.locals if n.startswith("values")] == [f"values_{k}" for k in range(8)]
+    elements = [n for n in p.process.locals if n.startswith("values_") and n[7:].isdigit()]
+    assert elements == [f"values_{k}" for k in range(8)]
     assert p.process.attr["values_0"]["width"] == 8                 # (x + 0: each its own width)
     assert p.process.attr["values_7"]["width"] == 9
     clocks = [{"x": k} for k in range(60)]
@@ -623,6 +624,40 @@ def remakes_a_long_list(port):
 
 
 _DELAY_CLOCKS = [{"x": (7 * i) % 256} for i in range(300)]
+
+
+def counts_columns(port, width=48):
+    columns = width // 8                     # (set once, to a constant: that constant)
+    while True:
+        for k in range(columns):             # (so the loop is known to run: no clock lost)
+            port.out = k
+            yield
+
+
+def reads_past_the_end_where_not_taken(port):
+    digits = [3, 1, 4, 1]
+    while True:
+        for k in range(8):
+            c = 0
+            if k < 2:
+                c = 1
+            elif k < 6:
+                c = digits[k - 2]            # (k = 0 known in a clock: digits[-2], not taken)
+            port.out = c
+            yield
+
+
+def test_a_local_set_once_to_a_constant_is_that_constant():
+    p = _quiet(counts_columns, None)
+    assert "columns" not in p.process.locals
+    clocks = [{}] * 20
+    gen = p.GEN_process()(clocks)
+    assert p.PY_process()(clocks) == gen
+    assert [g["out"] for g in gen[1:13]] == [0, 1, 2, 3, 4, 5] * 2
+    past = _quiet(reads_past_the_end_where_not_taken, None)
+    gen = past.GEN_process()(clocks)
+    assert past.PY_process()(clocks) == gen
+    assert [g["out"] for g in gen[1:9]] == [1, 1, 3, 1, 4, 1, 0, 0]
 
 
 def test_a_long_list_is_a_memory_block():

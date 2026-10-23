@@ -1262,6 +1262,55 @@ def _list_items(e: ast.expr) -> Optional[List[ast.expr]]:
     return None
 
 
+def _constant_locals(fd: ast.FunctionDef, pins: Set[str]) -> Dict[str, int]:
+    """In place: a local assigned once in the whole generator, to a constant
+    (columns = width // 8, of the parameters), is that constant where it is
+    read, and its assignment goes. (Python can't read it before then, so this
+    changes nothing it does; but a loop over range(columns) is then known to
+    run, and the width it needs known.) Pins (an output's working value o__n
+    too) are not locals. Returns those locals' values."""
+    stores: Dict[str, int] = {}
+    for n in ast.walk(fd):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            stores[n.id] = stores.get(n.id, 0) + 1
+    arithmetic = (ast.BinOp, ast.UnaryOp, ast.Constant, ast.operator, ast.unaryop)
+
+    def folded(e: ast.expr) -> Optional[int]:
+        """The value of arithmetic on constants (144 // 8), else None."""
+        if not all(isinstance(x, arithmetic) for x in ast.walk(e)):
+            return None
+        try:
+            v = eval(compile(ast.Expression(e), "<constant>", "eval"), {"__builtins__": {}})
+        except Exception:
+            return None
+        return v if type(v) is int else None
+
+    values: Dict[str, int] = {}
+    for n in ast.walk(fd):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) \
+                and stores.get(n.targets[0].id) == 1 and n.targets[0].id not in pins:
+            v = folded(n.value)
+            if v is not None:
+                values[n.targets[0].id] = v
+                n._constant_local = True
+    if not values:
+        return values
+
+    class _T(ast.NodeTransformer):
+        def visit_Assign(self, s: ast.Assign):
+            if getattr(s, "_constant_local", False):
+                return ast.copy_location(ast.Pass(), s)     # (a block can't be left empty)
+            return self.generic_visit(s)
+
+        def visit_Name(self, n: ast.Name):
+            if n.id in values and isinstance(n.ctx, ast.Load):
+                return ast.copy_location(ast.Constant(values[n.id]), n)
+            return n
+    _T().visit(fd)
+    ast.fix_missing_locations(fd)
+    return values
+
+
 MEMORY_MIN = 64              # a list this long or longer goes into a memory block, if it can
 MEMORY_REGISTERS_MAX = 256   # and one longer than this that can't is an error, not registers
 
@@ -1432,16 +1481,29 @@ def _expand_lists(fd: ast.FunctionDef, memories: Optional[Dict[str, List[int]]] 
                 if k is not None:
                     return ast.copy_location(ast.Assign(targets=[element(name, k, ast.Store())],
                                                         value=s.value), s)
-                # (a variable index: the element it is, an if for each)
-                chain: List[ast.stmt] = [ast.Pass()]
-                for k in reversed(range(lengths[name])):
+                # (a variable index: each element takes the value if it is the one
+                # the index is, else keeps its own: values_3 = x if i == 3 else
+                # values_3. Not an if: an if's branches would each hold the rest of
+                # the clock, and an elif chain makes each element depend on every
+                # test before its own. The index and the value worked out once.)
+                first: List[ast.stmt] = []
+                if not isinstance(index, (ast.Name, ast.Constant)):
+                    first.append(ast.copy_location(_assign_bare(f"{name}__index", index), s))
+                    index = ast.Name(id=f"{name}__index", ctx=ast.Load())
+                value = s.value
+                if not isinstance(value, (ast.Name, ast.Constant)):
+                    first.append(ast.copy_location(_assign_bare(f"{name}__value", value), s))
+                    value = ast.Name(id=f"{name}__value", ctx=ast.Load())
+                writes: List[ast.stmt] = []
+                for k in range(lengths[name]):
                     test = ast.Compare(left=_copy(index), ops=[ast.Eq()],
                                        comparators=[ast.Constant(k)])
                     test._element = True     # (not a limit of the index: see _flow_widths)
-                    write = ast.Assign(targets=[element(name, k, ast.Store())],
-                                       value=_copy(s.value))
-                    chain = [ast.If(test=test, body=[write], orelse=chain)]
-                return ast.copy_location(chain[0], s)
+                    choose = ast.IfExp(test=test, body=_copy(value),
+                                       orelse=element(name, k, ast.Load()))
+                    writes.append(ast.copy_location(
+                        ast.Assign(targets=[element(name, k, ast.Store())], value=choose), s))
+                return first + writes
             s.targets = [self.visit(t) for t in s.targets]
             return s
 
@@ -1533,6 +1595,8 @@ def compile_process(func: Callable, attr: Optional[Dict[str, Any]] = None,
             n.id = f"{n.id}_v"
     used |= {n.id for n in ast.walk(fd) if isinstance(n, ast.Name)}
     _desugar(fd, port, set(inputs), set(outputs), opens)
+    # (columns = width // 8: the constant it is)
+    _constant_locals(fd, set(inputs) | set(outputs) | {f"{o}__n" for o in outputs} | opens)
     # A long list local: in a memory block, if it is used as one can be (else
     # this is done again with it in registers, see below). A list local in
     # registers: a register per element, its width in attr each element's.

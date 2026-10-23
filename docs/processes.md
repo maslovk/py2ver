@@ -113,6 +113,10 @@ When a value really can grow without end (`total = total + port.x`), py2ver
 stops with an error naming every such variable and the line where it is
 first assigned. Give those widths in attr: `{"total": 16}`.
 
+A local assigned once in the whole process, to a constant, is that constant:
+`columns = width // 8` (with `width` a parameter) then `for k in
+range(columns)` is a loop of `width // 8` rounds, and costs no register.
+
 Two habits keep widths easy to work out:
 
 - Compute from a loop's variable rather than adding up in the loop:
@@ -177,7 +181,10 @@ n = len(neurons)                     # 64
 
 An index can be a variable or a constant, and a negative one counts from the
 end, as in Python. A list can only be used through its elements and its
-length: it can't be passed to a step or assigned to another name.
+length: it can't be passed to a step or assigned to another name. A test of
+an element at a variable index (`if digits[i] < 9`) doesn't limit the
+elements' widths; with a constant index (`if digits[3] < 9`) it does, as a
+test of a local does.
 
 A long list (64 elements or more) goes into a memory block, so it can hold
 thousands of values, such as a picture to draw from. That works when it is

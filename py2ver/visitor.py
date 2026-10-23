@@ -138,7 +138,8 @@ class FunctionVisitor(ast.NodeVisitor):
         self._rams: Dict[str, Dict[str, Any]] = {}
         self.ram_ports: Dict[str, Dict[str, str | None]] = {}
         # A process's clock: its states' code side by side, so a read after a
-        # write in the text may be in another clock (process.py checks each clock)
+        # write in the text may be in another clock (process.py checks each clock);
+        # and a branch never taken may read past a list's end (see visit_Subscript)
         self.reads_after_writes = False
         self._tmp_count = 0
         self._line: int | None = None      # the Python line being translated
@@ -518,6 +519,10 @@ class FunctionVisitor(ast.NodeVisitor):
             k = None
         if k is not None:
             if not -n <= k < n:
+                if self.reads_after_writes:
+                    # (a process: its clocks' known constants can make an index that
+                    # is never read where it's out of range, in a branch not taken)
+                    return "0"
                 raise NotImplementedError(f"Index {k} is out of range (length {n})")
             return elems[k]
         return self._select(elems, node.slice)
