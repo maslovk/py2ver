@@ -42,6 +42,7 @@ board's pins); each file's first lines list them.
 | [mandelbrot.py](mandelbrot.py) | a Mandelbrot set generator, one iteration a clock, streaming RGB565 pixels for a display |
 | [mandelbrot_lcd.py](mandelbrot_lcd.py) | the generator connected to the ILI9341 display: two blocks joined by a stream |
 | [mandelbrot_zoom.py](mandelbrot_zoom.py) | a fractal show on the display, its colors cycling: the Mandelbrot set zooming in and out, or (KEY1) Julia sets morphing; 10 to 17 frames a second |
+| [plasma.py](plasma.py) | a plasma on the display: four sine waves added at each pixel pick a rainbow color, flowing at 20 frames a second; its tables in memory blocks |
 
 ## Signal processing
 
