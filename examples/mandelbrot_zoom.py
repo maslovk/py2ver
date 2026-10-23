@@ -29,10 +29,13 @@ from py2ver.protocol import SPI  # noqa: E402
 LCD = ILI9341(spi=SPI(1, mode=0, miso=""))
 
 
-def zoom_on_screen(lcd=LCD, area=M.ZOOM, width=WIDTH, height=HEIGHT, max_iter=M.MAX_ITER):
-    """The zooming generator feeding the display."""
+def zoom_on_screen(lcd=LCD, area=M.ZOOM, width=WIDTH, height=HEIGHT, max_iter=M.MAX_ITER,
+                   cycle=1):
+    """The zooming generator feeding the display; its colors cycling `cycle`
+    places a frame."""
     fractal = functools.partial(M.mandelbrot_zoom, area=area, width=width, height=height,
-                                max_iter=max_iter, colors=M.palette(max_iter))
+                                max_iter=max_iter, colors=M.cyclic_palette(max_iter),
+                                cycle=cycle)
     display = functools.partial(ili9341_display, lcd=lcd, width=width, height=height)
     return connect(fractal=(fractal, M.ZOOM_ATTR), display=(display, {"color": 16, "valid": 1}),
                    name="mandelbrot_zoom",

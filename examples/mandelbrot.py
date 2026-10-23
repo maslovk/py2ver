@@ -54,8 +54,26 @@ def palette(max_iter=MAX_ITER):
     return tuple(colors) + (0,)
 
 
+# A gradient that ends where it begins, for cycling: dark blue, light blue,
+# white, orange, near black, and back to dark blue
+STOPS = ((0, 7, 100), (32, 107, 203), (237, 255, 255), (255, 170, 0), (0, 2, 0))
+
+
+def cyclic_palette(max_iter=MAX_ITER, stops=STOPS):
+    """A color for each count, going once round the stops (so that shifting the
+    colors along, cycling, shows no seam); black for the set itself."""
+    colors = []
+    for n in range(max_iter):
+        t = n / max_iter * len(stops)
+        k, u = int(t), t - int(t)
+        a, b = stops[k], stops[(k + 1) % len(stops)]
+        colors.append(rgb565(*(round(x + (y - x) * u) for x, y in zip(a, b))))
+    return tuple(colors) + (0,)
+
+
 VIEW = view()
 PALETTE = palette()
+CYCLIC = cyclic_palette()
 
 
 def escape_count(port, cx, cy, max_iter, frac=FRAC):
@@ -156,15 +174,18 @@ ZOOM = zoom()
 
 
 def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_ITER,
-                    colors=PALETTE):
+                    colors=CYCLIC, cycle=1):
     """An animation: a picture after another, zooming in on area's point, then
     back out again, and in again, and so on.
 
+    cycle: how many places the colors move along the palette each frame (0:
+    they stay), so that the bands seem to flow; points in the set stay black.
     Output stream: color (RGB565), valid; input: ready, as mandelbrot()'s.
     """
     port.valid = 0
     step = area.start
     zooming_in = 1
+    offset = 0                                   # how far the colors have cycled
     while True:
         x0 = area.cx - step * (width // 2)       # the top-left pixel, from the center
         y0 = area.cy + step * (height // 2)
@@ -175,7 +196,15 @@ def mandelbrot_zoom(port, area=ZOOM, width=WIDTH, height=HEIGHT, max_iter=MAX_IT
                 yield                    # a clock for the coordinates' multiply, before
                                          # the escape loop's (one multiplier per clock)
                 n = yield from escape_count(port, cx, cy, max_iter, area.frac)
-                yield from stream_send(port, colors[n], data="color")
+                index = n                        # in the set: black, as it is
+                if n < max_iter:
+                    index = n + offset           # else the color `offset` places along
+                    if index >= max_iter:
+                        index = index - max_iter
+                yield from stream_send(port, colors[index], data="color")
+        offset = offset + cycle                  # the next frame's colors, moved along
+        if offset >= max_iter:
+            offset = offset - max_iter
         # The next frame's step: smaller zooming in, larger zooming out (by 1 at
         # least either way: once step is under 2**shrink, step >> shrink is 0)
         if zooming_in:

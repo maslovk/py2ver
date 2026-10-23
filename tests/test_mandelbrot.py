@@ -59,27 +59,47 @@ def test_the_picture_on_a_display(sim, monkeypatch, tmp_path):
     assert screen.on and screen.pixels == sent
 
 
+def _frames(width, height, count):
+    """A testbench: `count` pictures in a row, from the stream."""
+    def tb(dut):
+        shots = []
+        for _ in range(count):
+            shot = yield from M.picture(width, height)(dut)
+            shots.append(shot)
+        return shots
+    return tb
+
+
 @pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
 def test_a_zoom_frame_after_frame(sim, monkeypatch, tmp_path):
-    # Zooming in by half each frame, starting over after the third
+    # Zooming in by half each frame, then back out
     monkeypatch.chdir(tmp_path)
     w, h, iters = 8, 6, 8
     area = M.zoom(start_width=3.2, end_width=0.5, width=w)._replace(shrink=1)
     f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
-                          colors=M.palette(iters))
+                          colors=M.palette(iters), cycle=0)
     p = _quiet(f, M.ZOOM_ATTR)
-
-    def frames(count):
-        def tb(dut):
-            shots = []
-            for _ in range(count):
-                shot = yield from M.picture(w, h)(dut)
-                shots.append(shot)
-            return shots
-        return tb
-    shots = p.check(frames(9), verilog=sim).value
+    shots = p.check(_frames(w, h, 9), verilog=sim).value
     assert shots[0] != shots[1] != shots[2]                     # (each zoomed in further)
     assert shots[8] == shots[0]                                 # (and back out to the start)
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_the_colors_cycle_frame_after_frame(sim, monkeypatch, tmp_path):
+    # The view held still (its start its smallest), the colors moving 3 places a
+    # frame; with colors 0, 1, 2, ... each pixel's color is its count, moved along
+    monkeypatch.chdir(tmp_path)
+    w, h, iters = 8, 6, 8
+    area = M.zoom(start_width=3.2, end_width=3.2, width=w)
+    f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
+                          colors=tuple(range(iters + 1)), cycle=3)
+    p = _quiet(f, M.ZOOM_ATTR)
+    shots = p.check(_frames(w, h, 4), verilog=sim).value
+    counts = shots[0]                                           # (frame 0: not moved yet)
+    for k, shot in enumerate(shots):
+        assert shot == [[n if n == iters else (n + 3 * k) % iters for n in row]
+                        for row in counts]                      # (the set: black, still)
+    assert any(n == iters for row in counts for n in row)       # (some of it in the set)
 
 
 @pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
@@ -92,18 +112,9 @@ def test_a_zoom_turns_around_at_both_ends(sim, monkeypatch, tmp_path):
     w, h, iters = 4, 3, 4
     area = M.Zoom(cx=-8, cy=0, start=40, smallest=7, shrink=4, frac=4)
     f = functools.partial(M.mandelbrot_zoom, area=area, width=w, height=h, max_iter=iters,
-                          colors=tuple(range(iters + 1)))
+                          colors=tuple(range(iters + 1)), cycle=0)
     p = _quiet(f, {"ready": 1, **M.escape_widths(4)})
-
-    def frames(count):
-        def tb(dut):
-            shots = []
-            for _ in range(count):
-                shot = yield from M.picture(w, h)(dut)
-                shots.append(shot)
-            return shots
-        return tb
-    shots = p.check(frames(60), verilog=sim).value
+    shots = p.check(_frames(w, h, 60), verilog=sim).value
     deepest = [[iters] * w for _ in range(h)]                       # (all in the set)
     assert shots[19] == deepest and shots[20] == shots[18]          # (in, and turning back)
     assert shots[39] == shots[0]                                    # (out to the start)
