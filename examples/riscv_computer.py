@@ -1,10 +1,12 @@
 # A RISC-V computer on the FPGA: a CPU written in Python, running C programs,
 # its console on the ILI9341 display and its keyboard the PC's.
 #
-# The CPU runs RV32IMA with machine and user modes: the base integer
-# instructions, multiply and divide (M), atomics (A), the CSRs (Zicsr), traps
-# and the timer's interrupt (user mode: for Linux's programs, their system calls
-# an ecall from user mode; no memory protection). A clock to fetch an instruction, a clock to decode it and read its
+# The CPU runs RV32IMA with machine, supervisor and user modes: the base
+# integer instructions, multiply and divide (M), atomics (A), the CSRs (Zicsr),
+# traps, delegated to supervisor mode as medeleg and mideleg say, and the
+# timer's interrupt (user mode: for Linux's programs, their system calls an
+# ecall from user mode; supervisor mode: for Linux with an MMU, to come;
+# no memory protection yet). A clock to fetch an instruction, a clock to decode it and read its
 # registers, a clock or more to carry it out (memory, multiplying, dividing:
 # 32 clocks), a clock to write its result: about 12 million instructions a
 # second. Its memory is mini-rv32ima's (the small RISC-V emulator that boots
@@ -76,7 +78,9 @@ TAG_VALID = 4096
 PC_PATIENCE = 100_000_000                # (2 s: the PC empties the JTAG UART every few ms, but
 #   after a long write to the board, its next read can be a second away)
 MASK = 0xFFFFFFFF                       # (the registers are 32 bits)
-MISA = (1 << 30) | (1 << 12) | (1 << 8) | (1 << 0)    # 32 bits; M, I, A
+MISA = (1 << 30) | (1 << 20) | (1 << 18) | (1 << 12) | (1 << 8) | (1 << 0)   # 32 bits; U, S, M, I, A
+SSTATUS = 0x000C0122                     # (sstatus: mstatus's SIE, SPIE, SPP, SUM, MXR)
+MPRV = 1 << 17
 
 # ----------------------------- building programs -----------------------------
 
@@ -125,7 +129,7 @@ def riscv_test(name):
     """One of riscv-tests' programs (rv32ui/add, rv32um/div, rv32ua/amoadd_w...),
     built with this computer's environment (examples/riscv/env)."""
     return build(os.path.join(RISCV_TESTS, "isa", name + ".S"),
-                 includes=(os.path.join(PROGRAMS, "env"),
+                 includes=(os.path.join(PROGRAMS, "env"), os.path.join(RISCV_TESTS, "env"),
                            os.path.join(RISCV_TESTS, "isa", "macros", "scalar")))
 
 
@@ -179,15 +183,32 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
     tags = [0] * LINES                           # and each line's tag (0: holds nothing)
     regs = [0] * 32                             # x0 to x31 (x0 never written: always 0)
     pc = 0
-    # Machine mode's state (the CSRs)
-    interrupts = 0                               # mstatus.MIE: interrupts on
+    # The privileged state: the mode, and the CSRs
+    mode = 3                                     # 3: machine mode, 1: supervisor mode, 0: user mode
+    interrupts = 0                               # mstatus.MIE: machine mode's interrupts on
     interrupts_before = 0                        # mstatus.MPIE: MIE before the trap
-    enabled = 0                                  # mie: the interrupts wanted (bit 7: the timer's)
+    mode_before = 3                              # mstatus.MPP: the mode before the trap
+    s_interrupts = 0                             # mstatus.SIE: supervisor mode's interrupts on
+    s_interrupts_before = 0                      # mstatus.SPIE: SIE before the trap
+    s_mode_before = 0                            # mstatus.SPP: the mode before the trap (1 or 0)
+    status_bits = 0                              # mstatus.MPRV, SUM, MXR, TVM, TW, TSR, in place (17 to 22)
+    enabled = 0                                  # mie: the interrupts wanted
+    pending = 0                                  # mip's bits that software sets: SSIP, STIP, SEIP
+    exceptions_delegated = 0                     # medeleg: traps below machine mode, to supervisor mode
+    interrupts_delegated = 0                     # mideleg: the same for interrupts
     trap_vector = 0                              # mtvec
     scratch = 0                                  # mscratch
     trap_pc = 0                                  # mepc
     cause = 0                                    # mcause
     trap_value = 0                               # mtval
+    s_trap_vector = 0                            # stvec
+    s_scratch = 0                                # sscratch
+    s_trap_pc = 0                                # sepc
+    s_cause = 0                                  # scause
+    s_trap_value = 0                             # stval
+    satp = 0                                     # satp (paging: its mode and root, kept, not yet used)
+    counters_on = 0                              # mcounteren: the counters supervisor mode may read
+    s_counters_on = 0                            # scounteren: and user mode
     retired_lo = 0                               # instructions carried out (cycle, instret)
     retired_hi = 0
     compare_lo = MASK                            # mtimecmp: the timer's interrupt from then
@@ -196,8 +217,6 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
     reservation = 0
     key_waiting = 0                              # a key taken from the PC, not yet read
     waiting_key = 0
-    user = 0                                     # 1: in user mode (Linux's programs), else machine mode
-    user_before = 0                              # mstatus.MPP: the mode before the trap (1: user)
     divisor_latch = 0                            # the UART's LCR bit 7: writes to its data set the baud rate
     patience = 0                                 # clocks to wait for room for the PC's copy (0: none listens)
     told = 0                                     # (1: KEY1 still held since the CPU's state was sent)
@@ -216,18 +235,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             yield from tell_pc(port, b" mtval ")
             yield from tell_pc_hex(port, trap_value)
             yield from tell_pc(port, b"]\n")
-        # ---- the timer's interrupt, if it is due and wanted: a trap now (in
-        # user mode, whatever mstatus.MIE says) ----
+        # (the timer's interrupt due: mip.MTIP)
         due = port.mtime_hi > compare_hi or (port.mtime_hi == compare_hi and port.mtime_lo >= compare_lo)
-        if (interrupts or user) and (enabled >> 7) & 1 and due:
-            trap_pc = pc
-            cause = 0x80000007
-            trap_value = 0
-            interrupts_before = interrupts
-            interrupts = 0
-            user_before = user
-            user = 0
-            pc = ((trap_vector & 0xFFFFFFFC) + (28 if trap_vector & 1 else 0)) & MASK   # (vectored: + 4 x 7)
         # ---- fetch: from the RAM, or from the SDRAM through the cache (on a
         # miss, the line read into it, and the cache looked at again) ----
         while True:
@@ -279,19 +288,26 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
         elif op == 0x17:                         # auipc
             result = (pc + imm_u) & MASK
             write = 1
-        elif op == 0x6F:                         # jal
+        elif op == 0x6F or op == 0x67:           # jal jalr (a target not a multiple of 4: a trap)
             result = next_pc
-            write = 1
-            next_pc = (pc + imm_j) & MASK
-        elif op == 0x67:                         # jalr
-            result = next_pc
-            write = 1
-            next_pc = (a + imm_i) & 0xFFFFFFFE
+            target = (pc + imm_j) & MASK if op == 0x6F else (a + imm_i) & 0xFFFFFFFE
+            if target & 2:
+                trap = 1
+                trap_cause = 0
+                trap_with = target
+            else:
+                write = 1
+                next_pc = target
         elif op == 0x63:                         # beq bne blt bge bltu bgeu
             taken = (f3 == 0 and a == b) or (f3 == 1 and a != b) or (f3 == 4 and sa < sb) \
                 or (f3 == 5 and sa >= sb) or (f3 == 6 and a < b) or (f3 == 7 and a >= b)
-            if taken:
-                next_pc = (pc + imm_b) & MASK
+            target = (pc + imm_b) & MASK
+            if taken and target & 2:
+                trap = 1
+                trap_cause = 0
+                trap_with = target
+            elif taken:
+                next_pc = target
         elif op == 0x33 and f7 == 1 and f3 < 4:  # mul mulh mulhsu mulhu
             left = sa if f3 == 1 or f3 == 2 else a
             right = sb if f3 == 1 else b
@@ -431,7 +447,7 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             # data and byte_mask, written a clock apart)
             size = 1 if f3 == 0 else (2 if f3 == 1 else 4)
             two = (address & 3) + size > 4
-            spread = (b & ((1 << (8 * size)) - 1)) << ((address & 3) * 8)
+            spread = (b & (255 if f3 == 0 else (65535 if f3 == 1 else MASK))) << ((address & 3) * 8)
             spread_mask = ((1 << size) - 1) << (address & 3)
             data = spread & MASK
             byte_mask = spread_mask & 15
@@ -561,42 +577,94 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                     else:
                         ram[k] = new
             write = 1 - trap
-        elif op == 0x73 and f3 == 0:             # ecall ebreak mret wfi
-            if (instruction >> 20) == 0x302:     # mret: back from the trap
+        elif op == 0x73 and f3 == 0:             # ecall ebreak mret sret wfi sfence.vma
+            function = instruction >> 20
+            tvm = (status_bits >> 20) & 1
+            if function == 0x302 and mode == 3:  # mret: back from machine mode's trap
                 next_pc = trap_pc
                 interrupts = interrupts_before
                 interrupts_before = 1
-                user = user_before               # (to the mode mstatus.MPP names, which is then user's)
-                user_before = 1
-            elif (instruction >> 20) == 0:
+                mode = mode_before
+                mode_before = 0
+                if mode != 3:
+                    status_bits = status_bits & ~MPRV
+            elif function == 0x102 and (mode == 3 or (mode == 1 and not (status_bits >> 22) & 1)):
+                next_pc = s_trap_pc              # sret: back from supervisor mode's (TSR: not allowed)
+                s_interrupts = s_interrupts_before
+                s_interrupts_before = 1
+                mode = s_mode_before
+                s_mode_before = 0
+                status_bits = status_bits & ~MPRV
+            elif function == 0:
                 trap = 1
-                trap_cause = 8 if user else 11   # (ecall from user mode: a system call; from machine mode)
-            elif (instruction >> 20) == 1:
+                trap_cause = 8 + mode            # (ecall: from user mode 8, a system call; supervisor 9, machine 11)
+            elif function == 1:
                 trap = 1
                 trap_cause = 3                   # (ebreak)
+            elif function == 0x105 and not ((status_bits >> 21) & 1 and mode < 3):
+                pass                             # (wfi: done at once; TW: not below machine mode)
+            elif f7 == 0x09 and rd == 0 and (mode == 3 or (mode == 1 and not tvm)):
+                pass                             # (sfence.vma: no TLB yet; TVM: not in supervisor mode)
+            else:
+                trap = 1
+                trap_cause = 2
+                trap_with = instruction
         elif op == 0x73:                         # csrrw csrrs csrrc, and with an immediate
             csr = instruction >> 20
             source = (instruction >> 15) & 31 if f3 >= 5 else a
-            mstatus = (interrupts << 3) | (interrupts_before << 7) | (0 if user_before else 3 << 11)
-            old = 0                              # (unknown CSRs: 0, written to no effect)
+            # (csrrs and csrrc of x0 or 0: a read only)
+            writes = f3 == 1 or f3 == 5 or (instruction >> 15) & 31 != 0
+            mstatus = (s_interrupts << 1) | (interrupts << 3) | (s_interrupts_before << 5) \
+                | (interrupts_before << 7) | (s_mode_before << 8) | (mode_before << 11) | status_bits
+            mip = pending | (128 if due else 0)
+            known = 1
+            old = 0
             if csr == 0x300:
                 old = mstatus
+            elif csr == 0x100:
+                old = mstatus & SSTATUS
             elif csr == 0x301:
                 old = MISA
             elif csr == 0x304:
                 old = enabled
+            elif csr == 0x104:
+                old = enabled & interrupts_delegated
+            elif csr == 0x344:
+                old = mip
+            elif csr == 0x144:
+                old = mip & interrupts_delegated
             elif csr == 0x305:
                 old = trap_vector
+            elif csr == 0x105:
+                old = s_trap_vector
             elif csr == 0x340:
                 old = scratch
+            elif csr == 0x140:
+                old = s_scratch
             elif csr == 0x341:
                 old = trap_pc
+            elif csr == 0x141:
+                old = s_trap_pc
             elif csr == 0x342:
                 old = cause
+            elif csr == 0x142:
+                old = s_cause
             elif csr == 0x343:
                 old = trap_value
-            elif csr == 0x344:
-                old = 128 if due else 0          # (mip: the timer's interrupt due)
+            elif csr == 0x143:
+                old = s_trap_value
+            elif csr == 0x302:
+                old = exceptions_delegated
+            elif csr == 0x303:
+                old = interrupts_delegated
+            elif csr == 0x306:
+                old = counters_on
+            elif csr == 0x106:
+                old = s_counters_on
+            elif csr == 0x180:
+                old = satp
+            elif csr == 0x310 or (csr >= 0xF11 and csr <= 0xF15):
+                old = 0                          # (mstatush; mvendorid, marchid, mimpid, mhartid, mconfigptr)
             elif csr == 0xC00 or csr == 0xC02 or csr == 0xB00 or csr == 0xB02:
                 old = retired_lo
             elif csr == 0xC80 or csr == 0xC82 or csr == 0xB80 or csr == 0xB82:
@@ -605,46 +673,126 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                 old = port.mtime_lo
             elif csr == 0xC81:
                 old = port.mtime_hi
-            new = source
-            if f3 == 2 or f3 == 6:
-                new = old | source
-            elif f3 == 3 or f3 == 7:
-                new = old & (MASK ^ source)
-            if csr == 0x300:
-                interrupts = (new >> 3) & 1
-                interrupts_before = (new >> 7) & 1
-                user_before = 1 if (new >> 11) & 3 == 0 else 0  # (MPP: user, or else machine)
-            elif csr == 0x304:
-                enabled = new & 0x888
-            elif csr == 0x305:
-                trap_vector = new
-            elif csr == 0x340:
-                scratch = new
-            elif csr == 0x341:
-                trap_pc = new & 0xFFFFFFFC
-            elif csr == 0x342:
-                cause = new
-            elif csr == 0x343:
-                trap_value = new
-            result = old
-            write = 1
+            else:
+                known = 0                        # (an unknown CSR: an illegal instruction)
+            # (allowed: a CSR of this mode or below (bits 8, 9), not read-only
+            # (bits 10, 11 both 1) if written; a counter as mcounteren and
+            # scounteren allow; satp in supervisor mode unless TVM)
+            counter = csr >> 8 == 0xC
+            counter_allowed = not counter or ((mode == 3 or (counters_on >> (csr & 31)) & 1)
+                                              and (mode != 0 or (s_counters_on >> (csr & 31)) & 1))
+            if not known or (csr >> 8) & 3 > mode or (writes and csr >> 10 == 3) \
+                    or not counter_allowed or (csr == 0x180 and mode == 1 and (status_bits >> 20) & 1):
+                trap = 1
+                trap_cause = 2
+                trap_with = instruction
+            else:
+                new = source
+                if f3 == 2 or f3 == 6:
+                    new = old | source
+                elif f3 == 3 or f3 == 7:
+                    new = old & (MASK ^ source)
+                if writes and (csr == 0x300 or csr == 0x100):
+                    # (sstatus: its bits of mstatus, the rest kept)
+                    status = new if csr == 0x300 else (mstatus & (MASK ^ SSTATUS)) | (new & SSTATUS)
+                    s_interrupts = (status >> 1) & 1
+                    interrupts = (status >> 3) & 1
+                    s_interrupts_before = (status >> 5) & 1
+                    interrupts_before = (status >> 7) & 1
+                    s_mode_before = (status >> 8) & 1
+                    mode_before = 0 if (status >> 11) & 3 == 2 else (status >> 11) & 3
+                    status_bits = status & 0x7E0000
+                elif writes and csr == 0x304:
+                    enabled = new & 0xAAA
+                elif writes and csr == 0x104:
+                    enabled = (enabled & (MASK ^ interrupts_delegated)) | (new & interrupts_delegated)
+                elif writes and csr == 0x344:
+                    pending = new & 0x222
+                elif writes and csr == 0x144:            # (sip: SSIP alone, if delegated)
+                    pending = (pending & 0x220) | (new & interrupts_delegated & 2)
+                elif writes and csr == 0x305:
+                    trap_vector = new & 0xFFFFFFFD
+                elif writes and csr == 0x105:
+                    s_trap_vector = new & 0xFFFFFFFD
+                elif writes and csr == 0x340:
+                    scratch = new
+                elif writes and csr == 0x140:
+                    s_scratch = new
+                elif writes and csr == 0x341:
+                    trap_pc = new & 0xFFFFFFFC
+                elif writes and csr == 0x141:
+                    s_trap_pc = new & 0xFFFFFFFC
+                elif writes and csr == 0x342:
+                    cause = new
+                elif writes and csr == 0x142:
+                    s_cause = new
+                elif writes and csr == 0x343:
+                    trap_value = new
+                elif writes and csr == 0x143:
+                    s_trap_value = new
+                elif writes and csr == 0x302:            # (ecall from machine mode: never delegated)
+                    exceptions_delegated = new & 0xB3FF
+                elif writes and csr == 0x303:
+                    interrupts_delegated = new & 0x222
+                elif writes and csr == 0x306:
+                    counters_on = new
+                elif writes and csr == 0x106:
+                    s_counters_on = new
+                elif writes and csr == 0x180:            # (Sv32's mode and root; no ASIDs)
+                    satp = new & 0x803FFFFF
+                result = old
+                write = 1
         elif op != 0x0F:                         # (fence, fence.i: nothing to do; else illegal)
             trap = 1
             trap_cause = 2
             trap_with = instruction
-        if trap:                                 # a trap: to mtvec, as an interrupt goes
-            trap_pc = pc
-            cause = trap_cause
-            trap_value = trap_with
-            interrupts_before = interrupts
-            interrupts = 0
-            user_before = user
-            user = 0
-            next_pc = trap_vector & 0xFFFFFFFC
-        pc = next_pc
         yield
-        # ---- write back (a clock of its own: the register file takes the
-        # result from a register, not from the whole of the clock's logic) ----
+        # ---- the instruction's end, a clock of its own (one state for every
+        # instruction: the trap's logic and the register file's write made once,
+        # from registers, not again for each way through the instruction).
+        # An interrupt waiting and wanted, if the instruction didn't trap, is
+        # taken now, before the next. Machine mode's: wanted below machine mode,
+        # or in it with MIE; supervisor mode's (delegated): in user mode, or in
+        # supervisor mode with SIE; the first of MEI, MSI, MTI, SEI, SSI, STI ----
+        waiting = (pending | (128 if due else 0)) & enabled
+        for_machine = waiting & (MASK ^ interrupts_delegated) if mode < 3 or interrupts else 0
+        for_supervisor = waiting & interrupts_delegated if mode == 0 or (mode == 1 and s_interrupts) else 0
+        interrupt = for_machine if for_machine else for_supervisor
+        number = 11 if interrupt & 0x800 else (3 if interrupt & 8 else (7 if interrupt & 128 else (
+            9 if interrupt & 0x200 else (1 if interrupt & 2 else 5))))
+        if trap:                                 # (an exception: the instruction not done)
+            write = 0
+            trap_at = pc
+            to_supervisor = mode < 3 and (exceptions_delegated >> trap_cause) & 1
+            vectored = 0
+        elif interrupt:
+            trap = 1
+            trap_cause = 0x80000000 | number
+            trap_with = 0
+            trap_at = next_pc
+            to_supervisor = for_machine == 0
+            vectored = 1
+        if trap:                                 # a trap: to mtvec, or delegated, to stvec
+            if to_supervisor:
+                s_trap_pc = trap_at
+                s_cause = trap_cause
+                s_trap_value = trap_with
+                s_interrupts_before = s_interrupts
+                s_interrupts = 0
+                s_mode_before = 1 if mode == 1 else 0
+                mode = 1
+                next_pc = ((s_trap_vector & 0xFFFFFFFC)
+                           + (4 * number if vectored and s_trap_vector & 1 else 0)) & MASK
+            else:
+                trap_pc = trap_at
+                cause = trap_cause
+                trap_value = trap_with
+                interrupts_before = interrupts
+                interrupts = 0
+                mode_before = mode
+                mode = 3
+                next_pc = ((trap_vector & 0xFFFFFFFC) + (4 * number if vectored and trap_vector & 1 else 0)) & MASK
+        pc = next_pc
         if write and rd != 0:
             regs[rd] = result
         if retired_lo == MASK:

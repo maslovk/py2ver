@@ -1,7 +1,7 @@
 # A check of the CPU's machine mode: the CSRs, traps (ecall, ebreak, an
 # illegal instruction, misaligned atomics), the timer interrupt and mret; of
-# user mode: mret into it, an ecall from it; and of loads and stores across a
-# word's end. Prints "OK", or "FAIL n" for the first check that went wrong.
+# user mode: mret into it, an ecall from it; of supervisor mode: a delegated
+# interrupt, an ecall from it; and of loads and stores across a word's end. Prints "OK", or "FAIL n" for the first check that went wrong.
 
     .equ CONSOLE, 0x10000000
     .equ MTIMECMP, 0x11004000
@@ -40,7 +40,7 @@ _start:
     csrr t1, mscratch
     check t1, 6, 7
     csrr t1, misa
-    check t1, 0x40001101, 8          # (32 bits; I, M, A)
+    check t1, 0x40141101, 8          # (32 bits; U, S, M, I, A)
     csrr t1, mhartid
     check t1, 0, 9
 
@@ -105,6 +105,33 @@ in_user:
     and  t1, s4, t0
     check t1, 0x1800, 23             # (MPP in the trap: machine)
 
+    # ---- supervisor mode: a delegated interrupt (STIP, as OpenSBI gives
+    # Linux its timer) taken there, to stvec; an ecall from it (cause 9) to
+    # machine mode; an ebreak back to machine mode ----
+    la   t0, s_handler
+    csrw stvec, t0
+    li   t0, 0x20
+    csrw mideleg, t0                 # (STIP: supervisor mode's)
+    csrw mie, t0                     # (STIE)
+    csrs mip, t0                     # (pending)
+    li   t0, 0x1800
+    csrc mstatus, t0
+    li   t0, 0x0802                  # (MPP: supervisor; SIE)
+    csrs mstatus, t0
+    la   t0, in_supervisor
+    csrw mepc, t0
+    li   s5, 0
+    mret
+in_supervisor:
+    check s5, 0x80000005, 31         # (the interrupt came, to supervisor mode)
+    ecall
+    check s2, 9, 32                  # (an ecall from supervisor mode)
+    ebreak
+    csrw mie, zero
+    csrw mideleg, zero
+    li   t0, 0x20
+    csrc mip, t0
+
     # ---- loads and stores at any address, across a word's end too (bytes
     # 0 to 3: 44 33 22 11, 4 to 7: 88 77 66 55) ----
     li   t0, 0x3000
@@ -134,6 +161,12 @@ in_user:
     la   a0, ok
     call print
     j    stop
+
+s_handler:                           # (supervisor mode's: STIE off in sie, back)
+    csrr s5, scause
+    li   t5, 0x20
+    csrc sie, t5
+    sret
 
 handler:
     csrr s2, mcause

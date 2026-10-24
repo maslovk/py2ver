@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from py2ver import Py2ver
+from py2ver.process import drive
 from py2ver.devices.ili9341 import ILI9341, ILI9341Model
 from py2ver.devices.sdram import SdramModel, SdramTiming
 from py2ver.protocol import SPI, alongside, together
@@ -189,7 +190,7 @@ def test_the_display_shows_the_framebuffer(sim, monkeypatch, tmp_path):
 
 def test_key1_sends_the_pc_where_the_cpu_is(monkeypatch, tmp_path):
     # (traps.S's last loop: KEY1 held, the report sent once, its mcause the
-    # last trap's: an ecall from machine mode)
+    # last trap's: the ebreak back to machine mode from supervisor mode)
     monkeypatch.chdir(tmp_path)
     with contextlib.redirect_stdout(io.StringIO()):
         p = Py2ver(functools.partial(R.rv32ima, image=R.build("traps.S")), R.CPU_ATTR)
@@ -211,7 +212,7 @@ def test_key1_sends_the_pc_where_the_cpu_is(monkeypatch, tmp_path):
     assert report.startswith(b"\n[pc ") and report.endswith(b"]\n") and report.count(b"[pc") == 1
     fields = report.decode().strip("\n[]").split()
     assert fields[0::2] == ["pc", "mcause", "mepc", "mtval"]
-    assert fields[3] == "0000000B"
+    assert fields[3] == "00000003"
 
 
 def test_our_kernel_s_options_take_the_place_of_mini_rv32ima_s():
@@ -232,21 +233,40 @@ def test_the_device_tree_gives_linux_the_sdram():
     assert R.FRAMEBUFFER == 0x81FD0000 and 0x81FD0000 + 240 * 320 * 2 <= L.TREE_AT
 
 
+# (rv32si's dirty: paging's, to come)
+NOT_YET = {"rv32si/dirty"}
+
+
 def _riscv_tests():
     names = []
-    for suite in ("rv32ui", "rv32um", "rv32ua"):
+    for suite in ("rv32ui", "rv32um", "rv32ua", "rv32si"):
         folder = Path(R.RISCV_TESTS) / "isa" / suite
         if folder.is_dir():
-            names += [f"{suite}/{p.stem}" for p in sorted(folder.glob("*.S"))]
+            names += [f"{suite}/{p.stem}" for p in sorted(folder.glob("*.S"))
+                      if f"{suite}/{p.stem}" not in NOT_YET]
     return names
 
 
 @pytest.mark.slow
 @pytest.mark.skipif(not os.path.isdir(R.RISCV_TESTS), reason="needs riscv-tests in ~/opt/riscv")
 @pytest.mark.parametrize("name", _riscv_tests())
-def test_riscv_tests(name, monkeypatch, tmp_path):
-    # (riscv-tests' rv32ui, rv32um, rv32ua: each prints OK, or FAIL and its
-    # failing case; ma_data among them: loads and stores at any address)
+def test_riscv_tests(name):
+    # (riscv-tests' rv32ui, rv32um, rv32ua, rv32si: each prints OK, or FAIL and
+    # its failing case; ma_data among them: loads and stores at any address;
+    # rv32si's in supervisor mode. On the CPU as written, the generator: that
+    # its hardware does the same, test_riscv_tests_in_the_hardware and the
+    # CPU's own programs check)
+    run = drive(functools.partial(R.rv32ima, image=R.riscv_test(name)), R.console(b"\n", limit=300_000),
+                R.CPU_ATTR, limit=400_000)
+    assert run.value == b"OK\n"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(R.RISCV_TESTS), reason="needs riscv-tests in ~/opt/riscv")
+@pytest.mark.parametrize("name", ["rv32ui/add", "rv32ui/ma_data", "rv32ua/lrsc", "rv32si/csr"])
+def test_riscv_tests_in_the_hardware(name, monkeypatch, tmp_path):
+    # (a few, through py2ver's model of the hardware as well: its compiling
+    # takes minutes)
     monkeypatch.chdir(tmp_path)
     printed = _cpu(R.riscv_test(name)).check(R.console(b"\n", limit=300_000), verilog=False).value
     assert printed == b"OK\n"
