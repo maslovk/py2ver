@@ -9,6 +9,7 @@ import pytest
 
 from py2ver import Py2ver
 from py2ver.devices.sdram import SdramModel, SdramTiming
+from py2ver.protocol import alongside, together
 
 # examples/riscv_computer.py: an RV32IMA CPU written as a process, running
 # programs built with the GNU RISC-V toolchain (skipped without one), and
@@ -72,6 +73,86 @@ def test_the_cache_keeps_up_with_stores(stride, sim, monkeypatch, tmp_path):
     printed = _memtest(64, stride, 2, sim, SdramModel())
     assert printed.endswith(b"pass 1: 0 words wrong\npass 2: 0 words wrong\ndone\n")
     assert b"running from the SDRAM: ok\n" in printed
+
+
+def test_the_boot_loader_loads_a_program_and_starts_it(monkeypatch, tmp_path):
+    # (boot.c on the CPU and the SDRAM: a program typed in as a load record,
+    # started by a go record with a1 'Z'; it prints 'K', then a1's low byte;
+    # the console's copy for the PC, its room there, the same as the display's)
+    monkeypatch.chdir(tmp_path)
+    import riscv_linux as L
+    program = b"".join(n.to_bytes(4, "little") for n in (
+        0x100002B7,                      # lui  t0, 0x10000 (the UART)
+        0x04B00313,                      # li   t1, 'K'
+        0x00628023,                      # sb   t1, 0(t0)
+        0x00B28023,                      # sb   a1, 0(t0)
+        0x0000006F))                     # j    .
+    typed = L.load_record(0x80000000, program) + L.go_record(0x80000000, ord("Z"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(R.cpu_with_sdram(R.build("boot.c"), timing=SdramTiming(power_up=20, refresh=60)))
+    chip = SdramModel()
+
+    def copy_for_the_pc(dut):
+        copied = bytearray()
+        while True:
+            dut.jtag_tx_room = 1
+            if dut.jtag_tx_send:
+                copied.append(dut.jtag_tx)
+            yield
+            if copied.endswith(b"KZ"):
+                return bytes(copied)
+
+    def tb(dut):
+        printed, copied = yield from together(R.console(b"KZ", typed, chip=chip)(dut),
+                                              copy_for_the_pc(dut))
+        return printed, copied
+
+    printed, copied = p.check(tb, verilog=False).value
+    assert printed == (b"py2ver RISC-V boot loader: waiting for the PC\n" + L.loaded_line(0x80000000, program)
+                       + b"starting at 80000000\nKZ")
+    assert copied == printed
+    assert [chip.word(k) for k in range(5)] == [int.from_bytes(program[k:k + 4], "little")
+                                                for k in range(0, 20, 4)]
+
+
+@pytest.mark.parametrize("every", [60, None])
+def test_the_pc_s_copy_of_the_console_waits_for_room_while_the_pc_reads(every, monkeypatch, tmp_path):
+    # (a FIFO to the PC of a byte (the board top's has 16), taken from every
+    # 60 clocks: each byte of the copy waiting for room; or never any room: no
+    # one reading, the CPU going on without it)
+    monkeypatch.chdir(tmp_path)
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(functools.partial(R.rv32ima, image=R.build("traps.S"), pc_patience=200),
+                   R.CPU_ATTR)
+
+    copied = bytearray()
+
+    def pc(dut):
+        clock, waiting = 0, 0
+        while True:
+            if dut.jtag_tx_send:
+                copied.append(dut.jtag_tx)
+                waiting += 1
+            if every and clock % every == 0 and waiting:
+                waiting -= 1
+            dut.jtag_tx_room = 1 if every and waiting < 1 else 0
+            clock += 1
+            yield
+
+    def tb(dut):
+        printed = yield from alongside(R.console(b"\n")(dut), pc(dut))
+        return printed
+
+    assert p.check(tb, verilog=False).value == b"OK\n"
+    assert copied == (b"OK\n" if every else b"")
+
+
+def test_the_device_tree_gives_linux_the_sdram():
+    import riscv_linux as L
+    tree = L.device_tree()
+    assert tree[:4] == bytes.fromhex("d00dfeed") and len(tree) % 4 == 0
+    assert L.TREE_AT + len(tree) <= 0x82000000                  # (in the SDRAM's last 16 KB)
+    assert bytes.fromhex("00000000 80000000 00000000 01ffc000") in tree     # (memory: up to it)
 
 
 def _riscv_tests():

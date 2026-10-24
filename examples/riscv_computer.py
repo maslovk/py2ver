@@ -1,9 +1,10 @@
 # A RISC-V computer on the FPGA: a CPU written in Python, running C programs,
 # its console on the ILI9341 display and its keyboard the PC's.
 #
-# The CPU runs RV32IMA with machine mode: the base integer instructions,
-# multiply and divide (M), atomics (A), the CSRs (Zicsr), traps and the timer's
-# interrupt. A clock to fetch an instruction, a clock to decode it and read its
+# The CPU runs RV32IMA with machine and user modes: the base integer
+# instructions, multiply and divide (M), atomics (A), the CSRs (Zicsr), traps
+# and the timer's interrupt (user mode: for Linux's programs, their system calls
+# an ecall from user mode; no memory protection). A clock to fetch an instruction, a clock to decode it and read its
 # registers, a clock or more to carry it out (memory, multiplying, dividing:
 # 32 clocks), a clock to write its result: about 12 million instructions a
 # second. Its memory is mini-rv32ima's (the small RISC-V emulator that boots
@@ -11,8 +12,10 @@
 #
 #   0x0000_0000  RAM, 16 KB: the program, loaded into it from the start (memory blocks)
 #   0x1000_0000  a 16550-style UART: write a character to the screen (terminal.py's
-#                terminal); read one typed on the PC (the JTAG UART); +5, its status
-#                (bit 0: a character came in, bit 5: room to write)
+#                terminal, and the PC's if it listens: the JTAG UART); read one typed
+#                on the PC; +3, its line control (bit 7: the data register sets the
+#                baud rate, ignored); +5, its status (bit 0: a character came in,
+#                bit 5: room to write)
 #   0x1000_1000  write: the 8 LEDs;  0x1000_1004  read: the keys (bits 0, 1; 0 pressed)
 #   0x1100_4000  the timer's mtimecmp (and +4, its upper half): the interrupt at mtime
 #   0x1100_BFF8  mtime (and +4): microseconds since reset
@@ -66,6 +69,8 @@ CACHE_WORDS = 2048
 LINES = CACHE_WORDS // LINE_WORDS
 CACHE_SHIFT = 13                         # (8 KB: the address's bits below 13 choose the word)
 TAG_VALID = 4096
+PC_PATIENCE = 100_000_000                # (2 s: the PC empties the JTAG UART every few ms, but
+#   after a long write to the board, its next read can be a second away)
 MASK = 0xFFFFFFFF                       # (the registers are 32 bits)
 MISA = (1 << 30) | (1 << 12) | (1 << 8) | (1 << 0)    # 32 bits; M, I, A
 
@@ -134,14 +139,15 @@ def take_key(port):
     return got, key
 
 
-def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
+def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
     """The CPU, running from address 0 the memory image `image` (RAM_WORDS words).
 
-    Outputs: the console's characters (tx, tx_valid; tx_ready: taken), the
+    Outputs: the console's characters (tx, tx_valid; tx_ready: taken), and
+    a copy for the PC (jtag_tx, jtag_tx_send; sent while jtag_tx_room); the
     PC keyboard's kb_ready, leds; the SDRAM controller's requests (req,
-    req_write, req_line, req_address, req_data, req_mask). Inputs: tx_ready; the
-    keyboard's kb, kb_valid; keys; mtime_lo, mtime_hi (from machine_timer);
-    the SDRAM controller's req_ready, resp_valid, resp_data.
+    req_write, req_line, req_address, req_data, req_mask). Inputs: tx_ready,
+    jtag_tx_room; the keyboard's kb, kb_valid; keys; mtime_lo, mtime_hi (from
+    machine_timer); the SDRAM controller's req_ready, resp_valid, resp_data.
     """
     port.tx_valid = 0
     port.kb_ready = 0
@@ -152,6 +158,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
     port.req_data = 0
     port.req_mask = 15
     port.req_line = 0
+    port.jtag_tx = 0
+    port.jtag_tx_send = 0
     ram = list(image)                            # the memory, the program in it
     cache = [0] * CACHE_WORDS                    # the SDRAM's cache: its lines' words,
     tags = [0] * LINES                           # and each line's tag (0: holds nothing)
@@ -174,15 +182,22 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
     reservation = 0
     key_waiting = 0                              # a key taken from the PC, not yet read
     waiting_key = 0
+    user = 0                                     # 1: in user mode (Linux's programs), else machine mode
+    user_before = 0                              # mstatus.MPP: the mode before the trap (1: user)
+    divisor_latch = 0                            # the UART's LCR bit 7: writes to its data set the baud rate
+    patience = 0                                 # clocks to wait for room for the PC's copy (0: none listens)
     while True:
-        # ---- the timer's interrupt, if it is due and wanted: a trap now ----
+        # ---- the timer's interrupt, if it is due and wanted: a trap now (in
+        # user mode, whatever mstatus.MIE says) ----
         due = port.mtime_hi > compare_hi or (port.mtime_hi == compare_hi and port.mtime_lo >= compare_lo)
-        if interrupts and (enabled >> 7) & 1 and due:
+        if (interrupts or user) and (enabled >> 7) & 1 and due:
             trap_pc = pc
             cause = 0x80000007
             trap_value = 0
             interrupts_before = interrupts
             interrupts = 0
+            user_before = user
+            user = 0
             pc = ((trap_vector & 0xFFFFFFFC) + (28 if trap_vector & 1 else 0)) & MASK   # (vectored: + 4 x 7)
         # ---- fetch: from the RAM, or from the SDRAM through the cache (on a
         # miss, the line read into it, and the cache looked at again) ----
@@ -404,8 +419,26 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
                     cache[(address >> 2) & (CACHE_WORDS - 1)] = (cached & (MASK ^ bits)) | data
                 yield from sdram_write(port, (address >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
-            elif address == UART:
+            elif address == UART and divisor_latch == 0:
+                # (a copy to the PC over the JTAG UART: while the PC reads it,
+                # waiting for room there, up to pc_patience clocks; the room
+                # not coming, the PC isn't reading: copies are dropped, not
+                # waited for, until there is room again)
+                waited = 0
+                while port.jtag_tx_room == 0 and waited < patience:
+                    yield
+                    waited = waited + 1
+                if port.jtag_tx_room:
+                    port.jtag_tx = b & 255
+                    port.jtag_tx_send = 1
+                    yield
+                    port.jtag_tx_send = 0
+                    patience = pc_patience
+                else:
+                    patience = 0
                 yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
+            elif address == UART + 3:                # (the line control register)
+                divisor_latch = (b >> 7) & 1
             elif address == LEDS:
                 port.leds = b & 255
             elif address == MTIMECMP:
@@ -486,16 +519,18 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 next_pc = trap_pc
                 interrupts = interrupts_before
                 interrupts_before = 1
+                user = user_before               # (to the mode mstatus.MPP names, which is then user's)
+                user_before = 1
             elif (instruction >> 20) == 0:
                 trap = 1
-                trap_cause = 11                  # (ecall from machine mode)
+                trap_cause = 8 if user else 11   # (ecall from user mode: a system call; from machine mode)
             elif (instruction >> 20) == 1:
                 trap = 1
                 trap_cause = 3                   # (ebreak)
         elif op == 0x73:                         # csrrw csrrs csrrc, and with an immediate
             csr = instruction >> 20
             source = (instruction >> 15) & 31 if f3 >= 5 else a
-            mstatus = (interrupts << 3) | (interrupts_before << 7) | (3 << 11)
+            mstatus = (interrupts << 3) | (interrupts_before << 7) | (0 if user_before else 3 << 11)
             old = 0                              # (unknown CSRs: 0, written to no effect)
             if csr == 0x300:
                 old = mstatus
@@ -531,6 +566,7 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
             if csr == 0x300:
                 interrupts = (new >> 3) & 1
                 interrupts_before = (new >> 7) & 1
+                user_before = 1 if (new >> 11) & 3 == 0 else 0  # (MPP: user, or else machine)
             elif csr == 0x304:
                 enabled = new & 0x888
             elif csr == 0x305:
@@ -555,6 +591,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
             trap_value = trap_with
             interrupts_before = interrupts
             interrupts = 0
+            user_before = user
+            user = 0
             next_pc = trap_vector & 0xFFFFFFFC
         pc = next_pc
         yield
@@ -569,11 +607,14 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
             retired_lo = retired_lo + 1
 
 
-CPU_ATTR = {"tx_ready": 1, "kb": 8, "kb_valid": 1, "keys": 2, "mtime_lo": 32, "mtime_hi": 32,
+CPU_ATTR = {"tx_ready": 1, "jtag_tx_room": 1, "kb": 8, "kb_valid": 1, "keys": 2,
+            "mtime_lo": 32, "mtime_hi": 32,
             # (a product of two 33-bit signed numbers: past the 64 bits followed by itself)
             "product": {"width": 66, "signed": 1},
             # (the SDRAM controller's answers)
-            "req_ready": 1, "resp_valid": 1, "resp_data": 32}
+            "req_ready": 1, "resp_valid": 1, "resp_data": 32,
+            # (the clocks waited for room for the PC's copy: up to PC_PATIENCE, 2 s)
+            "waited": 27, "patience": 27}
 
 
 def machine_timer(port, tick=50):
@@ -592,10 +633,12 @@ def machine_timer(port, tick=50):
 
 # ----------------------------- the computer -----------------------------
 
-# On the board: the display's pins, the JTAG UART for the keyboard, the LEDs and
+# On the board: the display's pins, the JTAG UART for the keyboard and a copy of
+# the console, the LEDs and
 # keys, the SDRAM's (the display and the SDRAM both have a cs_n: in the
 # computer, display_cs_n and sdram_cs_n)
 PINS = dict(T.PINS, kb="JTAG_RX_DATA", kb_valid="JTAG_RX_VALID", kb_ready="JTAG_RX_READY",
+            jtag_tx="JTAG_TX_DATA", jtag_tx_send="JTAG_TX_VALID", jtag_tx_room="JTAG_TX_READY",
             leds="LED", keys="KEY")
 for _name in ("rx", "rx_valid", "rx_ready"):    # (the terminal's bytes come from the CPU)
     PINS.pop(_name)

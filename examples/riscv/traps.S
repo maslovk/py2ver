@@ -1,6 +1,7 @@
 # A check of the CPU's machine mode: the CSRs, traps (ecall, ebreak, an
 # illegal instruction, misaligned loads and stores), the timer interrupt and
-# mret. Prints "OK", or "FAIL n" for the first check that went wrong.
+# mret; and of user mode: mret into it, an ecall from it. Prints "OK", or
+# "FAIL n" for the first check that went wrong.
 
     .equ CONSOLE, 0x10000000
     .equ MTIMECMP, 0x11004000
@@ -79,6 +80,31 @@ the_sh:
     andi t1, t1, 8
     check t1, 8, 18                  # (on again after mret)
 
+    # ---- user mode: mret to it (MPP 0); an ecall there is a system call
+    # (mcause 8), and the trap saves user mode in MPP; an ebreak, whose
+    # handler sets MPP to machine mode, comes back to machine mode ----
+    csrci mstatus, 8
+    li   t0, 0x1800
+    csrc mstatus, t0                 # (MPP: user)
+    csrr t1, mstatus
+    and  t1, t1, t0
+    check t1, 0, 19
+    la   t0, in_user
+    csrw mepc, t0
+    mret
+in_user:
+    ecall
+    check s2, 8, 20                  # (an ecall from user mode)
+    li   t0, 0x1800
+    and  t1, s4, t0
+    check t1, 0, 21                  # (MPP in the trap: user)
+    ebreak
+    ecall
+    check s2, 11, 22                 # (machine mode again)
+    li   t0, 0x1800
+    and  t1, s4, t0
+    check t1, 0x1800, 23             # (MPP in the trap: machine)
+
     la   a0, ok
     call print
     j    stop
@@ -86,7 +112,12 @@ the_sh:
 handler:
     csrr s2, mcause
     csrr s3, mtval
-    bltz s2, 1f                      # (an interrupt: go back to the same place)
+    csrr s4, mstatus
+    li   t5, 3                       # (ebreak: back to machine mode)
+    bne  s2, t5, 3f
+    li   t5, 0x1800
+    csrs mstatus, t5
+3:  bltz s2, 1f                      # (an interrupt: go back to the same place)
     csrr t5, mepc                    # (a trap: on to the next instruction)
     addi t5, t5, 4
     csrw mepc, t5
