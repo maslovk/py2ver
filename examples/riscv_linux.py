@@ -213,7 +213,13 @@ OPENSBI_PATCH = """\
 # security modules, profiling, perf, power management, debugfs; the sections
 # 4 MB apart for their protection, STRICT_KERNEL_RWX: 30 MB of image), one
 # hart; the framebuffer, its console and the logo, /dev/mem; the 8250 UART,
-# polled
+# polled.
+# LIBCRC32C is turned off by name: the RISC-V defconfig's file-system modules
+# select it as a module, and that value stays in .config after they are
+# gone. Without modules a module becomes built in, and LIBCRC32C selects
+# crypto again, and with it the random-number generator, whose jitter
+# entropy source tests itself at boot for 80 s on this CPU (the watchdog's
+# soft-lockup warnings).
 MMU_KERNEL_OPTIONS = {
     "CONFIG_SMP": "n", "CONFIG_FPU": "n", "CONFIG_RISCV_ISA_C": "n", "CONFIG_RISCV_ISA_V": "n",
     "CONFIG_RISCV_ISA_ZBB": "n", "CONFIG_RISCV_ISA_ZICBOM": "n", "CONFIG_RISCV_ISA_ZICBOZ": "n",
@@ -225,7 +231,7 @@ MMU_KERNEL_OPTIONS = {
     "CONFIG_AUTOFS_FS": "n", "CONFIG_I2C": "n", "CONFIG_SPI": "n", "CONFIG_HID": "n",
     "CONFIG_HWMON": "n", "CONFIG_THERMAL": "n", "CONFIG_WATCHDOG": "n", "CONFIG_RTC_CLASS": "n",
     "CONFIG_BPF_SYSCALL": "n", "CONFIG_CGROUPS": "n", "CONFIG_NAMESPACES": "n", "CONFIG_CRYPTO": "n",
-    "CONFIG_KEYS": "n", "CONFIG_SECURITY": "n", "CONFIG_PROFILING": "n", "CONFIG_PERF_EVENTS": "n",
+    "CONFIG_LIBCRC32C": "n", "CONFIG_KEYS": "n", "CONFIG_SECURITY": "n", "CONFIG_PROFILING": "n", "CONFIG_PERF_EVENTS": "n",
     "CONFIG_SUSPEND": "n", "CONFIG_CPU_IDLE": "n", "CONFIG_CPU_FREQ": "n", "CONFIG_DEBUG_FS": "n",
     "CONFIG_IKCONFIG": "n", "CONFIG_STRICT_KERNEL_RWX": "n",
     **KERNEL_OPTIONS,

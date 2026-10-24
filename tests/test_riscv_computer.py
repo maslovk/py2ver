@@ -244,6 +244,8 @@ def test_the_mmu_device_tree_and_build_suit_the_cpu():
     options = L.fragment(L.MMU_KERNEL_OPTIONS)
     assert "# CONFIG_RISCV_ISA_C is not set\n" in options and "# CONFIG_EFI is not set\n" in options
     assert "CONFIG_FB_SIMPLE=y\n" in options
+    # (crypto off for good: LIBCRC32C, left on by the defconfig, would select it again)
+    assert "# CONFIG_CRYPTO is not set\n" in options and "# CONFIG_LIBCRC32C is not set\n" in options
 
 
 def test_our_kernel_s_options_take_the_place_of_mini_rv32ima_s():
