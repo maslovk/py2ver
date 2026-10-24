@@ -25,7 +25,8 @@
 # Our own (--build-linux): mini-rv32ima's Buildroot (git clone --recurse-submodules
 # --depth 1 https://github.com/cnlohr/buildroot ~/opt/riscv/buildroot) with its
 # configurations, the kernel's with KERNEL_OPTIONS (the framebuffer, Linux's
-# console and logo on it, /dev/mem); about an hour. Its kernel:
+# console and logo on it, /dev/mem), BusyBox's with BUSYBOX_OPTIONS, the shell
+# on the display too (SHELL_LINE); about an hour the first time. Its kernel:
 # ~/opt/riscv/buildroot/output/images/Image (boot it with --kernel).
 import hashlib
 import os
@@ -79,6 +80,15 @@ KERNEL_OPTIONS = {"CONFIG_FB": "y", "CONFIG_FB_DEVICE": "y", "CONFIG_FB_SIMPLE":
                   "CONFIG_FRAMEBUFFER_CONSOLE": "y", "CONFIG_LOGO": "y",
                   "CONFIG_LOGO_LINUX_CLUT224": "y", "CONFIG_DEVMEM": "y"}
 
+# BusyBox's beyond mini-rv32ima's: script (the shell's words on the display too,
+# see SHELL_LINE), fbset and fbsplash (pictures on /dev/fb0)
+BUSYBOX_OPTIONS = {"CONFIG_SCRIPT": "y", "CONFIG_FBSET": "y", "CONFIG_FBSPLASH": "y"}
+
+# The shell, on the console (the PC's: ttyS0) as in mini-rv32ima's inittab, all
+# it prints also on the display (tty1, the framebuffer's console)
+LOGIN_LINE = "console::respawn:/bin/login -f root"
+SHELL_LINE = "console::respawn:/usr/bin/script -q -c '/bin/login -f root' /dev/tty1"
+
 
 def git_hash(data):
     """A file's git hash (git hash-object's)."""
@@ -105,6 +115,12 @@ def prepare_buildroot(buildroot=BUILDROOT):
             raise ValueError(f"{name}: not the file expected (its git hash {git_hash(data)})")
         if name == "custom_kernel_config":
             data = with_options(data.decode(), KERNEL_OPTIONS).encode()
+        if name == "busybox_config":
+            data = with_options(data.decode(), BUSYBOX_OPTIONS).encode()
+        if name == "rootfsoverlay/etc/inittab":
+            if LOGIN_LINE.encode() not in data:
+                raise ValueError(f"{name}: no line {LOGIN_LINE!r} to change")
+            data = data.replace(LOGIN_LINE.encode(), SHELL_LINE.encode())
         if name == "buildroot_config":       # (the overlay: in the same build)
             overlay = os.path.join(buildroot, "py2ver_overlay")
             data = data.replace(b'BR2_ROOTFS_OVERLAY=""', f'BR2_ROOTFS_OVERLAY="{overlay}"'.encode())
@@ -191,6 +207,8 @@ if __name__ == "__main__":
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))
     if "--build-linux" in args:
         prepare_buildroot()
+        # (BusyBox and the kernel built afresh: their configurations may be new)
+        subprocess.run(["make", "-C", BUILDROOT, "busybox-dirclean", "linux-dirclean"], check=True)
         subprocess.run(["make", "-C", BUILDROOT], check=True)
         print(f"the kernel: {BUILT_KERNEL}")
     if "--boot" in args or "--console" in args:
