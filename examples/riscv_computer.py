@@ -5,8 +5,8 @@
 # integer instructions, multiply and divide (M), atomics (A), the CSRs (Zicsr),
 # traps, delegated to supervisor mode as medeleg and mideleg say, and the
 # timer's interrupt (user mode: for Linux's programs, their system calls an
-# ecall from user mode; supervisor mode: for Linux with an MMU, to come;
-# no memory protection yet). A clock to fetch an instruction, a clock to decode it and read its
+# ecall from user mode; supervisor mode: for Linux with an MMU), and Sv32
+# paging (its page-table entries read for each access: a TLB to come). A clock to fetch an instruction, a clock to decode it and read its
 # registers, a clock or more to carry it out (memory, multiplying, dividing:
 # 32 clocks), a clock to write its result: about 12 million instructions a
 # second. Its memory is mini-rv32ima's (the small RISC-V emulator that boots
@@ -81,6 +81,7 @@ MASK = 0xFFFFFFFF                       # (the registers are 32 bits)
 MISA = (1 << 30) | (1 << 20) | (1 << 18) | (1 << 12) | (1 << 8) | (1 << 0)   # 32 bits; U, S, M, I, A
 SSTATUS = 0x000C0122                     # (sstatus: mstatus's SIE, SPIE, SPP, SUM, MXR)
 MPRV = 1 << 17
+LOAD, STORE, ATOMIC = 1, 2, 3            # (the data loop's accesses)
 
 # ----------------------------- building programs -----------------------------
 
@@ -125,10 +126,12 @@ def build(*sources, includes=(), defines=()):
 RISCV_TESTS = os.path.expanduser("~/opt/riscv/riscv-tests")
 
 
-def riscv_test(name):
+def riscv_test(name, paging=False):
     """One of riscv-tests' programs (rv32ui/add, rv32um/div, rv32ua/amoadd_w...),
-    built with this computer's environment (examples/riscv/env)."""
+    built with this computer's environment (examples/riscv/env); paging: run
+    in user mode with Sv32 paging on."""
     return build(os.path.join(RISCV_TESTS, "isa", name + ".S"),
+                 defines=("PY2VER_PAGING",) if paging else (),
                  includes=(os.path.join(PROGRAMS, "env"), os.path.join(RISCV_TESTS, "env"),
                            os.path.join(RISCV_TESTS, "isa", "macros", "scalar")))
 
@@ -237,26 +240,69 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             yield from tell_pc(port, b"]\n")
         # (the timer's interrupt due: mip.MTIP)
         due = port.mtime_hi > compare_hi or (port.mtime_hi == compare_hi and port.mtime_lo >= compare_lo)
-        # ---- fetch: from the RAM, or from the SDRAM through the cache (on a
-        # miss, the line read into it, and the cache looked at again) ----
+        trap = 0                                 # (1: a trap instead: its cause, its value)
+        trap_cause = 0
+        trap_with = 0
+        # ---- fetch: the instruction at pc, through paging if it's on (below
+        # machine mode, satp's mode Sv32): the page-table entries read first.
+        # A word from the RAM, or from the SDRAM through the cache (on a miss,
+        # the line read into it, and the cache looked at again) ----
+        walk = 2 if satp >> 31 and mode < 3 else 0  # (2: the root's entry next, 1: the leaf's, 0: the word)
+        table = (satp & 0x3FFFFF) << 12
+        physical = pc
         while True:
-            from_ram = ram[(pc >> 2) & (RAM_WORDS - 1)]
-            from_cache = cache[(pc >> 2) & (CACHE_WORDS - 1)]
-            fetch_tag = tags[(pc >> 5) & (LINES - 1)]
-            yield
-            if pc >> 25 != SDRAM >> 25 or fetch_tag == ((pc >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                break
-            yield from sdram_read_line(port, (pc >> 2) & (SDRAM_WORDS - LINE_WORDS))
-            base = (pc >> 2) & (CACHE_WORDS - LINE_WORDS)
-            k = 0
-            while k < LINE_WORDS:
-                yield from wait_until(port, "resp_valid")
-                cache[base + k] = port.resp_data
-                k = k + 1
+            # (fetch_where, not the data loop's where: py2ver gives reads of a
+            # memory at the same address one port, and the fetch's and the
+            # data's must each have their own memory block)
+            if walk == 2:
+                fetch_where = (table + ((pc >> 22) << 2)) & MASK
+            elif walk == 1:
+                fetch_where = (table + (((pc >> 12) & 1023) << 2)) & MASK
+            else:
+                fetch_where = physical
+            while True:
+                from_ram = ram[(fetch_where >> 2) & (RAM_WORDS - 1)]
+                from_cache = cache[(fetch_where >> 2) & (CACHE_WORDS - 1)]
+                fetch_tag = tags[(fetch_where >> 5) & (LINES - 1)]
                 yield
-            tags[(pc >> 5) & (LINES - 1)] = ((pc >> CACHE_SHIFT) & 4095) | TAG_VALID
-            yield
-        instruction = from_cache if pc >> 25 == SDRAM >> 25 else from_ram
+                if fetch_where >> 25 != SDRAM >> 25 or fetch_tag == ((fetch_where >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                    break
+                yield from sdram_read_line(port, (fetch_where >> 2) & (SDRAM_WORDS - LINE_WORDS))
+                base = (fetch_where >> 2) & (CACHE_WORDS - LINE_WORDS)
+                k = 0
+                while k < LINE_WORDS:
+                    yield from wait_until(port, "resp_valid")
+                    cache[base + k] = port.resp_data
+                    k = k + 1
+                    yield
+                tags[(fetch_where >> 5) & (LINES - 1)] = ((fetch_where >> CACHE_SHIFT) & 4095) | TAG_VALID
+                yield
+            fetched = from_cache if fetch_where >> 25 == SDRAM >> 25 else from_ram
+            if walk == 0:
+                break
+            # (a page-table entry: V R W X U G A D in bits 0 to 7, the page's
+            # number above; a leaf (R or X) must allow the fetch: X, U for
+            # user mode, not U for supervisor mode, A; a megapage aligned)
+            leaf = (fetched >> 1) & 1 or (fetched >> 3) & 1
+            user_page = (fetched >> 4) & 1
+            if not fetched & 1 or ((fetched >> 2) & 1 and not (fetched >> 1) & 1) or (not leaf and walk == 1) \
+                    or (leaf and (not (fetched >> 3) & 1 or user_page != (1 if mode == 0 else 0)
+                                  or not (fetched >> 6) & 1 or (walk == 2 and (fetched >> 10) & 1023))):
+                trap = 1                         # (a fetch's page fault)
+                trap_cause = 12
+                trap_with = pc
+                break
+            if leaf and walk == 2:               # (a megapage: 4 MB)
+                physical = (((fetched >> 20) << 22) | (pc & 0x3FFFFF)) & MASK
+                walk = 0
+            elif leaf:
+                physical = (((fetched >> 10) << 12) | (pc & 0xFFF)) & MASK
+                walk = 0
+            else:
+                table = ((fetched >> 10) << 12) & MASK
+                walk = 1
+            yield                                # (a clock before the next read: the entry used, the next asked for)
+        instruction = fetched if not trap else 0x13  # (a fault: a nop, the trap pending)
         # ---- decode: the instruction's fields, the registers it reads ----
         op = instruction & 0x7F
         rd = (instruction >> 7) & 31
@@ -276,9 +322,10 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
         # ---- execute ----
         result = 0
         write = 0                                # (1: rd gets result)
-        trap = 0                                 # (1: a trap instead: its cause, its value)
-        trap_cause = 0
-        trap_with = 0
+        access = 0                               # (a memory access to make: LOAD, STORE, ATOMIC)
+        address = 0                              # (its address, its bytes, an atomic's kind)
+        size = 4
+        kind = 0
         next_pc = (pc + 4) & MASK
         sa = a - ((a >> 31) << 32)               # (a and b as signed numbers)
         sb = b - ((b >> 31) << 32)
@@ -365,218 +412,28 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             else:
                 result = a & y
             write = 1
-        elif op == 0x03:                         # lb lh lw lbu lhu
+        elif op == 0x03:                         # lb lh lw lbu lhu (the data loop's)
+            access = LOAD
             address = (a + imm_i) & MASK
-            # (at any address: one across two words, a word and a half at byte
-            # 3, takes both words, a clock between)
             size = 1 if f3 == 0 or f3 == 4 else (2 if f3 == 1 or f3 == 5 else 4)
-            two = (address & 3) + size > 4
-            at = address                         # (the word read now: the first, then the second)
-            second = 0
-            low = 0
-            while True:
-                value = 0
-                if at < 4 * RAM_WORDS:
-                    word = ram[at >> 2]
-                    yield
-                    value = word
-                elif at >> 25 == SDRAM >> 25:       # (through the cache, as a fetch)
-                    while True:
-                        cached = cache[(at >> 2) & (CACHE_WORDS - 1)]
-                        tag = tags[(at >> 5) & (LINES - 1)]
-                        yield
-                        if tag == ((at >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                            break
-                        yield from sdram_read_line(port, (at >> 2) & (SDRAM_WORDS - LINE_WORDS))
-                        base = (at >> 2) & (CACHE_WORDS - LINE_WORDS)
-                        k = 0
-                        while k < LINE_WORDS:
-                            yield from wait_until(port, "resp_valid")
-                            cache[base + k] = port.resp_data
-                            k = k + 1
-                            yield
-                        tags[(at >> 5) & (LINES - 1)] = ((at >> CACHE_SHIFT) & 4095) | TAG_VALID
-                        yield
-                    value = cached
-                elif at == UART or at == UART_STATUS:
-                    if not key_waiting:          # (a key from the PC, kept until read)
-                        got, key = yield from take_key(port)
-                        key_waiting = got
-                        waiting_key = key
-                    if at == UART:
-                        value = waiting_key if key_waiting else 0
-                        key_waiting = 0
-                    else:
-                        value = (0x60 | key_waiting) << 8 * (UART_STATUS & 3)
-                elif at == KEYS:
-                    value = port.keys
-                elif at == MTIMECMP:
-                    value = compare_lo
-                elif at == MTIMECMP + 4:
-                    value = compare_hi
-                elif at == MTIME:
-                    value = port.mtime_lo
-                elif at == MTIME + 4:
-                    value = port.mtime_hi
-                if not two or second:
-                    break
-                low = value
-                second = 1
-                at = (((address >> 2) + 1) << 2) & MASK
-                yield
-            # (the bytes asked for, at the bottom)
-            if two:
-                part = (((value << 32) | low) >> ((address & 3) * 8)) & MASK
-            else:
-                part = value >> ((address & 3) * 8)
-            if f3 == 0:
-                result = ((part & 255) - (((part >> 7) & 1) << 8)) & MASK
-            elif f3 == 1:
-                result = ((part & 65535) - (((part >> 15) & 1) << 16)) & MASK
-            elif f3 == 4:
-                result = part & 255
-            elif f3 == 5:
-                result = part & 65535
-            else:
-                result = part & MASK
-            write = 1
-        elif op == 0x23:                         # sb sh sw
+        elif op == 0x23:                         # sb sh sw (the data loop's)
+            access = STORE
             address = (a + imm_s) & MASK
-            # (at any address: its bytes, b's lowest at address, in the word
-            # there and, across a word's end, the next; each word's own,
-            # data and byte_mask, written a clock apart)
             size = 1 if f3 == 0 else (2 if f3 == 1 else 4)
-            two = (address & 3) + size > 4
-            spread = (b & (255 if f3 == 0 else (65535 if f3 == 1 else MASK))) << ((address & 3) * 8)
-            spread_mask = ((1 << size) - 1) << (address & 3)
-            data = spread & MASK
-            byte_mask = spread_mask & 15
-            at = address
-            second = 0
-            while True:
-                bits = ((byte_mask & 1) * 0xFF) | (((byte_mask >> 1) & 1) * 0xFF00) \
-                    | (((byte_mask >> 2) & 1) * 0xFF0000) | ((byte_mask >> 3) * 0xFF000000)
-                if at < 4 * RAM_WORDS:
-                    k = at >> 2
-                    if byte_mask == 15:
-                        ram[k] = data
-                    else:                        # (some bytes: into the word around them)
-                        word = ram[k]
-                        yield
-                        ram[k] = (word & (MASK ^ bits)) | data
-                elif at >> 25 == SDRAM >> 25:
-                    # (written through: to the SDRAM, just those bytes, and
-                    # into the cache if the line is there)
-                    cached = cache[(at >> 2) & (CACHE_WORDS - 1)]
-                    tag = tags[(at >> 5) & (LINES - 1)]
-                    yield
-                    if tag == ((at >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                        cache[(at >> 2) & (CACHE_WORDS - 1)] = (cached & (MASK ^ bits)) | data
-                    yield from sdram_write(port, (at >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
-                if not two or second:
-                    break
-                second = 1
-                at = (((address >> 2) + 1) << 2) & MASK
-                data = spread >> 32
-                byte_mask = spread_mask >> 4
-                yield
-            if address < 4 * RAM_WORDS or address >> 25 == SDRAM >> 25:
-                pass                             # (the memory's: done)
-            elif address == UART and divisor_latch == 0:
-                # (a copy to the PC over the JTAG UART: while the PC reads it,
-                # waiting for room there, up to pc_patience clocks; the room
-                # not coming, the PC isn't reading: copies are dropped, not
-                # waited for, until there is room again)
-                waited = 0
-                while port.jtag_tx_room == 0 and waited < patience:
-                    yield
-                    waited = waited + 1
-                if port.jtag_tx_room:
-                    port.jtag_tx = b & 255
-                    port.jtag_tx_send = 1
-                    yield
-                    port.jtag_tx_send = 0
-                    patience = pc_patience
-                else:
-                    patience = 0
-                yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
-            elif address == UART + 3:                # (the line control register)
-                divisor_latch = (b >> 7) & 1
-            elif address == LEDS:
-                port.leds = b & 255
-            elif address == MTIMECMP:
-                compare_lo = b
-            elif address == MTIMECMP + 4:
-                compare_hi = b
-            elif address == SYSCON and b == 0x5555:
-                while True:                      # (powered off)
-                    yield
-            elif address == SYSCON and b == 0x7777:
-                next_pc = 0                      # (restart)
-        elif op == 0x2F:                         # lr.w sc.w amo*.w
+        elif op == 0x2F:                         # lr.w sc.w amo*.w (the data loop's)
             address = a
-            k = (address >> 2) & (RAM_WORDS - 1)
-            in_sdram = address >> 25 == SDRAM >> 25
-            sdram_word = (address >> 2) & (SDRAM_WORDS - 1)
+            size = 4
             kind = instruction >> 27
             if address & 3:
                 trap = 1
                 trap_cause = 6
                 trap_with = address
-            elif kind == 3:                      # sc.w: done if lr.w's reservation is still here
-                if reserved and reservation == address:
-                    if in_sdram:                 # (written through, as a store)
-                        tag = tags[(address >> 5) & (LINES - 1)]
-                        yield
-                        if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                            cache[(address >> 2) & (CACHE_WORDS - 1)] = b
-                        yield from sdram_write(port, sdram_word, b)
-                    else:
-                        ram[k] = b
-                    result = 0
-                else:
-                    result = 1
+            elif kind == 3 and not (reserved and reservation == address):
+                result = 1                       # (sc.w: lr.w's reservation gone, nothing written)
+                write = 1
                 reserved = 0
             else:
-                if in_sdram:
-                    # (from the SDRAM itself: every store goes there, so it
-                    # holds what the cache does)
-                    word = yield from sdram_read(port, sdram_word)
-                else:
-                    word = ram[k]
-                    yield
-                result = word
-                if kind == 2:                    # lr.w
-                    reserved = 1
-                    reservation = address
-                else:
-                    sw = word - ((word >> 31) << 32)
-                    new = b                      # (amoswap)
-                    if kind == 0:
-                        new = (word + b) & MASK
-                    elif kind == 4:
-                        new = word ^ b
-                    elif kind == 12:
-                        new = word & b
-                    elif kind == 8:
-                        new = word | b
-                    elif kind == 16:
-                        new = word if sw < sb else b
-                    elif kind == 20:
-                        new = word if sw > sb else b
-                    elif kind == 24:
-                        new = word if word < b else b
-                    elif kind == 28:
-                        new = word if word > b else b
-                    if in_sdram:                 # (written through, as a store)
-                        tag = tags[(address >> 5) & (LINES - 1)]
-                        yield
-                        if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                            cache[(address >> 2) & (CACHE_WORDS - 1)] = new
-                        yield from sdram_write(port, sdram_word, new)
-                    else:
-                        ram[k] = new
-            write = 1 - trap
+                access = ATOMIC
         elif op == 0x73 and f3 == 0:             # ecall ebreak mret sret wfi sfence.vma
             function = instruction >> 20
             tvm = (status_bits >> 20) & 1
@@ -746,6 +603,232 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             trap = 1
             trap_cause = 2
             trap_with = instruction
+        # ---- the data: a load's, a store's or an atomic's words (two, across
+        # a word's end: a word and a half at byte 3), each through paging if
+        # it's on (below machine mode, or with MPRV MPP's; satp's mode Sv32),
+        # its page-table entries read first; then the word read (from the RAM,
+        # the SDRAM through the cache, a device's register) and, a write, its
+        # bytes written into it (the SDRAM's line read into the cache first if
+        # it isn't there; the SDRAM written through). An atomic: the word
+        # read, then its new value written ----
+        if access:
+            effective = mode_before if status_bits & MPRV and mode == 3 else mode
+            paging = satp >> 31 and effective < 3
+            # (stores and atomics but lr.w: the page's W, D; the rest its R,
+            # or X with MXR)
+            storing = access == STORE or (access == ATOMIC and kind != 2)
+            spread = (b & (255 if size == 1 else (65535 if size == 2 else MASK))) << ((address & 3) * 8)
+            spread_mask = ((1 if size == 1 else (3 if size == 2 else 15)) << (address & 3)) & 127
+            two = (address & 3) + size > 4
+            data = spread & MASK
+            byte_mask = spread_mask & 15
+            writing = access == STORE or (access == ATOMIC and kind == 3)   # (sc.w: a write alone)
+            at = address                         # (the word now: the first, then the second)
+            second = 0
+            low = 0
+            walk = 2 if paging else 0
+            table = (satp & 0x3FFFFF) << 12
+            physical = at
+            while True:
+                # (a clock first: each turn starts from one state, however the
+                # last ended; else py2ver makes the turn's start once for each)
+                yield
+                done = 0
+                if walk == 2:
+                    where = (table + ((at >> 22) << 2)) & MASK
+                elif walk == 1:
+                    where = (table + (((at >> 12) & 1023) << 2)) & MASK
+                else:
+                    where = physical
+                # ---- the word read, whatever comes next: a page-table entry,
+                # the data, or the word a write goes into (the SDRAM's line in
+                # the cache then; a device's register only for a load) ----
+                value = 0
+                if where < 4 * RAM_WORDS:
+                    word = ram[where >> 2]
+                    yield
+                    value = word
+                elif where >> 25 == SDRAM >> 25:
+                    while True:
+                        cached = cache[(where >> 2) & (CACHE_WORDS - 1)]
+                        tag = tags[(where >> 5) & (LINES - 1)]
+                        yield
+                        if tag == ((where >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                            break
+                        yield from sdram_read_line(port, (where >> 2) & (SDRAM_WORDS - LINE_WORDS))
+                        base = (where >> 2) & (CACHE_WORDS - LINE_WORDS)
+                        k = 0
+                        while k < LINE_WORDS:
+                            yield from wait_until(port, "resp_valid")
+                            cache[base + k] = port.resp_data
+                            k = k + 1
+                            yield
+                        tags[(where >> 5) & (LINES - 1)] = ((where >> CACHE_SHIFT) & 4095) | TAG_VALID
+                        yield
+                    value = cached
+                elif walk == 0 and not writing and (where == UART or where == UART_STATUS):
+                    if not key_waiting:          # (a key from the PC, kept until read)
+                        got, key = yield from take_key(port)
+                        key_waiting = got
+                        waiting_key = key
+                    if where == UART:
+                        value = waiting_key if key_waiting else 0
+                        key_waiting = 0
+                    else:
+                        value = (0x60 | key_waiting) << 8 * (UART_STATUS & 3)
+                elif walk == 0 and not writing and where == KEYS:
+                    value = port.keys
+                elif walk == 0 and not writing and where == MTIMECMP:
+                    value = compare_lo
+                elif walk == 0 and not writing and where == MTIMECMP + 4:
+                    value = compare_hi
+                elif walk == 0 and not writing and where == MTIME:
+                    value = port.mtime_lo
+                elif walk == 0 and not writing and where == MTIME + 4:
+                    value = port.mtime_hi
+                # (what's done with the word: in one state, after a clock,
+                # however the read ended; else py2ver makes it once for each)
+                yield
+                if walk:
+                    # (a page-table entry: V R W X U G A D in bits 0 to 7, the
+                    # page's number above; a leaf (R or X) must allow the
+                    # access: W and D storing, else R or X with MXR; U for user
+                    # mode, for supervisor mode not U unless SUM; A; a
+                    # megapage aligned)
+                    leaf = (value >> 1) & 1 or (value >> 3) & 1
+                    allowed = (value >> 2) & 1 and (value >> 7) & 1 if storing \
+                        else (value >> 1) & 1 or (status_bits >> 19 & 1 and (value >> 3) & 1)
+                    user_page = (value >> 4) & 1
+                    user_allowed = user_page if effective == 0 else (not user_page or status_bits >> 18 & 1)
+                    if not value & 1 or ((value >> 2) & 1 and not (value >> 1) & 1) \
+                            or (not leaf and walk == 1) \
+                            or (leaf and (not allowed or not user_allowed or not (value >> 6) & 1
+                                          or (walk == 2 and (value >> 10) & 1023))):
+                        trap = 1                 # (a load's page fault, or a store's or an atomic's)
+                        trap_cause = 15 if storing else 13
+                        trap_with = at
+                        done = 1
+                    elif leaf and walk == 2:     # (a megapage: 4 MB)
+                        physical = (((value >> 20) << 22) | (at & 0x3FFFFF)) & MASK
+                        walk = 0
+                    elif leaf:
+                        physical = (((value >> 10) << 12) | (at & 0xFFF)) & MASK
+                        walk = 0
+                    else:
+                        table = ((value >> 10) << 12) & MASK
+                        walk = 1
+                elif writing:
+                    # ---- a word written: data's bytes that byte_mask chooses,
+                    # into the word read (the RAM's, or the cache's; the SDRAM
+                    # written through), or a device's register ----
+                    bits = ((byte_mask & 1) * 0xFF) | (((byte_mask >> 1) & 1) * 0xFF00) \
+                        | (((byte_mask >> 2) & 1) * 0xFF0000) | ((byte_mask >> 3) * 0xFF000000)
+                    merged = (value & (MASK ^ bits)) | data
+                    if where < 4 * RAM_WORDS:
+                        ram[where >> 2] = merged
+                    elif where >> 25 == SDRAM >> 25:
+                        cache[(where >> 2) & (CACHE_WORDS - 1)] = merged
+                        yield from sdram_write(port, (where >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
+                    elif where == UART and divisor_latch == 0:
+                        # (a copy to the PC over the JTAG UART: while the PC reads it,
+                        # waiting for room there, up to pc_patience clocks; the room
+                        # not coming, the PC isn't reading: copies are dropped, not
+                        # waited for, until there is room again)
+                        waited = 0
+                        while port.jtag_tx_room == 0 and waited < patience:
+                            yield
+                            waited = waited + 1
+                        if port.jtag_tx_room:
+                            port.jtag_tx = b & 255
+                            port.jtag_tx_send = 1
+                            yield
+                            port.jtag_tx_send = 0
+                            patience = pc_patience
+                        else:
+                            patience = 0
+                        yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
+                    elif where == UART + 3:      # (the line control register)
+                        divisor_latch = (b >> 7) & 1
+                    elif where == LEDS:
+                        port.leds = b & 255
+                    elif where == MTIMECMP:
+                        compare_lo = b
+                    elif where == MTIMECMP + 4:
+                        compare_hi = b
+                    elif where == SYSCON and b == 0x5555:
+                        while True:              # (powered off)
+                            yield
+                    elif where == SYSCON and b == 0x7777:
+                        next_pc = 0              # (restart)
+                    yield                        # (the same, after a write)
+                    if access == ATOMIC:
+                        if kind == 3:            # (sc.w: done)
+                            result = 0
+                            reserved = 0
+                        done = 1
+                    elif two and not second:     # (a store's first word: then the second)
+                        second = 1
+                        at = (((address >> 2) + 1) << 2) & MASK
+                        data = spread >> 32
+                        byte_mask = spread_mask >> 4
+                        walk = 2 if paging else 0
+                        table = (satp & 0x3FFFFF) << 12
+                        physical = at
+                    else:
+                        done = 1
+                elif access == ATOMIC:
+                    result = value
+                    if kind == 2:                # (lr.w: reserved)
+                        reserved = 1
+                        reservation = address
+                        done = 1
+                    else:                        # (then the new value written)
+                        sw = value - ((value >> 31) << 32)
+                        data = b                 # (amoswap)
+                        if kind == 0:
+                            data = (value + b) & MASK
+                        elif kind == 4:
+                            data = value ^ b
+                        elif kind == 12:
+                            data = value & b
+                        elif kind == 8:
+                            data = value | b
+                        elif kind == 16:
+                            data = value if sw < sb else b
+                        elif kind == 20:
+                            data = value if sw > sb else b
+                        elif kind == 24:
+                            data = value if value < b else b
+                        elif kind == 28:
+                            data = value if value > b else b
+                        writing = 1
+                elif two and not second:         # (a load's first word: then the second)
+                    low = value
+                    second = 1
+                    at = (((address >> 2) + 1) << 2) & MASK
+                    walk = 2 if paging else 0
+                    table = (satp & 0x3FFFFF) << 12
+                    physical = at
+                else:
+                    done = 1
+                if done:
+                    break
+            if access == LOAD:                   # (the bytes asked for, at the bottom)
+                if two:
+                    part = (((value << 32) | low) >> ((address & 3) * 8)) & MASK
+                else:
+                    part = value >> ((address & 3) * 8)
+                if f3 == 0:
+                    result = ((part & 255) - (((part >> 7) & 1) << 8)) & MASK
+                elif f3 == 1:
+                    result = ((part & 65535) - (((part >> 15) & 1) << 16)) & MASK
+                elif f3 == 4:
+                    result = part & 255
+                elif f3 == 5:
+                    result = part & 65535
+                else:
+                    result = part & MASK
+            write = access != STORE
         yield
         # ---- the instruction's end, a clock of its own (one state for every
         # instruction: the trap's logic and the register file's write made once,

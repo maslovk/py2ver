@@ -9,11 +9,14 @@
 // riscv-tests' own environment runs it: its stvec_handler, if it has one,
 // given the traps it makes (a user ecall, a breakpoint, a misaligned fetch,
 // page faults), and SSIP and STIP delegated. A trap that reaches machine mode
-// unasked prints "TRAP" and its cause, as a letter (A: 0, B: 1, ...).
+// goes to the test's mtvec_handler if it has one; unasked, it prints "TRAP"
+// and its cause, as a letter (A: 0, B: 1, ...). DRAM_BASE is 0: the RAM.
 #ifndef PY2VER_RISCV_TEST_H
 #define PY2VER_RISCV_TEST_H
 
 #include "encoding.h"                     // (riscv-tests' own: the CSRs' bits, the causes)
+#undef DRAM_BASE
+#define DRAM_BASE 0                         // (where a test is: this computer's RAM)
 
 #define RVTEST_RV32U
 #define RVTEST_RV64U
@@ -26,6 +29,35 @@
 
 #define PY2VER_PUT(c) li t1, c; sb t1, 0(t0);
 
+// With PY2VER_PAGING, the test runs in user mode with Sv32 paging on: the
+// root table at 0x2000, a leaf table at 0x3000 giving the RAM's four 4 KB
+// pages their own addresses (U R W X A D), and the UART's 4 MB its own (U R W
+// A D); the test, its code and data, below 0x2000.
+#ifdef PY2VER_PAGING
+#define PY2VER_PAGED                                                    \
+        li t1, 0x2000;                          /* the root table */    \
+        li t2, (0x3000 >> 12 << 10) | PTE_V;    /* its 0: the leaf table */ \
+        sw t2, 0(t1);                                                   \
+        li t2, (0x10000000 >> 12 << 10) | PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D; \
+        sw t2, (0x10000000 >> 22 << 2)(t1);     /* the UART's megapage */ \
+        li t1, 0x3000;                          /* the leaf table */    \
+        li t2, PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D;    \
+        sw t2, 0(t1);                                                   \
+        li t3, 1 << 10;                                                 \
+        add t2, t2, t3;                                                 \
+        sw t2, 4(t1);                                                   \
+        add t2, t2, t3;                                                 \
+        sw t2, 8(t1);                                                   \
+        add t2, t2, t3;                                                 \
+        sw t2, 12(t1);                                                  \
+        li t1, SATP32_MODE | (0x2000 >> 12);                            \
+        csrw satp, t1;                                                  \
+        sfence.vma;                                                     \
+        li t0, 0;                               /* MPP: user */
+#else
+#define PY2VER_PAGED
+#endif
+
 #define RVTEST_CODE_BEGIN                                               \
         .section .text.start;                                           \
         .align 2;                                                       \
@@ -34,6 +66,7 @@ _start:                                                                 \
         la t0, py2ver_trap;                                             \
         csrw mtvec, t0;                                                 \
         li TESTNUM, 0;                                                  \
+        .weak mtvec_handler;                                            \
         .ifdef py2ver_supervisor;                                       \
         .weak stvec_handler;                                            \
         la t0, stvec_handler;                                           \
@@ -43,14 +76,20 @@ _start:                                                                 \
         li t0, (1 << 1) | (1 << 5);                                     \
         csrw mideleg, t0;                                               \
         li t0, 1 << 11;                         /* MPP: supervisor */   \
-        csrw mstatus, t0;                                               \
+        .else;                                                          \
+        li t0, 3 << 11;                         /* MPP: machine */      \
+        .endif;                                                         \
+        PY2VER_PAGED                                                    \
+        csrw mstatus, t0;                       /* (and after mret: MPP user, as riscv-tests' own) */ \
         la t0, py2ver_test;                                             \
         csrw mepc, t0;                                                  \
         mret;                                                           \
-        .endif;                                                         \
-        j py2ver_test;                                                  \
         .align 2;                                                       \
-py2ver_trap:                                                            \
+py2ver_trap:                            /* (the test's own, if it has one) */ \
+        la t5, mtvec_handler;                                           \
+        beqz t5, py2ver_unasked;                                        \
+        jr t5;                                                          \
+py2ver_unasked:                                                         \
         li t0, 0x10000000;                                              \
         PY2VER_PUT('T') PY2VER_PUT('R') PY2VER_PUT('A') PY2VER_PUT('P') \
         PY2VER_PUT(' ')                                                 \

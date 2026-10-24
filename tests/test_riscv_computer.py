@@ -233,8 +233,7 @@ def test_the_device_tree_gives_linux_the_sdram():
     assert R.FRAMEBUFFER == 0x81FD0000 and 0x81FD0000 + 240 * 320 * 2 <= L.TREE_AT
 
 
-# (rv32si's dirty: paging's, to come)
-NOT_YET = {"rv32si/dirty"}
+NOT_YET = set()
 
 
 def _riscv_tests():
@@ -258,6 +257,20 @@ def test_riscv_tests(name):
     # CPU's own programs check)
     run = drive(functools.partial(R.rv32ima, image=R.riscv_test(name)), R.console(b"\n", limit=300_000),
                 R.CPU_ATTR, limit=400_000)
+    assert run.value == b"OK\n"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.isdir(R.RISCV_TESTS), reason="needs riscv-tests in ~/opt/riscv")
+@pytest.mark.parametrize("name", [n for n in _riscv_tests() if not n.startswith("rv32si/")])
+def test_riscv_tests_with_paging(name):
+    # (each user-mode test again, in user mode with Sv32 paging on: every
+    # fetch, load and store through a two-level walk; the page tables at
+    # 0x2000 and 0x3000, the test below them)
+    image = R.riscv_test(name, paging=True)
+    assert not any(image[0x2000 // 4:])
+    run = drive(functools.partial(R.rv32ima, image=image), R.console(b"\n", limit=1_000_000),
+                R.CPU_ATTR, limit=1_200_000)
     assert run.value == b"OK\n"
 
 
