@@ -55,8 +55,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import terminal as T  # noqa: E402
 from py2ver import connect  # noqa: E402
 from py2ver.devices.sdram import (LINE_WORDS, SDRAM_ATTR, SDRAM_PINS, TIMING,  # noqa: E402
-                                  WORDS as SDRAM_WORDS, sdram_controller, sdram_read,
-                                  sdram_read_line, sdram_write)
+                                  WORDS as SDRAM_WORDS, sdram_controller, sdram_read_line,
+                                  sdram_write)
 from py2ver.protocol import (alongside, jtag_print, jtag_print_hex, stream_send,  # noqa: E402
                              wait_until)
 

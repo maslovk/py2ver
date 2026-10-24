@@ -308,6 +308,19 @@ def test_a_testbench_s_assert_says_its_clock():
         process.drive(U.echo(), forever, limit=50)
 
 
+def test_a_long_run_need_not_be_recorded():
+    # (record=False: the same run, its value and clocks, none of its rows kept)
+    def tb(dut):
+        dut.rx = 1
+        yield 250
+        return dut.valid
+
+    kept = process.drive(U.echo(), tb)
+    light = process.drive(U.echo(), tb, record=False)
+    assert light.value == kept.value and light.clocks == kept.clocks == len(kept.outputs) == 250
+    assert light.inputs == [] and light.outputs == []
+
+
 def test_a_testbench_stuck_in_together_says_which_step():
     def never(dut):
         yield from wait_until(dut, "error")            # (the echo's error: never)

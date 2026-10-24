@@ -231,6 +231,21 @@ def test_a_page_mapped_elsewhere_reads_the_new_page_after_sfence_vma(model, monk
     assert printed == b"OK\n"
 
 
+def test_the_mmu_device_tree_and_build_suit_the_cpu():
+    import riscv_linux as L
+    tree = L.device_tree("linux_mmu.dts", room=4096)
+    assert tree[:4] == bytes.fromhex("d00dfeed") and L.TREE_AT + len(tree) <= 0x82000000
+    assert b"riscv,sv32" in tree and b"rv32ima_zicsr_zifencei" in tree and b"ns16550a" in tree
+    config = L.MMU_CONFIG.format(overlay="o", kernel_options="k", busybox_options="b", patches="p")
+    assert "# BR2_RISCV_ISA_RVC is not set" in config and "PLATFORM_RISCV_ISA=rv32ima_zicsr_zifencei" in config
+    # (OpenSBI must take the device tree's address from us: see OPENSBI_PATCH)
+    assert "FW_JUMP_FDT_ADDR=0x81FFC000" in config and 'BR2_GLOBAL_PATCH_DIR="p"' in config
+    assert "+FW_JUMP_FDT_ADDR?=" in L.OPENSBI_PATCH
+    options = L.fragment(L.MMU_KERNEL_OPTIONS)
+    assert "# CONFIG_RISCV_ISA_C is not set\n" in options and "# CONFIG_EFI is not set\n" in options
+    assert "CONFIG_FB_SIMPLE=y\n" in options
+
+
 def test_our_kernel_s_options_take_the_place_of_mini_rv32ima_s():
     import riscv_linux as L
     assert L.git_hash(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"   # (git's own)

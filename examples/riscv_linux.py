@@ -15,6 +15,8 @@
 #   python examples/riscv_linux.py --console   # the console of a board already running Linux
 #   python examples/riscv_linux.py --boot --kernel PATH # another kernel (our own, say)
 #   python examples/riscv_linux.py --build-linux        # our own kernel and BusyBox (Buildroot)
+#   python examples/riscv_linux.py --build-linux-mmu    # Linux with the MMU, and OpenSBI
+#   python examples/riscv_linux.py --boot --mmu         # (the board programmed) boot it
 #
 # (Log in as root, no password. juart-terminal, in Quartus's bin directory, is a
 # console too.)
@@ -28,6 +30,13 @@
 # console and logo on it, /dev/mem), BusyBox's with BUSYBOX_OPTIONS, the shell
 # on the display too (SHELL_LINE); about an hour the first time. Its kernel:
 # ~/opt/riscv/buildroot/output/images/Image (boot it with --kernel).
+#
+# With the MMU (--build-linux-mmu): the same Buildroot, into its output-mmu
+# folder, with MMU_CONFIG: glibc, built for RV32IMA (no C, no floating point:
+# the CPU's), Linux in supervisor mode with Sv32 paging (MMU_KERNEL_OPTIONS),
+# OpenSBI in machine mode under it (its generic platform, fw_jump); BusyBox,
+# the overlay, as before. --boot --mmu loads OpenSBI (to 0x8000_0000), the
+# kernel (0x8040_0000) and linux_mmu.dts, and starts OpenSBI.
 import hashlib
 import os
 import urllib.request
@@ -44,16 +53,22 @@ import riscv_computer as R  # noqa: E402
 KERNEL = os.environ.get("LINUX_IMAGE", os.path.expanduser("~/opt/riscv/linux/image/Image"))
 BUILDROOT = os.environ.get("BUILDROOT", os.path.expanduser("~/opt/riscv/buildroot"))
 BUILT_KERNEL = os.path.join(BUILDROOT, "output", "images", "Image")
+MMU_OUTPUT = os.path.join(BUILDROOT, "output-mmu")
+MMU_KERNEL = os.path.join(MMU_OUTPUT, "images", "Image")
+MMU_FIRMWARE = os.path.join(MMU_OUTPUT, "images", "fw_jump.bin")
 KERNEL_AT = 0x80000000
+FIRMWARE_AT = 0x80000000                 # (with the MMU: OpenSBI here,
+MMU_KERNEL_AT = 0x80400000               # the kernel here, 4 MB on: Sv32's megapage)
 TREE_AT = 0x81FFC000                     # (after the memory linux.dts gives Linux)
 
 
-def device_tree():
-    """linux.dts compiled (dtc), its length made a multiple of 4."""
+def device_tree(source="linux.dts", room=0):
+    """A device tree (examples/riscv's source) compiled (dtc), room bytes spare
+    in it (for what OpenSBI adds), its length made a multiple of 4."""
     with tempfile.TemporaryDirectory() as work:
-        out = os.path.join(work, "linux.dtb")
-        subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-o", out,
-                        os.path.join(R.PROGRAMS, "linux.dts")], check=True)
+        out = os.path.join(work, "tree.dtb")
+        subprocess.run(["dtc", "-q", "-I", "dts", "-O", "dtb", "-p", str(room), "-o", out,
+                        os.path.join(R.PROGRAMS, source)], check=True)
         tree = open(out, "rb").read()
     return tree + bytes(-len(tree) % 4)
 
@@ -129,6 +144,138 @@ def prepare_buildroot(buildroot=BUILDROOT):
         open(path, "wb").write(data)
         if name == "uclibc_config":           # (its fragment too, as mini-rv32ima's Makefile)
             open(os.path.join(buildroot, "uclibc_config_extra"), "wb").write(data)
+
+
+# ----------------------------- Linux with the MMU -----------------------------
+
+# Buildroot's configuration (from qemu_riscv32_virt_defconfig): the CPU's ISA
+# exactly (RV32IMA, ilp32: no C, no floating point), glibc, Linux 6.8-rc1 (its
+# rv32 defconfig, with MMU_KERNEL_OPTIONS), OpenSBI's generic platform built
+# for the same ISA (fw_jump: the kernel at 0x8040_0000, the device tree at
+# TREE_AT: see OPENSBI_PATCH), the root an initramfs in the kernel; {overlay},
+# {kernel_options}, {busybox_options}, {patches}: their files and folders
+MMU_CONFIG = """\
+BR2_riscv=y
+BR2_riscv_custom=y
+BR2_RISCV_ISA_RVI=y
+BR2_RISCV_ISA_RVM=y
+BR2_RISCV_ISA_RVA=y
+# BR2_RISCV_ISA_RVF is not set
+# BR2_RISCV_ISA_RVD is not set
+# BR2_RISCV_ISA_RVC is not set
+BR2_RISCV_32=y
+BR2_RISCV_ABI_ILP32=y
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+BR2_KERNEL_HEADERS_AS_KERNEL=y
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_5=y
+BR2_TARGET_GENERIC_HOSTNAME="py2ver"
+BR2_ROOTFS_OVERLAY="{overlay}"
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.8-rc1"
+BR2_LINUX_KERNEL_DEFCONFIG="rv32"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="{kernel_options}"
+BR2_LINUX_KERNEL_IMAGE=y
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="{busybox_options}"
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_INITRAMFS=y
+# BR2_TARGET_ROOTFS_TAR is not set
+BR2_TARGET_OPENSBI=y
+BR2_TARGET_OPENSBI_PLAT="generic"
+BR2_TARGET_OPENSBI_ADDITIONAL_VARIABLES="PLATFORM_RISCV_ISA=rv32ima_zicsr_zifencei PLATFORM_RISCV_ABI=ilp32 \
+FW_TEXT_START=0x80000000 FW_JUMP_ADDR=0x80400000 FW_JUMP_FDT_ADDR=0x81FFC000"
+BR2_GLOBAL_PATCH_DIR="{patches}"
+"""
+
+# OpenSBI's generic platform sets FW_JUMP_FDT_ADDR (0x8220_0000 on RV32: past
+# our 32 MB) whatever Buildroot passes it (in the environment, which a
+# makefile's assignment overrides): this patch lets ours stand
+OPENSBI_PATCH = """\
+--- a/platform/generic/objects.mk
++++ b/platform/generic/objects.mk
+@@ -32,7 +32,7 @@
+   # This needs to be 2MB aligned for 64-bit system
+   FW_JUMP_ADDR=$(shell printf "0x%X" $$(($(FW_TEXT_START) + 0x200000)))
+ endif
+-FW_JUMP_FDT_ADDR=$(shell printf "0x%X" $$(($(FW_TEXT_START) + 0x2200000)))
++FW_JUMP_FDT_ADDR?=$(shell printf "0x%X" $$(($(FW_TEXT_START) + 0x2200000)))
+ FW_PAYLOAD=y
+ ifeq ($(PLATFORM_RISCV_XLEN), 32)
+   # This needs to be 4MB aligned for 32-bit system
+"""
+
+# The kernel's options beyond rv32's defconfig: what the CPU hasn't (floating
+# point, the C extension, vectors, Zbb, the cache operations, Svnapot, Svpbmt;
+# EFI, whose image begins with a compressed instruction), what the board
+# hasn't (PCI, USB, sound, a network, DRM, MMC, virtio; disks and their file
+# systems: the root an initramfs; I2C, SPI, HID, sensors, a watchdog, a
+# clock), what 32 MB can't spare (BPF, cgroups, namespaces, crypto, keys,
+# security modules, profiling, perf, power management, debugfs; the sections
+# 4 MB apart for their protection, STRICT_KERNEL_RWX: 30 MB of image), one
+# hart; the framebuffer, its console and the logo, /dev/mem; the 8250 UART,
+# polled
+MMU_KERNEL_OPTIONS = {
+    "CONFIG_SMP": "n", "CONFIG_FPU": "n", "CONFIG_RISCV_ISA_C": "n", "CONFIG_RISCV_ISA_V": "n",
+    "CONFIG_RISCV_ISA_ZBB": "n", "CONFIG_RISCV_ISA_ZICBOM": "n", "CONFIG_RISCV_ISA_ZICBOZ": "n",
+    "CONFIG_RISCV_ISA_SVNAPOT": "n", "CONFIG_RISCV_ISA_SVPBMT": "n", "CONFIG_EFI": "n",
+    "CONFIG_MODULES": "n", "CONFIG_PCI": "n", "CONFIG_USB_SUPPORT": "n", "CONFIG_SOUND": "n",
+    "CONFIG_NET": "n", "CONFIG_DRM": "n", "CONFIG_MMC": "n", "CONFIG_VIRTIO_MENU": "n",
+    "CONFIG_BLOCK": "n", "CONFIG_MTD": "n", "CONFIG_SCSI": "n", "CONFIG_ATA": "n", "CONFIG_MD": "n",
+    "CONFIG_EXT4_FS": "n", "CONFIG_BTRFS_FS": "n", "CONFIG_FAT_FS": "n", "CONFIG_OVERLAY_FS": "n",
+    "CONFIG_AUTOFS_FS": "n", "CONFIG_I2C": "n", "CONFIG_SPI": "n", "CONFIG_HID": "n",
+    "CONFIG_HWMON": "n", "CONFIG_THERMAL": "n", "CONFIG_WATCHDOG": "n", "CONFIG_RTC_CLASS": "n",
+    "CONFIG_BPF_SYSCALL": "n", "CONFIG_CGROUPS": "n", "CONFIG_NAMESPACES": "n", "CONFIG_CRYPTO": "n",
+    "CONFIG_KEYS": "n", "CONFIG_SECURITY": "n", "CONFIG_PROFILING": "n", "CONFIG_PERF_EVENTS": "n",
+    "CONFIG_SUSPEND": "n", "CONFIG_CPU_IDLE": "n", "CONFIG_CPU_FREQ": "n", "CONFIG_DEBUG_FS": "n",
+    "CONFIG_IKCONFIG": "n", "CONFIG_STRICT_KERNEL_RWX": "n",
+    **KERNEL_OPTIONS,
+    "CONFIG_SERIAL_8250": "y", "CONFIG_SERIAL_8250_CONSOLE": "y", "CONFIG_SERIAL_OF_PLATFORM": "y",
+    "CONFIG_SERIAL_EARLYCON": "y", "CONFIG_BLK_DEV_INITRD": "y"}
+
+
+# BusyBox's: BUSYBOX_OPTIONS, and no tc (BusyBox 1.36's tc wants the CBQ
+# scheduler's definitions, which Linux 6.8's headers have dropped)
+MMU_BUSYBOX_OPTIONS = {**BUSYBOX_OPTIONS, "CONFIG_TC": "n"}
+
+
+def fragment(options):
+    """A configuration fragment: each option set, or (n) not set."""
+    return "".join(f"# {o} is not set\n" if v == "n" else f"{o}={v}\n" for o, v in options.items())
+
+
+def prepare_mmu_buildroot(buildroot=BUILDROOT):
+    """The MMU build's configuration (and the overlay, prepare_buildroot's)
+    into Buildroot's folder: py2ver_mmu/defconfig, its two fragments, and
+    the patches (OPENSBI_PATCH)."""
+    prepare_buildroot(buildroot)
+    folder = os.path.join(buildroot, "py2ver_mmu")
+    os.makedirs(folder, exist_ok=True)
+    files = {"kernel_options": os.path.join(folder, "kernel.fragment"),
+             "busybox_options": os.path.join(folder, "busybox.fragment")}
+    open(files["kernel_options"], "w").write(fragment(MMU_KERNEL_OPTIONS))
+    open(files["busybox_options"], "w").write(fragment(MMU_BUSYBOX_OPTIONS))
+    patches = os.path.join(folder, "patches")
+    os.makedirs(os.path.join(patches, "opensbi"), exist_ok=True)
+    open(os.path.join(patches, "opensbi", "0001-fw-jump-fdt-addr-from-outside.patch"), "w").write(OPENSBI_PATCH)
+    config = os.path.join(folder, "defconfig")
+    open(config, "w").write(MMU_CONFIG.format(overlay=os.path.join(buildroot, "py2ver_overlay"),
+                                              patches=patches, **files))
+    return config
+
+
+def boot_mmu(link, firmware=MMU_FIRMWARE, kernel=MMU_KERNEL):
+    """Load OpenSBI, the MMU kernel and linux_mmu.dts into the board, each
+    checked, and start OpenSBI (a1: the device tree)."""
+    images = [(FIRMWARE_AT, open(firmware, "rb").read()), (MMU_KERNEL_AT, open(kernel, "rb").read()),
+              (TREE_AT, device_tree("linux_mmu.dts", room=4096))]
+    for address, data in images:
+        data += bytes(-len(data) % 4)
+        print(f"sending {len(data):,} bytes to {address:#010x}", flush=True)
+        start = time.time()
+        link.write(load_record(address, data))
+        wait_for(link, loaded_line(address, data), 60 + len(data) / 20_000)
+        print(f"({time.time() - start:.1f} s)", flush=True)
+    link.write(go_record(FIRMWARE_AT, TREE_AT))
 
 
 def word(n):
@@ -211,10 +358,20 @@ if __name__ == "__main__":
         subprocess.run(["make", "-C", BUILDROOT, "busybox-dirclean", "linux-dirclean"], check=True)
         subprocess.run(["make", "-C", BUILDROOT], check=True)
         print(f"the kernel: {BUILT_KERNEL}")
+    if "--build-linux-mmu" in args:
+        config = prepare_mmu_buildroot()
+        subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}", f"BR2_DEFCONFIG={config}", "defconfig"],
+                       check=True)
+        subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}", "busybox-dirclean", "linux-dirclean"],
+                       check=True)
+        subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}"], check=True)
+        print(f"OpenSBI: {MMU_FIRMWARE}; the kernel: {MMU_KERNEL}")
     if "--boot" in args or "--console" in args:
         from py2ver.jtag_uart import JtagUart
         with JtagUart(os.environ.get("QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")) as link:
-            if "--boot" in args:
+            if "--boot" in args and "--mmu" in args:
+                boot_mmu(link)
+            elif "--boot" in args:
                 boot(link, args[args.index("--kernel") + 1] if "--kernel" in args else KERNEL)
             watch = args[args.index("--watch") + 1] if "--watch" in args else None
             console(link, None if watch is None else float(watch))

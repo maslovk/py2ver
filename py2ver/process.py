@@ -278,6 +278,7 @@ class Run:
     outputs: List[Dict[str, int]]
     value: Any = None
     simulator: Optional[str] = None             # (check(): the Verilog's, icarus or verilator)
+    clocks: Optional[int] = None                # (drive(): how many it ran, recorded or not)
 
 
 class TestbenchFailed(AssertionError):
@@ -362,7 +363,7 @@ class _Pins:
 
 
 def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
-          limit: int = 10_000_000) -> Run:
+          limit: int = 10_000_000, record: bool = True) -> Run:
     """
     Run a testbench against the generator (or a System's): tb is a generator of
     one argument, the design's pins. It writes the inputs (kept until written
@@ -370,13 +371,17 @@ def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
     `yield` lets a clock pass, `yield n` n clocks; when it returns, the run
     ends (its value: the Run's). The steps of a protocol (yield from
     uart_send(dut, 'rx', b, BIT)) drive and read pins as well.
+
+    record=False keeps no clock's inputs and outputs (the Run's lists empty,
+    its clocks counted): for a long run, millions of clocks, whose record
+    would fill the memory.
     """
     sim = _Sim(func, attr)
     pins = _Pins(sim)
     gen = tb(pins)
     inputs: List[Dict[str, int]] = []
     rows: List[Dict[str, int]] = []
-    wait, value = 0, None
+    wait, value, clock = 0, None, 0
     while True:
         row = sim.row()
         object.__setattr__(pins, "_row", row)
@@ -387,21 +392,23 @@ def drive(func: Any, tb: Callable, attr: Optional[Dict[str, Any]] = None,
                 value = e.value
                 break
             except AssertionError as e:
-                raise TestbenchFailed(f"the testbench at clock {len(rows):,} ({_raised_at(e)}): "
+                raise TestbenchFailed(f"the testbench at clock {clock:,} ({_raised_at(e)}): "
                                       f"{e}") from e
             wait = 1 if n is None else int(n)
             if wait < 1:
-                raise ProcessError(f"the testbench's yield {n} at clock {len(rows)}: a clock at "
+                raise ProcessError(f"the testbench's yield {n} at clock {clock}: a clock at "
                                    f"least")
         values = pins._inputs()
-        inputs.append(values)
-        rows.append(row)
-        sim.clock(values, len(rows) - 1)
+        if record:
+            inputs.append(values)
+            rows.append(row)
+        sim.clock(values, clock)
+        clock += 1
         wait -= 1
-        if len(rows) > limit:
+        if clock > limit:
             raise ProcessError(f"the testbench ran {limit:,} clocks without returning, waiting at "
                                f"{_waiting(gen)} (limit= for more)")
-    return Run(inputs, rows, value)
+    return Run(inputs, rows, value, clocks=clock)
 
 
 class ProcessMixin:
