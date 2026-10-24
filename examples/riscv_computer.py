@@ -6,7 +6,7 @@
 # traps, delegated to supervisor mode as medeleg and mideleg say, and the
 # timer's interrupt (user mode: for Linux's programs, their system calls an
 # ecall from user mode; supervisor mode: for Linux with an MMU), and Sv32
-# paging (its page-table entries read for each access: a TLB to come). A clock to fetch an instruction, a clock to decode it and read its
+# paging (a TLB of 32 pages for fetches, one for data). A clock to fetch an instruction, a clock to decode it and read its
 # registers, a clock or more to carry it out (memory, multiplying, dividing:
 # 32 clocks), a clock to write its result: about 12 million instructions a
 # second. Its memory is mini-rv32ima's (the small RISC-V emulator that boots
@@ -82,6 +82,7 @@ MISA = (1 << 30) | (1 << 20) | (1 << 18) | (1 << 12) | (1 << 8) | (1 << 0)   # 3
 SSTATUS = 0x000C0122                     # (sstatus: mstatus's SIE, SPIE, SPP, SUM, MXR)
 MPRV = 1 << 17
 LOAD, STORE, ATOMIC = 1, 2, 3            # (the data loop's accesses)
+TLB_ENTRIES = 32                         # (each TLB's: a memory block's, 32 at least)
 
 # ----------------------------- building programs -----------------------------
 
@@ -209,7 +210,16 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
     s_trap_pc = 0                                # sepc
     s_cause = 0                                  # scause
     s_trap_value = 0                             # stval
-    satp = 0                                     # satp (paging: its mode and root, kept, not yet used)
+    satp = 0                                     # satp (paging: its mode and root)
+    # The TLBs, a fetch's and the data's: TLB_ENTRIES each, an entry for a 4 KB
+    # page (a megapage's too, a page at a time), at its virtual page number's
+    # lowest bits: that number (bits 28 up), the physical page's (8 to 27), the
+    # page-table entry's flags (0 to 7, where they are in it); which hold one:
+    # a bit each (sfence.vma, a write of satp: none)
+    itlb = [0] * TLB_ENTRIES
+    dtlb = [0] * TLB_ENTRIES
+    itlb_valid = 0
+    dtlb_valid = 0
     counters_on = 0                              # mcounteren: the counters supervisor mode may read
     s_counters_on = 0                            # scounteren: and user mode
     retired_lo = 0                               # instructions carried out (cycle, instret)
@@ -247,9 +257,20 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
         # machine mode, satp's mode Sv32): the page-table entries read first.
         # A word from the RAM, or from the SDRAM through the cache (on a miss,
         # the line read into it, and the cache looked at again) ----
-        walk = 2 if satp >> 31 and mode < 3 else 0  # (2: the root's entry next, 1: the leaf's, 0: the word)
+        # (the TLB's entry for pc's page: read now, a clock on used if paging:
+        # a hit that allows the fetch (X; U for user mode, not U for
+        # supervisor mode) gives the physical address, else the walk)
+        fetch_entry = itlb[(pc >> 12) & (TLB_ENTRIES - 1)]
+        walk = 0                                 # (2: the root's entry next, 1: the leaf's, 0: the word)
         table = (satp & 0x3FFFFF) << 12
         physical = pc
+        if satp >> 31 and mode < 3:
+            yield
+            if (itlb_valid >> ((pc >> 12) & (TLB_ENTRIES - 1))) & 1 and fetch_entry >> 28 == pc >> 12 \
+                    and (fetch_entry >> 3) & 1 and (fetch_entry >> 4) & 1 == (1 if mode == 0 else 0):
+                physical = (((fetch_entry >> 8) & 0xFFFFF) << 12) | (pc & 0xFFF)
+            else:
+                walk = 2
         while True:
             # (fetch_where, not the data loop's where: py2ver gives reads of a
             # memory at the same address one port, and the fetch's and the
@@ -292,12 +313,14 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                 trap_cause = 12
                 trap_with = pc
                 break
-            if leaf and walk == 2:               # (a megapage: 4 MB)
-                physical = (((fetched >> 20) << 22) | (pc & 0x3FFFFF)) & MASK
+            if leaf:                             # (the page: into the TLB)
+                if walk == 2:                    # (a megapage: 4 MB)
+                    physical = (((fetched >> 20) << 22) | (pc & 0x3FFFFF)) & MASK
+                else:
+                    physical = (((fetched >> 10) << 12) | (pc & 0xFFF)) & MASK
                 walk = 0
-            elif leaf:
-                physical = (((fetched >> 10) << 12) | (pc & 0xFFF)) & MASK
-                walk = 0
+                itlb[(pc >> 12) & (TLB_ENTRIES - 1)] = ((pc >> 12) << 28) | ((physical >> 12) << 8) | (fetched & 0xFF)
+                itlb_valid = itlb_valid | (1 << ((pc >> 12) & (TLB_ENTRIES - 1)))
             else:
                 table = ((fetched >> 10) << 12) & MASK
                 walk = 1
@@ -461,7 +484,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             elif function == 0x105 and not ((status_bits >> 21) & 1 and mode < 3):
                 pass                             # (wfi: done at once; TW: not below machine mode)
             elif f7 == 0x09 and rd == 0 and (mode == 3 or (mode == 1 and not tvm)):
-                pass                             # (sfence.vma: no TLB yet; TVM: not in supervisor mode)
+                itlb_valid = 0                   # (sfence.vma: the TLBs emptied; TVM: not in supervisor mode)
+                dtlb_valid = 0
             else:
                 trap = 1
                 trap_cause = 2
@@ -597,6 +621,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                     s_counters_on = new
                 elif writes and csr == 0x180:            # (Sv32's mode and root; no ASIDs)
                     satp = new & 0x803FFFFF
+                    itlb_valid = 0
+                    dtlb_valid = 0
                 result = old
                 write = 1
         elif op != 0x0F:                         # (fence, fence.i: nothing to do; else illegal)
@@ -626,7 +652,11 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             at = address                         # (the word now: the first, then the second)
             second = 0
             low = 0
-            walk = 2 if paging else 0
+            # (the TLB's entry for the word's page, read now, used after the
+            # turn's first clock: walk 3; a hit that allows the access gives
+            # the physical address, else the walk)
+            data_entry = dtlb[(address >> 12) & (TLB_ENTRIES - 1)]
+            walk = 3 if paging else 0
             table = (satp & 0x3FFFFF) << 12
             physical = at
             while True:
@@ -634,6 +664,17 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                 # last ended; else py2ver makes the turn's start once for each)
                 yield
                 done = 0
+                if walk == 3:
+                    allowed = (data_entry >> 2) & 1 and (data_entry >> 7) & 1 if storing \
+                        else (data_entry >> 1) & 1 or (status_bits >> 19 & 1 and (data_entry >> 3) & 1)
+                    user_page = (data_entry >> 4) & 1
+                    user_allowed = user_page if effective == 0 else (not user_page or status_bits >> 18 & 1)
+                    if (dtlb_valid >> ((at >> 12) & (TLB_ENTRIES - 1))) & 1 and data_entry >> 28 == at >> 12 \
+                            and allowed and user_allowed:
+                        physical = (((data_entry >> 8) & 0xFFFFF) << 12) | (at & 0xFFF)
+                        walk = 0
+                    else:
+                        walk = 2
                 if walk == 2:
                     where = (table + ((at >> 22) << 2)) & MASK
                 elif walk == 1:
@@ -708,12 +749,15 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                         trap_cause = 15 if storing else 13
                         trap_with = at
                         done = 1
-                    elif leaf and walk == 2:     # (a megapage: 4 MB)
-                        physical = (((value >> 20) << 22) | (at & 0x3FFFFF)) & MASK
+                    elif leaf:                   # (the page: into the TLB)
+                        if walk == 2:            # (a megapage: 4 MB)
+                            physical = (((value >> 20) << 22) | (at & 0x3FFFFF)) & MASK
+                        else:
+                            physical = (((value >> 10) << 12) | (at & 0xFFF)) & MASK
                         walk = 0
-                    elif leaf:
-                        physical = (((value >> 10) << 12) | (at & 0xFFF)) & MASK
-                        walk = 0
+                        dtlb[(at >> 12) & (TLB_ENTRIES - 1)] = ((at >> 12) << 28) | ((physical >> 12) << 8) \
+                            | (value & 0xFF)
+                        dtlb_valid = dtlb_valid | (1 << ((at >> 12) & (TLB_ENTRIES - 1)))
                     else:
                         table = ((value >> 10) << 12) & MASK
                         walk = 1
@@ -771,7 +815,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                         at = (((address >> 2) + 1) << 2) & MASK
                         data = spread >> 32
                         byte_mask = spread_mask >> 4
-                        walk = 2 if paging else 0
+                        data_entry = dtlb[(at >> 12) & (TLB_ENTRIES - 1)]
+                        walk = 3 if paging else 0
                         table = (satp & 0x3FFFFF) << 12
                         physical = at
                     else:
@@ -806,7 +851,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
                     low = value
                     second = 1
                     at = (((address >> 2) + 1) << 2) & MASK
-                    walk = 2 if paging else 0
+                    data_entry = dtlb[(at >> 12) & (TLB_ENTRIES - 1)]
+                    walk = 3 if paging else 0
                     table = (satp & 0x3FFFFF) << 12
                     physical = at
                 else:

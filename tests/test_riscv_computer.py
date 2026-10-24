@@ -215,6 +215,22 @@ def test_key1_sends_the_pc_where_the_cpu_is(monkeypatch, tmp_path):
     assert fields[3] == "00000003"
 
 
+@pytest.mark.parametrize("model", [False, True])
+def test_a_page_mapped_elsewhere_reads_the_new_page_after_sfence_vma(model, monkeypatch, tmp_path):
+    # (paging.S in supervisor mode, its pages in the RAM and the SDRAM: the
+    # TLB's old mapping gone after sfence.vma, an unmapped page a fault; on the
+    # generator, and through the hardware's model)
+    monkeypatch.chdir(tmp_path)
+    system = R.cpu_with_sdram(R.build("paging.S"), timing=SdramTiming(power_up=20, refresh=60))
+    tb = R.console(b"\n", chip=SdramModel())
+    if model:
+        with contextlib.redirect_stdout(io.StringIO()):
+            printed = Py2ver(system).check(tb, verilog=False).value
+    else:
+        printed = drive(system, tb, {}).value
+    assert printed == b"OK\n"
+
+
 def test_our_kernel_s_options_take_the_place_of_mini_rv32ima_s():
     import riscv_linux as L
     assert L.git_hash(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"   # (git's own)
@@ -276,10 +292,14 @@ def test_riscv_tests_with_paging(name):
 
 @pytest.mark.slow
 @pytest.mark.skipif(not os.path.isdir(R.RISCV_TESTS), reason="needs riscv-tests in ~/opt/riscv")
-@pytest.mark.parametrize("name", ["rv32ui/add", "rv32ui/ma_data", "rv32ua/lrsc", "rv32si/csr"])
-def test_riscv_tests_in_the_hardware(name, monkeypatch, tmp_path):
-    # (a few, through py2ver's model of the hardware as well: its compiling
-    # takes minutes)
+@pytest.mark.parametrize("name, paging", [("rv32ui/add", False), ("rv32ui/ma_data", False),
+                                          ("rv32ua/lrsc", False), ("rv32si/csr", False),
+                                          ("rv32si/dirty", False), ("rv32ui/ld_st", True),
+                                          ("rv32ua/amoadd_w", True)])
+def test_riscv_tests_in_the_hardware(name, paging, monkeypatch, tmp_path):
+    # (a few, through py2ver's model of the hardware as well, some with paging
+    # on: the TLBs, the walk, page faults and sfence.vma in the hardware too)
     monkeypatch.chdir(tmp_path)
-    printed = _cpu(R.riscv_test(name)).check(R.console(b"\n", limit=300_000), verilog=False).value
+    printed = _cpu(R.riscv_test(name, paging=paging)).check(R.console(b"\n", limit=1_000_000),
+                                                            verilog=False).value
     assert printed == b"OK\n"
