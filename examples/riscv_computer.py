@@ -17,8 +17,12 @@
 #   0x1100_4000  the timer's mtimecmp (and +4, its upper half): the interrupt at mtime
 #   0x1100_BFF8  mtime (and +4): microseconds since reset
 #   0x1110_0000  write 0x5555: power off (the CPU stops); 0x7777: restart
+#   0x8000_0000  the SDRAM, 32 MB (py2ver.devices.sdram's controller): a word in
+#                about 10 clocks; instructions can be fetched from it too
 #
 #   machine_timer --mtime--> cpu --characters--> terminal --color/valid/ready--> ili9341_display
+#                             ^
+#                             +--words--> sdram_controller --> the SDRAM's pins
 #
 # Programs are written in C or assembly (examples/riscv/) and built with the
 # GNU RISC-V toolchain: riscv-none-elf-gcc (xPack's, unpacked in ~/opt/riscv,
@@ -27,6 +31,7 @@
 #   python examples/riscv_computer.py          # the CPU's checks, then hello.c: test, print what they print
 #   python examples/riscv_computer.py --sim    # also simulate the generated Verilog
 #   python examples/riscv_computer.py --pins   # build hello.c's computer for the board
+#   python examples/riscv_computer.py --pins memtest.c     # or another program's
 import functools
 import glob
 import os
@@ -39,7 +44,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import terminal as T  # noqa: E402
 from py2ver import connect  # noqa: E402
-from py2ver.protocol import stream_send  # noqa: E402
+from py2ver.devices.sdram import (SDRAM_ATTR, SDRAM_PINS, TIMING, WORDS as SDRAM_WORDS,  # noqa: E402
+                                  sdram_controller, sdram_read, sdram_write)
+from py2ver.protocol import alongside, stream_send  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAMS = os.path.join(HERE, "riscv")
@@ -49,7 +56,8 @@ UART, UART_STATUS = 0x10000000, 0x10000005
 LEDS, KEYS = 0x10001000, 0x10001004
 MTIMECMP, MTIME = 0x11004000, 0x1100BFF8
 SYSCON = 0x11100000
-MASK = 0xFFFFFFFF                        # (the registers are 32 bits)
+SDRAM = 0x80000000                       # (to 0x81FF_FFFF: an address there has 0x40 above bit 25)
+MASK = 0xFFFFFFFF                       # (the registers are 32 bits)
 MISA = (1 << 30) | (1 << 12) | (1 << 8) | (1 << 0)    # 32 bits; M, I, A
 
 # ----------------------------- building programs -----------------------------
@@ -63,10 +71,11 @@ def toolchain():
     return next((g for g in found if g and os.path.exists(g)), None)
 
 
-def build(*sources, includes=()):
+def build(*sources, includes=(), defines=()):
     """A program's memory image (RAM_WORDS words, from 0): its sources (paths,
     or names in examples/riscv; C or assembly; a C program gets start.S,
-    which calls its main) compiled for RV32IMA and linked to this computer."""
+    which calls its main) compiled for RV32IMA and linked to this computer.
+    defines: the preprocessor's, such as "WORDS=24"."""
     gcc = toolchain()
     if gcc is None:
         raise RuntimeError("No RISC-V toolchain: unpack xPack's riscv-none-elf-gcc in ~/opt/riscv, "
@@ -78,6 +87,7 @@ def build(*sources, includes=()):
         elf, binary = os.path.join(work, "program.elf"), os.path.join(work, "program.bin")
         subprocess.run([gcc, "-march=rv32ima_zicsr_zifencei", "-mabi=ilp32", "-Os", "-nostdlib",
                         "-ffreestanding", "-Wl,--no-warn-rwx-segments", *[f"-I{i}" for i in includes],
+                        *[f"-D{d}" for d in defines],
                         "-T", os.path.join(PROGRAMS, "link.ld"), "-o", elf, *paths, "-lgcc"],
                        check=True)
         objcopy = gcc[:-len("gcc")] + "objcopy"       # (riscv-none-elf-gcc: riscv-none-elf-objcopy)
@@ -119,12 +129,19 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
     """The CPU, running from address 0 the memory image `image` (RAM_WORDS words).
 
     Outputs: the console's characters (tx, tx_valid; tx_ready: taken), the
-    PC keyboard's kb_ready, leds. Inputs: tx_ready; the keyboard's kb,
-    kb_valid; keys; mtime_lo, mtime_hi (from machine_timer).
+    PC keyboard's kb_ready, leds; the SDRAM controller's requests (req,
+    req_write, req_address, req_data, req_mask). Inputs: tx_ready; the
+    keyboard's kb, kb_valid; keys; mtime_lo, mtime_hi (from machine_timer);
+    the SDRAM controller's req_ready, resp_valid, resp_data.
     """
     port.tx_valid = 0
     port.kb_ready = 0
     port.leds = 0
+    port.req = 0
+    port.req_write = 0
+    port.req_address = 0
+    port.req_data = 0
+    port.req_mask = 15
     ram = list(image)                            # the memory, the program in it
     regs = [0] * 32                              # x0 to x31 (x0 never written: always 0)
     pc = 0
@@ -156,7 +173,10 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
             interrupts = 0
             pc = (trap_vector & 0xFFFFFFFC) + (28 if trap_vector & 1 else 0)   # (vectored: + 4 x 7)
         # ---- fetch ----
-        instruction = ram[(pc >> 2) & (RAM_WORDS - 1)]
+        if pc >> 25 == SDRAM >> 25:
+            instruction = yield from sdram_read(port, (pc >> 2) & (SDRAM_WORDS - 1))
+        else:
+            instruction = ram[(pc >> 2) & (RAM_WORDS - 1)]
         yield
         # ---- decode: the instruction's fields, the registers it reads ----
         op = instruction & 0x7F
@@ -270,6 +290,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 word = ram[address >> 2]
                 yield
                 value = word
+            elif address >> 25 == SDRAM >> 25:
+                value = yield from sdram_read(port, (address >> 2) & (SDRAM_WORDS - 1))
             elif address == UART or address == UART_STATUS:
                 if not key_waiting:              # (a key from the PC, kept until read)
                     got, key = yield from take_key(port)
@@ -318,6 +340,17 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                     at = (address & 3) * 8
                     keep = 255 if f3 == 0 else 65535
                     ram[k] = (word & (MASK ^ (keep << at))) | ((b & keep) << at)
+            elif address >> 25 == SDRAM >> 25:      # (a byte or a half: the SDRAM writes just those)
+                at = (address & 3) * 8
+                data = b
+                byte_mask = 15
+                if f3 == 0:
+                    data = ((b & 255) << at) & MASK
+                    byte_mask = 1 << (address & 3)
+                elif f3 == 1:
+                    data = ((b & 65535) << at) & MASK
+                    byte_mask = 3 << (address & 3)
+                yield from sdram_write(port, (address >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
             elif address == UART:
                 yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
             elif address == LEDS:
@@ -334,6 +367,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
         elif op == 0x2F:                         # lr.w sc.w amo*.w
             address = a
             k = (address >> 2) & (RAM_WORDS - 1)
+            in_sdram = address >> 25 == SDRAM >> 25
+            sdram_word = (address >> 2) & (SDRAM_WORDS - 1)
             kind = instruction >> 27
             if address & 3:
                 trap = 1
@@ -341,14 +376,20 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 trap_with = address
             elif kind == 3:                      # sc.w: done if lr.w's reservation is still here
                 if reserved and reservation == address:
-                    ram[k] = b
+                    if in_sdram:
+                        yield from sdram_write(port, sdram_word, b)
+                    else:
+                        ram[k] = b
                     result = 0
                 else:
                     result = 1
                 reserved = 0
             else:
-                word = ram[k]
-                yield
+                if in_sdram:
+                    word = yield from sdram_read(port, sdram_word)
+                else:
+                    word = ram[k]
+                    yield
                 result = word
                 if kind == 2:                    # lr.w
                     reserved = 1
@@ -372,7 +413,10 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                         new = word if word < b else b
                     elif kind == 28:
                         new = word if word > b else b
-                    ram[k] = new
+                    if in_sdram:
+                        yield from sdram_write(port, sdram_word, new)
+                    else:
+                        ram[k] = new
             write = 1 - trap
         elif op == 0x73 and f3 == 0:             # ecall ebreak mret wfi
             if (instruction >> 20) == 0x302:     # mret: back from the trap
@@ -464,7 +508,9 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
 
 CPU_ATTR = {"tx_ready": 1, "kb": 8, "kb_valid": 1, "keys": 2, "mtime_lo": 32, "mtime_hi": 32,
             # (a product of two 33-bit signed numbers: past the 64 bits followed by itself)
-            "product": {"width": 66, "signed": 1}}
+            "product": {"width": 66, "signed": 1},
+            # (the SDRAM controller's answers)
+            "req_ready": 1, "resp_valid": 1, "resp_data": 32}
 
 
 def machine_timer(port, tick=50):
@@ -483,34 +529,58 @@ def machine_timer(port, tick=50):
 
 # ----------------------------- the computer -----------------------------
 
-# On the board: the display's pins, the JTAG UART for the keyboard, the LEDs and keys
+# On the board: the display's pins, the JTAG UART for the keyboard, the LEDs and
+# keys, the SDRAM's (the display and the SDRAM both have a cs_n: in the
+# computer, display_cs_n and sdram_cs_n)
 PINS = dict(T.PINS, kb="JTAG_RX_DATA", kb_valid="JTAG_RX_VALID", kb_ready="JTAG_RX_READY",
             leds="LED", keys="KEY")
 for _name in ("rx", "rx_valid", "rx_ready"):    # (the terminal's bytes come from the CPU)
     PINS.pop(_name)
+PINS["display_cs_n"] = PINS.pop("cs_n")
+PINS.update({("sdram_cs_n" if _name == "cs_n" else _name): _pin for _name, _pin in SDRAM_PINS.items()})
 
 
-def computer(image, lcd=T.LCD, columns=T.COLUMNS, rows=T.ROWS, height=T.SCREEN_HEIGHT):
-    """The CPU running the memory image `image`, its console the terminal on the display."""
+# The CPU's requests to the SDRAM controller, and its answers
+SDRAM_WIRES = {**{f"sdram.{n}": f"cpu.{n}" for n in ("req", "req_write", "req_address", "req_data",
+                                                     "req_mask")},
+               **{f"cpu.{n}": f"sdram.{n}" for n in ("req_ready", "resp_valid", "resp_data")}}
+
+
+def computer(image, lcd=T.LCD, columns=T.COLUMNS, rows=T.ROWS, height=T.SCREEN_HEIGHT,
+             timing=TIMING):
+    """The CPU running the memory image `image`, its console the terminal on
+    the display, the SDRAM at 0x8000_0000."""
     cpu = functools.partial(rv32ima, image=image)
+    controller = functools.partial(sdram_controller, timing=timing)
     screen = functools.partial(T.terminal, columns=columns, rows=rows, height=height)
     width = columns * 8
     display = functools.partial(T.ili9341_display, lcd=lcd, width=width, height=height)
     return connect(timer=(machine_timer, {}), cpu=(cpu, CPU_ATTR), terminal=(screen, {"ready": 1}),
-                   display=(display, {"color": 16, "valid": 1}), name="riscv_computer",
+                   display=(display, {"color": 16, "valid": 1}), sdram=(controller, SDRAM_ATTR),
+                   name="riscv_computer",
                    wires={"cpu.mtime_lo": "timer.mtime_lo", "cpu.mtime_hi": "timer.mtime_hi",
                           "terminal.rx": "cpu.tx", "terminal.rx_valid": "cpu.tx_valid",
                           "cpu.tx_ready": "terminal.rx_ready",
                           "display.color": "terminal.color", "display.valid": "terminal.valid",
-                          "terminal.ready": "display.ready"})
+                          "terminal.ready": "display.ready", **SDRAM_WIRES})
 
 
-def console(until, typed=b"", limit=2_000_000):
+def cpu_with_sdram(image, timing=TIMING):
+    """The CPU and the SDRAM controller alone (no timer, no display): for a
+    testbench, with console(chip=) playing the SDRAM."""
+    cpu = functools.partial(rv32ima, image=image)
+    controller = functools.partial(sdram_controller, timing=timing)
+    return connect(cpu=(cpu, CPU_ATTR), sdram=(controller, SDRAM_ATTR), name="cpu_with_sdram",
+                   wires=SDRAM_WIRES)
+
+
+def console(until, typed=b"", limit=2_000_000, chip=None):
     """A testbench for the CPU alone: it takes the console's characters (a
     clock after each, as the terminal would), types `typed` on the keyboard,
     and stops once the console has printed `until` (or after limit clocks).
-    mtime stays 0. Returns what was printed."""
-    def tb(dut):
+    mtime stays 0. chip: an SdramModel, for cpu_with_sdram(). Returns what was
+    printed."""
+    def printing(dut):
         printed, k = bytearray(), 0
         dut.keys = 3
         for _ in range(limit):
@@ -525,6 +595,13 @@ def console(until, typed=b"", limit=2_000_000):
                 break
             yield
         return bytes(printed)
+
+    def tb(dut):
+        if chip is None:
+            printed = yield from printing(dut)
+        else:
+            printed = yield from alongside(printing(dut), chip.run(dut))
+        return printed
     return tb
 
 
@@ -538,6 +615,7 @@ if __name__ == "__main__":
         run = p.check(console(until, typed), verilog="--sim" in args)
         print(f"{sources[0]} printed {run.value.decode()!r} in {len(run.inputs):,} clock cycles")
     if "--pins" in args:
-        board = Py2ver(computer(build("hello.c")), pins=PINS)
+        program = next((a for a in args if a.endswith((".c", ".S"))), "hello.c")
+        board = Py2ver(computer(build(program)), pins=PINS)
         print(board.PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))

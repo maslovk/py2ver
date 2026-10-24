@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from py2ver import Py2ver
+from py2ver.devices.sdram import SdramModel, SdramTiming
 
 # examples/riscv_computer.py: an RV32IMA CPU written as a process, running
 # programs built with the GNU RISC-V toolchain (skipped without one), and
@@ -40,6 +41,22 @@ def test_a_c_program_prints_and_echoes(sim, monkeypatch, tmp_path):
     printed = run.value
     assert printed.startswith(b"Hello from RISC-V!\nFibonacci:\n0 1 1 2 3 5 8 13 21 34 55 89 144 ")
     assert b"610 987 \n" in printed and printed.endswith(b"I echo:\nok")
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_the_sdram_holds_words_bytes_halves_and_code(sim, monkeypatch, tmp_path):
+    # (memtest.c on the CPU and the SDRAM controller, the chip's model behind
+    # them: 24 words spread over the banks, written, changed a byte or a half
+    # at a time, read back by loads and atomic adds; and a function run from
+    # the SDRAM)
+    monkeypatch.chdir(tmp_path)
+    image = R.build("memtest.c", defines=("WORDS=24", "STRIDE=211001", "PASSES=1"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(R.cpu_with_sdram(image, timing=SdramTiming(power_up=20, refresh=60)))
+    chip = SdramModel()
+    run = p.check(R.console(b"done\n", chip=chip), verilog=sim)
+    assert run.value == b"SDRAM test\nrunning from the SDRAM: ok\npass 1: 0 words wrong\ndone\n"
+    assert chip.word(0) == 0x42021 ^ 0xFF        # (the first random number, its low byte inverted)
 
 
 def _riscv_tests():
