@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 
 from py2ver import Py2ver
+from py2ver.devices.ili9341 import ILI9341, ILI9341Model
 from py2ver.devices.sdram import SdramModel, SdramTiming
-from py2ver.protocol import alongside, together
+from py2ver.protocol import SPI, alongside, together
 
 # examples/riscv_computer.py: an RV32IMA CPU written as a process, running
 # programs built with the GNU RISC-V toolchain (skipped without one), and
@@ -147,12 +148,88 @@ def test_the_pc_s_copy_of_the_console_waits_for_room_while_the_pc_reads(every, m
     assert copied == (b"OK\n" if every else b"")
 
 
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+def test_the_display_shows_the_framebuffer(sim, monkeypatch, tmp_path):
+    # (screen.c's test pattern on a 16 x 4 screen: drawn by the CPU into the
+    # SDRAM, read by the framebuffer's scanner as the controller's second
+    # client, between the CPU's accesses, and sent to the display)
+    monkeypatch.chdir(tmp_path)
+    width, height = 16, 4
+    image = R.build("screen.c", defines=(f"WIDTH={width}", f"HEIGHT={height}", "PATTERN_ONLY"))
+    lcd = ILI9341(spi=SPI(1, mode=0, miso=""), wake_clocks=50)
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(R.computer(image, lcd=lcd, height=height, width=width, screen="framebuffer",
+                              timing=SdramTiming(power_up=20, refresh=60)))
+    chip = SdramModel(cs_n="sdram_cs_n")
+    screen = ILI9341Model(lcd._replace(cs_n="display_cs_n"), width, height)
+
+    def tb(dut):
+        copied, frames_after = bytearray(), None
+        dut.keys = 3
+        while frames_after is None or screen.written < frames_after:
+            dut.jtag_tx_room = 1
+            if dut.jtag_tx_send:
+                copied.append(dut.jtag_tx)
+                if copied.endswith(b"done\n"):           # (then two whole frames more)
+                    frames_after = screen.written + 2 * width * height
+            yield
+        return bytes(copied)
+
+    def run(dut):
+        printed = yield from alongside(tb(dut), chip.run(dut), screen.run(dut))
+        return printed
+
+    assert p.check(run, verilog=sim).value == b"framebuffer: a test pattern\ndone\n"
+
+    def rgb(red, green, blue):
+        return (red >> 3) << 11 | (green >> 2) << 5 | blue >> 3
+    assert screen.pixels == [[rgb(x * 256 // width, y * 256 // height, 128) for x in range(width)]
+                             for y in range(height)]
+
+
+def test_key1_sends_the_pc_where_the_cpu_is(monkeypatch, tmp_path):
+    # (traps.S's last loop: KEY1 held, the report sent once, its mcause the
+    # last trap's: an ecall from machine mode)
+    monkeypatch.chdir(tmp_path)
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(functools.partial(R.rv32ima, image=R.build("traps.S")), R.CPU_ATTR)
+
+    def tb(dut):
+        printed = yield from R.console(b"\n")(dut)
+        report = bytearray()
+        dut.keys = 1                         # (KEY1 pressed, KEY0 not)
+        for _ in range(3000):
+            dut.jtag_tx_room = 1
+            dut.tx_ready = 1
+            if dut.jtag_tx_send:
+                report.append(dut.jtag_tx)
+            yield
+        return printed, bytes(report)
+
+    printed, report = p.check(tb, verilog=False).value
+    assert printed == b"OK\n"
+    assert report.startswith(b"\n[pc ") and report.endswith(b"]\n") and report.count(b"[pc") == 1
+    fields = report.decode().strip("\n[]").split()
+    assert fields[0::2] == ["pc", "mcause", "mepc", "mtval"]
+    assert fields[3] == "0000000B"
+
+
+def test_our_kernel_s_options_take_the_place_of_mini_rv32ima_s():
+    import riscv_linux as L
+    assert L.git_hash(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"   # (git's own)
+    config = "CONFIG_A=y\n# CONFIG_FB is not set\nCONFIG_DEVMEM=n\nCONFIG_FBX=y\n"
+    out = L.with_options(config, {"CONFIG_FB": "y", "CONFIG_DEVMEM": "y"})
+    assert out == "CONFIG_A=y\nCONFIG_FBX=y\nCONFIG_FB=y\nCONFIG_DEVMEM=y\n"
+
+
 def test_the_device_tree_gives_linux_the_sdram():
     import riscv_linux as L
     tree = L.device_tree()
     assert tree[:4] == bytes.fromhex("d00dfeed") and len(tree) % 4 == 0
     assert L.TREE_AT + len(tree) <= 0x82000000                  # (in the SDRAM's last 16 KB)
-    assert bytes.fromhex("00000000 80000000 00000000 01ffc000") in tree     # (memory: up to it)
+    assert bytes.fromhex("00000000 80000000 00000000 01fd0000") in tree     # (memory: up to the
+    assert bytes.fromhex("00000000 81fd0000 00000000 00025800") in tree     # framebuffer, then it)
+    assert R.FRAMEBUFFER == 0x81FD0000 and 0x81FD0000 + 240 * 320 * 2 <= L.TREE_AT
 
 
 def _riscv_tests():
@@ -160,7 +237,7 @@ def _riscv_tests():
     for suite in ("rv32ui", "rv32um", "rv32ua"):
         folder = Path(R.RISCV_TESTS) / "isa" / suite
         if folder.is_dir():
-            names += [f"{suite}/{p.stem}" for p in sorted(folder.glob("*.S")) if p.stem != "ma_data"]
+            names += [f"{suite}/{p.stem}" for p in sorted(folder.glob("*.S"))]
     return names
 
 
@@ -169,7 +246,7 @@ def _riscv_tests():
 @pytest.mark.parametrize("name", _riscv_tests())
 def test_riscv_tests(name, monkeypatch, tmp_path):
     # (riscv-tests' rv32ui, rv32um, rv32ua: each prints OK, or FAIL and its
-    # failing case; ma_data left out: misaligned accesses trap here)
+    # failing case; ma_data among them: loads and stores at any address)
     monkeypatch.chdir(tmp_path)
     printed = _cpu(R.riscv_test(name)).check(R.console(b"\n", limit=300_000), verilog=False).value
     assert printed == b"OK\n"

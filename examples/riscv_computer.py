@@ -17,6 +17,7 @@
 #                baud rate, ignored); +5, its status (bit 0: a character came in,
 #                bit 5: room to write)
 #   0x1000_1000  write: the 8 LEDs;  0x1000_1004  read: the keys (bits 0, 1; 0 pressed)
+#                (KEY1 also sends the PC where the CPU is: pc, mcause, mepc, mtval)
 #   0x1100_4000  the timer's mtimecmp (and +4, its upper half): the interrupt at mtime
 #   0x1100_BFF8  mtime (and +4): microseconds since reset
 #   0x1110_0000  write 0x5555: power off (the CPU stops); 0x7777: restart
@@ -37,6 +38,8 @@
 #   python examples/riscv_computer.py --sim    # also simulate the generated Verilog
 #   python examples/riscv_computer.py --pins   # build hello.c's computer for the board
 #   python examples/riscv_computer.py --pins memtest.c     # or another program's
+#   python examples/riscv_computer.py --pins screen.c --framebuffer   # the display showing
+#                                                # the framebuffer, not the console
 import functools
 import glob
 import os
@@ -52,7 +55,8 @@ from py2ver import connect  # noqa: E402
 from py2ver.devices.sdram import (LINE_WORDS, SDRAM_ATTR, SDRAM_PINS, TIMING,  # noqa: E402
                                   WORDS as SDRAM_WORDS, sdram_controller, sdram_read,
                                   sdram_read_line, sdram_write)
-from py2ver.protocol import alongside, stream_send, wait_until  # noqa: E402
+from py2ver.protocol import (alongside, jtag_print, jtag_print_hex, stream_send,  # noqa: E402
+                             wait_until)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAMS = os.path.join(HERE, "riscv")
@@ -139,6 +143,16 @@ def take_key(port):
     return got, key
 
 
+def tell_pc(port, text):
+    """Text to the PC's console (the JTAG UART), waiting for room for it."""
+    yield from jtag_print(port, text, data="jtag_tx", send="jtag_tx_send", room="jtag_tx_room")
+
+
+def tell_pc_hex(port, value):
+    """A 32-bit number to the PC's console, in hexadecimal."""
+    yield from jtag_print_hex(port, value, 8, data="jtag_tx", send="jtag_tx_send", room="jtag_tx_room")
+
+
 def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
     """The CPU, running from address 0 the memory image `image` (RAM_WORDS words).
 
@@ -186,7 +200,22 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
     user_before = 0                              # mstatus.MPP: the mode before the trap (1: user)
     divisor_latch = 0                            # the UART's LCR bit 7: writes to its data set the baud rate
     patience = 0                                 # clocks to wait for room for the PC's copy (0: none listens)
+    told = 0                                     # (1: KEY1 still held since the CPU's state was sent)
     while True:
+        # ---- KEY1 pressed: where the CPU is, and its last trap, to the PC ----
+        if port.keys & 2:
+            told = 0
+        elif not told:
+            told = 1
+            yield from tell_pc(port, b"\n[pc ")
+            yield from tell_pc_hex(port, pc)
+            yield from tell_pc(port, b" mcause ")
+            yield from tell_pc_hex(port, cause)
+            yield from tell_pc(port, b" mepc ")
+            yield from tell_pc_hex(port, trap_pc)
+            yield from tell_pc(port, b" mtval ")
+            yield from tell_pc_hex(port, trap_value)
+            yield from tell_pc(port, b"]\n")
         # ---- the timer's interrupt, if it is due and wanted: a trap now (in
         # user mode, whatever mstatus.MIE says) ----
         due = port.mtime_hi > compare_hi or (port.mtime_hi == compare_hi and port.mtime_lo >= compare_lo)
@@ -322,54 +351,68 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             write = 1
         elif op == 0x03:                         # lb lh lw lbu lhu
             address = (a + imm_i) & MASK
-            value = 0
-            if (f3 == 2 and address & 3) or ((f3 == 1 or f3 == 5) and address & 1):
-                trap = 1                         # (misaligned)
-                trap_cause = 4
-                trap_with = address
-            elif address < 4 * RAM_WORDS:
-                word = ram[address >> 2]
-                yield
-                value = word
-            elif address >> 25 == SDRAM >> 25:      # (through the cache, as a fetch)
-                while True:
-                    cached = cache[(address >> 2) & (CACHE_WORDS - 1)]
-                    tag = tags[(address >> 5) & (LINES - 1)]
+            # (at any address: one across two words, a word and a half at byte
+            # 3, takes both words, a clock between)
+            size = 1 if f3 == 0 or f3 == 4 else (2 if f3 == 1 or f3 == 5 else 4)
+            two = (address & 3) + size > 4
+            at = address                         # (the word read now: the first, then the second)
+            second = 0
+            low = 0
+            while True:
+                value = 0
+                if at < 4 * RAM_WORDS:
+                    word = ram[at >> 2]
                     yield
-                    if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                        break
-                    yield from sdram_read_line(port, (address >> 2) & (SDRAM_WORDS - LINE_WORDS))
-                    base = (address >> 2) & (CACHE_WORDS - LINE_WORDS)
-                    k = 0
-                    while k < LINE_WORDS:
-                        yield from wait_until(port, "resp_valid")
-                        cache[base + k] = port.resp_data
-                        k = k + 1
+                    value = word
+                elif at >> 25 == SDRAM >> 25:       # (through the cache, as a fetch)
+                    while True:
+                        cached = cache[(at >> 2) & (CACHE_WORDS - 1)]
+                        tag = tags[(at >> 5) & (LINES - 1)]
                         yield
-                    tags[(address >> 5) & (LINES - 1)] = ((address >> CACHE_SHIFT) & 4095) | TAG_VALID
-                    yield
-                value = cached
-            elif address == UART or address == UART_STATUS:
-                if not key_waiting:              # (a key from the PC, kept until read)
-                    got, key = yield from take_key(port)
-                    key_waiting = got
-                    waiting_key = key
-                if address == UART:
-                    value = waiting_key if key_waiting else 0
-                    key_waiting = 0
-                else:
-                    value = (0x60 | key_waiting) << 8 * (UART_STATUS & 3)
-            elif address == KEYS:
-                value = port.keys
-            elif address == MTIMECMP:
-                value = compare_lo
-            elif address == MTIMECMP + 4:
-                value = compare_hi
-            elif address == MTIME:
-                value = port.mtime_lo
-            elif address == MTIME + 4:
-                value = port.mtime_hi
-            part = value >> ((address & 3) * 8)  # (the byte or half asked for, at the bottom)
+                        if tag == ((at >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                            break
+                        yield from sdram_read_line(port, (at >> 2) & (SDRAM_WORDS - LINE_WORDS))
+                        base = (at >> 2) & (CACHE_WORDS - LINE_WORDS)
+                        k = 0
+                        while k < LINE_WORDS:
+                            yield from wait_until(port, "resp_valid")
+                            cache[base + k] = port.resp_data
+                            k = k + 1
+                            yield
+                        tags[(at >> 5) & (LINES - 1)] = ((at >> CACHE_SHIFT) & 4095) | TAG_VALID
+                        yield
+                    value = cached
+                elif at == UART or at == UART_STATUS:
+                    if not key_waiting:          # (a key from the PC, kept until read)
+                        got, key = yield from take_key(port)
+                        key_waiting = got
+                        waiting_key = key
+                    if at == UART:
+                        value = waiting_key if key_waiting else 0
+                        key_waiting = 0
+                    else:
+                        value = (0x60 | key_waiting) << 8 * (UART_STATUS & 3)
+                elif at == KEYS:
+                    value = port.keys
+                elif at == MTIMECMP:
+                    value = compare_lo
+                elif at == MTIMECMP + 4:
+                    value = compare_hi
+                elif at == MTIME:
+                    value = port.mtime_lo
+                elif at == MTIME + 4:
+                    value = port.mtime_hi
+                if not two or second:
+                    break
+                low = value
+                second = 1
+                at = (((address >> 2) + 1) << 2) & MASK
+                yield
+            # (the bytes asked for, at the bottom)
+            if two:
+                part = (((value << 32) | low) >> ((address & 3) * 8)) & MASK
+            else:
+                part = value >> ((address & 3) * 8)
             if f3 == 0:
                 result = ((part & 255) - (((part >> 7) & 1) << 8)) & MASK
             elif f3 == 1:
@@ -379,46 +422,50 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS, pc_patience=PC_PATIENCE):
             elif f3 == 5:
                 result = part & 65535
             else:
-                result = value
-            write = 1 - trap
+                result = part & MASK
+            write = 1
         elif op == 0x23:                         # sb sh sw
             address = (a + imm_s) & MASK
-            if (f3 == 2 and address & 3) or (f3 == 1 and address & 1):
-                trap = 1                         # (misaligned)
-                trap_cause = 6
-                trap_with = address
-            elif address < 4 * RAM_WORDS:
-                k = address >> 2
-                if f3 == 2:
-                    ram[k] = b
-                else:                            # (a byte or a half: into the word around it)
-                    word = ram[k]
+            # (at any address: its bytes, b's lowest at address, in the word
+            # there and, across a word's end, the next; each word's own,
+            # data and byte_mask, written a clock apart)
+            size = 1 if f3 == 0 else (2 if f3 == 1 else 4)
+            two = (address & 3) + size > 4
+            spread = (b & ((1 << (8 * size)) - 1)) << ((address & 3) * 8)
+            spread_mask = ((1 << size) - 1) << (address & 3)
+            data = spread & MASK
+            byte_mask = spread_mask & 15
+            at = address
+            second = 0
+            while True:
+                bits = ((byte_mask & 1) * 0xFF) | (((byte_mask >> 1) & 1) * 0xFF00) \
+                    | (((byte_mask >> 2) & 1) * 0xFF0000) | ((byte_mask >> 3) * 0xFF000000)
+                if at < 4 * RAM_WORDS:
+                    k = at >> 2
+                    if byte_mask == 15:
+                        ram[k] = data
+                    else:                        # (some bytes: into the word around them)
+                        word = ram[k]
+                        yield
+                        ram[k] = (word & (MASK ^ bits)) | data
+                elif at >> 25 == SDRAM >> 25:
+                    # (written through: to the SDRAM, just those bytes, and
+                    # into the cache if the line is there)
+                    cached = cache[(at >> 2) & (CACHE_WORDS - 1)]
+                    tag = tags[(at >> 5) & (LINES - 1)]
                     yield
-                    at = (address & 3) * 8
-                    keep = 255 if f3 == 0 else 65535
-                    # (each & MASK: 32 bits, as the RAM's words; a half at byte 3 traps first)
-                    ram[k] = (word & (MASK ^ ((keep << at) & MASK))) | (((b & keep) << at) & MASK)
-            elif address >> 25 == SDRAM >> 25:
-                # (written through: to the SDRAM, a byte or a half just those,
-                # and into the cache if the line is there)
-                at = (address & 3) * 8
-                data = b
-                byte_mask = 15
-                bits = MASK
-                if f3 == 0:
-                    data = ((b & 255) << at) & MASK
-                    byte_mask = 1 << (address & 3)
-                    bits = (255 << at) & MASK
-                elif f3 == 1:
-                    data = ((b & 65535) << at) & MASK
-                    byte_mask = (3 << (address & 3)) & 15
-                    bits = (65535 << at) & MASK
-                cached = cache[(address >> 2) & (CACHE_WORDS - 1)]
-                tag = tags[(address >> 5) & (LINES - 1)]
+                    if tag == ((at >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                        cache[(at >> 2) & (CACHE_WORDS - 1)] = (cached & (MASK ^ bits)) | data
+                    yield from sdram_write(port, (at >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
+                if not two or second:
+                    break
+                second = 1
+                at = (((address >> 2) + 1) << 2) & MASK
+                data = spread >> 32
+                byte_mask = spread_mask >> 4
                 yield
-                if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
-                    cache[(address >> 2) & (CACHE_WORDS - 1)] = (cached & (MASK ^ bits)) | data
-                yield from sdram_write(port, (address >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
+            if address < 4 * RAM_WORDS or address >> 25 == SDRAM >> 25:
+                pass                             # (the memory's: done)
             elif address == UART and divisor_latch == 0:
                 # (a copy to the PC over the JTAG UART: while the PC reads it,
                 # waiting for room there, up to pc_patience clocks; the room
@@ -634,9 +681,8 @@ def machine_timer(port, tick=50):
 # ----------------------------- the computer -----------------------------
 
 # On the board: the display's pins, the JTAG UART for the keyboard and a copy of
-# the console, the LEDs and
-# keys, the SDRAM's (the display and the SDRAM both have a cs_n: in the
-# computer, display_cs_n and sdram_cs_n)
+# the console, the LEDs and keys, the SDRAM's (the display and the SDRAM both
+# have a cs_n: in the computer, display_cs_n and sdram_cs_n)
 PINS = dict(T.PINS, kb="JTAG_RX_DATA", kb_valid="JTAG_RX_VALID", kb_ready="JTAG_RX_READY",
             jtag_tx="JTAG_TX_DATA", jtag_tx_send="JTAG_TX_VALID", jtag_tx_room="JTAG_TX_READY",
             leds="LED", keys="KEY")
@@ -651,24 +697,90 @@ SDRAM_WIRES = {**{f"sdram.{n}": f"cpu.{n}" for n in ("req", "req_write", "req_ad
                                                      "req_mask", "req_line")},
                **{f"cpu.{n}": f"sdram.{n}" for n in ("req_ready", "resp_valid", "resp_data")}}
 
+# The screen's picture, for screen="framebuffer": 240 x 320 pixels, RGB565 (red in
+# the top 5 bits), row after row from the top left, two pixels a word (the
+# left one in the low half): 153,600 bytes in the SDRAM, below the device tree
+FRAMEBUFFER = 0x81FD0000
+SCREEN_WIDTH = 240
+
+
+def framebuffer_scan(port, base=(FRAMEBUFFER >> 2) & (SDRAM_WORDS - 1), width=SCREEN_WIDTH,
+                     height=T.SCREEN_HEIGHT):
+    """The screen's picture from the SDRAM, frame after frame, for the display:
+    a line of LINE_WORDS words (2 x LINE_WORDS pixels) at a time from the
+    controller's second client (req2, req2_address; req2_ready, resp2_valid,
+    resp_data), each pixel sent on (color, valid; ready). base: the picture's
+    word address in the SDRAM."""
+    port.req2 = 0
+    port.req2_address = 0
+    port.valid = 0
+    port.color = 0
+    words = [0] * LINE_WORDS                     # a line's words, as they came
+    while True:
+        address = base
+        k = 0
+        while k < width * height // (2 * LINE_WORDS):
+            port.req2_address = address
+            port.req2 = 1
+            yield
+            yield from wait_until(port, "req2_ready")
+            port.req2 = 0
+            j = 0
+            while j < LINE_WORDS:
+                yield from wait_until(port, "resp2_valid")
+                words[j] = port.resp_data
+                j = j + 1
+                yield
+            j = 0
+            while j < LINE_WORDS:
+                yield from stream_send(port, words[j] & 0xFFFF, data="color")
+                yield from stream_send(port, words[j] >> 16, data="color")
+                j = j + 1
+            address = (address + LINE_WORDS) & (SDRAM_WORDS - 1)
+            k = k + 1
+        yield                                    # (a clock between frames)
+
+
+def always_ready(port):
+    """ready always 1: for screen="framebuffer", the console's characters
+    taken at once (the PC has its copy)."""
+    port.ready = 1
+    while True:
+        yield
+
 
 def computer(image, lcd=T.LCD, columns=T.COLUMNS, rows=T.ROWS, height=T.SCREEN_HEIGHT,
-             timing=TIMING):
-    """The CPU running the memory image `image`, its console the terminal on
-    the display, the SDRAM at 0x8000_0000."""
+             timing=TIMING, screen="terminal", width=SCREEN_WIDTH, framebuffer=FRAMEBUFFER):
+    """The CPU running the memory image `image`, the SDRAM at 0x8000_0000.
+    The display shows, screen="terminal": the console, as text; screen=
+    "framebuffer": the picture at `framebuffer` in the SDRAM (width x height)."""
     cpu = functools.partial(rv32ima, image=image)
     controller = functools.partial(sdram_controller, timing=timing)
-    screen = functools.partial(T.terminal, columns=columns, rows=rows, height=height)
-    width = columns * 8
+    wires = {"cpu.mtime_lo": "timer.mtime_lo", "cpu.mtime_hi": "timer.mtime_hi", **SDRAM_WIRES}
+    if screen == "terminal":
+        picture = functools.partial(T.terminal, columns=columns, rows=rows, height=height)
+        width = columns * 8
+        shows = dict(terminal=(picture, {"ready": 1}), name="riscv_computer")
+        wires.update({"terminal.rx": "cpu.tx", "terminal.rx_valid": "cpu.tx_valid",
+                      "cpu.tx_ready": "terminal.rx_ready", "display.color": "terminal.color",
+                      "display.valid": "terminal.valid", "terminal.ready": "display.ready"})
+    elif screen == "framebuffer":
+        picture = functools.partial(framebuffer_scan, base=(framebuffer >> 2) & (SDRAM_WORDS - 1),
+                                    width=width, height=height)
+        shows = dict(picture=(picture, {"req2_ready": 1, "resp2_valid": 1, "resp_data": 32,
+                                        "ready": 1, "k": 16}),       # (k: a frame's lines)
+                     console=(always_ready, {}), name="riscv_framebuffer_computer")
+        wires.update({"cpu.tx_ready": "console.ready", "display.color": "picture.color",
+                      "display.valid": "picture.valid", "picture.ready": "display.ready",
+                      "sdram.req2": "picture.req2", "sdram.req2_address": "picture.req2_address",
+                      "picture.req2_ready": "sdram.req2_ready",
+                      "picture.resp2_valid": "sdram.resp2_valid", "picture.resp_data": "sdram.resp_data"})
+    else:
+        raise ValueError(f"screen: 'terminal' or 'framebuffer', not {screen!r}")
     display = functools.partial(T.ili9341_display, lcd=lcd, width=width, height=height)
-    return connect(timer=(machine_timer, {}), cpu=(cpu, CPU_ATTR), terminal=(screen, {"ready": 1}),
+    return connect(timer=(machine_timer, {}), cpu=(cpu, CPU_ATTR),
                    display=(display, {"color": 16, "valid": 1}), sdram=(controller, SDRAM_ATTR),
-                   name="riscv_computer",
-                   wires={"cpu.mtime_lo": "timer.mtime_lo", "cpu.mtime_hi": "timer.mtime_hi",
-                          "terminal.rx": "cpu.tx", "terminal.rx_valid": "cpu.tx_valid",
-                          "cpu.tx_ready": "terminal.rx_ready",
-                          "display.color": "terminal.color", "display.valid": "terminal.valid",
-                          "terminal.ready": "display.ready", **SDRAM_WIRES})
+                   **shows, wires=wires)
 
 
 def cpu_with_sdram(image, timing=TIMING):
@@ -722,6 +834,7 @@ if __name__ == "__main__":
         print(f"{sources[0]} printed {run.value.decode()!r} in {len(run.inputs):,} clock cycles")
     if "--pins" in args:
         program = next((a for a in args if a.endswith((".c", ".S"))), "hello.c")
-        board = Py2ver(computer(build(program)), pins=PINS)
+        screen = "framebuffer" if "--framebuffer" in args else "terminal"
+        board = Py2ver(computer(build(program), screen=screen), pins=PINS)
         print(board.PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))

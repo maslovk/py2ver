@@ -21,6 +21,14 @@ A line's words (its address a multiple of LINE_WORDS) come a word every two
 clocks, all from one opening of the row: 8 words in 24 clocks, where eight
 reads of a word take 80.
 
+A second client (a display reading its picture, say) may read lines too:
+
+    req2, req2_address                               -> a line's read
+    req2_ready                                       <- 1 for the clock it is taken
+    resp2_valid (resp_data)                          <- its words, each for a clock
+
+and when both ask at once, they take turns.
+
 A word is two halfwords next to each other in a row: the controller opens the
 row, reads or writes the two (the second closing the row again), and every
 7 us or so refreshes the chip. Its pins (pins=SDRAM_PINS) are the SDRAM's;
@@ -64,7 +72,7 @@ SDRAM_PINS = {"dram_clk": "DRAM_CLK", "cke": "DRAM_CKE", "cs_n": "DRAM_CS_N",
 
 # The controller's attr: the client's inputs, and the pins' kinds
 SDRAM_ATTR = {"req": 1, "req_write": 1, "req_line": 1, "req_address": 23, "req_data": 32,
-              "req_mask": 4, "dq_in": 16, "dq_out": {"width": 16, "tristate": "dq_oe"},
+              "req_mask": 4, "req2": 1, "req2_address": 23, "dq_in": 16, "dq_out": {"width": 16, "tristate": "dq_oe"},
               "dram_clk": {"width": 1, "clock": "inverted"}}
 
 
@@ -82,7 +90,7 @@ def sdram_command(port, ras_n, cas_n, we_n):
 
 
 def sdram_controller(port, timing=TIMING):
-    """The controller: the chip set up, then the client's accesses and the refreshes."""
+    """The controller: the chip set up, then the clients' accesses and the refreshes."""
     port.dram_clk = 0                    # (the board drives it: the clock, inverted)
     port.cke = 1
     port.cs_n = 1
@@ -97,6 +105,8 @@ def sdram_controller(port, timing=TIMING):
     port.req_ready = 0
     port.resp_valid = 0
     port.resp_data = 0
+    port.req2_ready = 0
+    port.resp2_valid = 0
     # ---- power-up: wait, precharge every bank, refresh twice, set the mode ----
     yield timing.power_up
     port.addr = 1 << 10                  # (A10: all banks)
@@ -112,22 +122,34 @@ def sdram_controller(port, timing=TIMING):
     yield timing.mrd
     port.dqm = 0
     since = 0                                        # clocks since the last refresh
+    turn = 0                                         # (1: the second client's turn, both asking)
     while True:
         if since >= timing.refresh:                  # ---- a refresh ----
             yield from sdram_command(port, 0, 0, 1)
             yield timing.rfc
             since = 0
-        elif port.req:                               # ---- the client's access ----
-            write = port.req_write
-            line = port.req_line
-            word = port.req_address
-            data = port.req_data
-            mask = port.req_mask
-            port.req_ready = 1
+        elif port.req or port.req2:                  # ---- a client's access ----
+            second = port.req2 and (turn or not port.req)
+            turn = 0 if second else 1
+            write = 0
+            line = 1
+            word = port.req2_address
+            data = 0
+            mask = 0
+            if second:
+                port.req2_ready = 1
+            else:
+                write = port.req_write
+                line = port.req_line
+                word = port.req_address
+                data = port.req_data
+                mask = port.req_mask
+                port.req_ready = 1
             port.ba = word >> 21                     # (bank, row, the first halfword's column)
             port.addr = (word >> 8) & 8191
             yield from sdram_command(port, 0, 1, 1)  # ACTIVE: the row open
             port.req_ready = 0
+            port.req2_ready = 0
             yield timing.rcd - 1
             column = (word & 255) << 1
             if write:
@@ -152,6 +174,7 @@ def sdram_controller(port, timing=TIMING):
                 low = 0
                 while j < 2 * LINE_WORDS + timing.read_delay:
                     port.resp_valid = 0
+                    port.resp2_valid = 0
                     if j < 2 * LINE_WORDS:
                         port.cs_n = 0                # READ
                         port.cas_n = 0
@@ -162,12 +185,16 @@ def sdram_controller(port, timing=TIMING):
                     if j >= timing.read_delay:
                         if (j - timing.read_delay) & 1:
                             port.resp_data = (port.dq_in << 16) | low
-                            port.resp_valid = 1
+                            if second:
+                                port.resp2_valid = 1
+                            else:
+                                port.resp_valid = 1
                         else:
                             low = port.dq_in
                     yield
                     j = j + 1
                 port.resp_valid = 0
+                port.resp2_valid = 0
                 since = since + timing.rcd + 2 * LINE_WORDS + timing.read_delay
             else:
                 port.addr = column
@@ -246,12 +273,14 @@ class SdramModel:
     open, a refresh with a row open, a write not driving the bus.
 
     mem: halfword address -> value. commands: each command as it came,
-    (clock, name, bank, address), for a test to check the timing of.
+    (clock, name, bank, address), for a test to check the timing of. cs_n:
+    the chip select's name in the design (sdram_cs_n, say, beside a display's).
     """
 
-    def __init__(self, delay=TIMING.read_delay):
+    def __init__(self, delay=TIMING.read_delay, cs_n="cs_n"):
         self.mem = {}
         self.delay = delay
+        self.cs_n = cs_n
         self.open = {}                           # bank -> its open row
         self.commands = []
 
@@ -264,7 +293,7 @@ class SdramModel:
                 p[0] -= 1
             if pending and pending[0][0] == 0:
                 dut.dq_in = pending.pop(0)[1]
-            if dut.cs_n == 0:
+            if getattr(dut, self.cs_n) == 0:
                 self.command(dut, clock, pending)
             clock += 1
             yield

@@ -1,7 +1,7 @@
 # A check of the CPU's machine mode: the CSRs, traps (ecall, ebreak, an
-# illegal instruction, misaligned loads and stores), the timer interrupt and
-# mret; and of user mode: mret into it, an ecall from it. Prints "OK", or
-# "FAIL n" for the first check that went wrong.
+# illegal instruction, misaligned atomics), the timer interrupt and mret; of
+# user mode: mret into it, an ecall from it; and of loads and stores across a
+# word's end. Prints "OK", or "FAIL n" for the first check that went wrong.
 
     .equ CONSOLE, 0x10000000
     .equ MTIMECMP, 0x11004000
@@ -53,15 +53,15 @@ _start:
     .word 0                          # (all zeros: an illegal instruction)
     check s2, 2, 12
     li   t0, 2
-    lw   t1, 0(t0)                   # (a word at an address not a multiple of 4)
-    check s2, 4, 13
+    amoadd.w t1, zero, (t0)          # (an atomic at an address not a multiple of 4)
+    check s2, 6, 13
     check s3, 2, 14                  # (mtval: the address)
     li   t0, 1
-the_sh:
-    sh   t1, 0(t0)
+the_amo:
+    amoswap.w t1, t1, (t0)
     check s2, 6, 15
-    csrr t1, mepc                    # (mepc: the sh's address, which the handler moved on by 4)
-    la   t2, the_sh
+    csrr t1, mepc                    # (mepc: the amoswap's address, which the handler moved on by 4)
+    la   t2, the_amo
     addi t2, t2, 4
     li   gp, 16
     bne  t1, t2, fail
@@ -104,6 +104,32 @@ in_user:
     li   t0, 0x1800
     and  t1, s4, t0
     check t1, 0x1800, 23             # (MPP in the trap: machine)
+
+    # ---- loads and stores at any address, across a word's end too (bytes
+    # 0 to 3: 44 33 22 11, 4 to 7: 88 77 66 55) ----
+    li   t0, 0x3000
+    li   t1, 0x11223344
+    sw   t1, 0(t0)
+    li   t1, 0x55667788
+    sw   t1, 4(t0)
+    lw   t1, 1(t0)
+    check t1, 0x88112233, 24
+    lhu  t1, 3(t0)
+    check t1, 0x8811, 25
+    lh   t1, 3(t0)
+    check t1, 0xFFFF8811, 26
+    li   t1, 0xAABBCCDD
+    sw   t1, 3(t0)                   # (bytes 3 to 6)
+    lw   t1, 0(t0)
+    check t1, 0xDD223344, 27
+    lw   t1, 4(t0)
+    check t1, 0x55AABBCC, 28
+    li   t1, 0xEEFF
+    sh   t1, 7(t0)                   # (bytes 7 and 8)
+    lw   t1, 4(t0)
+    check t1, 0xFFAABBCC, 29
+    lw   t1, 8(t0)
+    check t1, 0xEE, 30
 
     la   a0, ok
     call print

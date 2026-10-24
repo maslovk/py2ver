@@ -9,16 +9,27 @@
 # display), what is typed goes to it.
 #
 #   python examples/riscv_linux.py --pins      # build the computer with the boot loader for the board
+#   python examples/riscv_linux.py --pins --framebuffer   # its display the framebuffer (our kernel's)
 #   python examples/riscv_linux.py --boot      # (the board programmed) load Linux, start it, its console
 #   python examples/riscv_linux.py --boot --watch 60    # the console for 60 s, nothing typed
 #   python examples/riscv_linux.py --console   # the console of a board already running Linux
+#   python examples/riscv_linux.py --boot --kernel PATH # another kernel (our own, say)
+#   python examples/riscv_linux.py --build-linux        # our own kernel and BusyBox (Buildroot)
 #
 # (Log in as root, no password. juart-terminal, in Quartus's bin directory, is a
 # console too.)
 #
 # The kernel: linux-6.1.14-rv32nommu-cnl-1.zip of github.com/cnlohr/mini-rv32ima-images,
 # unpacked to ~/opt/riscv/linux/image/Image (or LINUX_IMAGE names it).
+#
+# Our own (--build-linux): mini-rv32ima's Buildroot (git clone --recurse-submodules
+# --depth 1 https://github.com/cnlohr/buildroot ~/opt/riscv/buildroot) with its
+# configurations, the kernel's with KERNEL_OPTIONS (the framebuffer, Linux's
+# console and logo on it, /dev/mem); about an hour. Its kernel:
+# ~/opt/riscv/buildroot/output/images/Image (boot it with --kernel).
+import hashlib
 import os
+import urllib.request
 import select
 import subprocess
 import sys
@@ -30,6 +41,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import riscv_computer as R  # noqa: E402
 
 KERNEL = os.environ.get("LINUX_IMAGE", os.path.expanduser("~/opt/riscv/linux/image/Image"))
+BUILDROOT = os.environ.get("BUILDROOT", os.path.expanduser("~/opt/riscv/buildroot"))
+BUILT_KERNEL = os.path.join(BUILDROOT, "output", "images", "Image")
 KERNEL_AT = 0x80000000
 TREE_AT = 0x81FFC000                     # (after the memory linux.dts gives Linux)
 
@@ -42,6 +55,64 @@ def device_tree():
                         os.path.join(R.PROGRAMS, "linux.dts")], check=True)
         tree = open(out, "rb").read()
     return tree + bytes(-len(tree) % 4)
+
+
+# ----------------------------- our own Linux -----------------------------
+
+# mini-rv32ima's configurations (github.com/cnlohr/mini-rv32ima, configs/), each
+# file's git hash, and where it goes in Buildroot's folder (the kernel's: with
+# KERNEL_OPTIONS)
+MINI_RV32IMA = "https://raw.githubusercontent.com/cnlohr/mini-rv32ima/master/configs/"
+CONFIGS = {
+    "buildroot_config": ("3d85234bed1f6a95651999d50395e5332624a800", ".config"),
+    "busybox_config": ("2a2c0eff5daf6aefb1485fe158f2aa77c51990cb", "busybox_config"),
+    "uclibc_config": ("bda6efc73b93bd4cda25b94c162850c2fba1419a", "uclibc_config"),
+    "custom_kernel_config": ("ad1c3608add01c8bb38868b3318413c68e61c45d", "kernel_config"),
+    "rootfsoverlay/etc/fstab": ("1ec4ecaca50f64db9bc9063b507a6744f445f8bc", "py2ver_overlay/etc/fstab"),
+    "rootfsoverlay/etc/inittab": ("d20e6958e033594ae2ab694c14d74f2a65a049fc",
+                                  "py2ver_overlay/etc/inittab"),
+}
+
+# The kernel's options beyond mini-rv32ima's: the framebuffer (linux.dts's
+# simple-framebuffer, /dev/fb0), Linux's console on it with its logo, /dev/mem
+KERNEL_OPTIONS = {"CONFIG_FB": "y", "CONFIG_FB_DEVICE": "y", "CONFIG_FB_SIMPLE": "y",
+                  "CONFIG_FRAMEBUFFER_CONSOLE": "y", "CONFIG_LOGO": "y",
+                  "CONFIG_LOGO_LINUX_CLUT224": "y", "CONFIG_DEVMEM": "y"}
+
+
+def git_hash(data):
+    """A file's git hash (git hash-object's)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def with_options(config, options):
+    """A kernel configuration with options set (each one's old line, set or
+    'is not set', taken out)."""
+    lines = [line for line in config.splitlines()
+             if not any(line.startswith(f"{o}=") or line == f"# {o} is not set" for o in options)]
+    return "\n".join(lines + [f"{o}={v}" for o, v in options.items()]) + "\n"
+
+
+def prepare_buildroot(buildroot=BUILDROOT):
+    """mini-rv32ima's configurations into Buildroot's folder, each checked,
+    the kernel's with KERNEL_OPTIONS, the root's files from the overlay."""
+    if not os.path.isdir(buildroot):
+        raise FileNotFoundError(f"no Buildroot in {buildroot}: git clone --recurse-submodules "
+                                f"--depth 1 https://github.com/cnlohr/buildroot {buildroot}")
+    for name, (sha, to) in CONFIGS.items():
+        data = urllib.request.urlopen(MINI_RV32IMA + name, timeout=60).read()
+        if git_hash(data) != sha:
+            raise ValueError(f"{name}: not the file expected (its git hash {git_hash(data)})")
+        if name == "custom_kernel_config":
+            data = with_options(data.decode(), KERNEL_OPTIONS).encode()
+        if name == "buildroot_config":       # (the overlay: in the same build)
+            overlay = os.path.join(buildroot, "py2ver_overlay")
+            data = data.replace(b'BR2_ROOTFS_OVERLAY=""', f'BR2_ROOTFS_OVERLAY="{overlay}"'.encode())
+        path = os.path.join(buildroot, to)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "wb").write(data)
+        if name == "uclibc_config":           # (its fragment too, as mini-rv32ima's Makefile)
+            open(os.path.join(buildroot, "uclibc_config_extra"), "wb").write(data)
 
 
 def word(n):
@@ -114,13 +185,18 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if "--pins" in args:
         from py2ver import Py2ver
-        board = Py2ver(R.computer(R.build("boot.c")), pins=R.PINS)
+        screen = "framebuffer" if "--framebuffer" in args else "terminal"
+        board = Py2ver(R.computer(R.build("boot.c"), screen=screen), pins=R.PINS)
         print(board.PINS({"QUARTUS_DIR": os.environ.get(
             "QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")}))
+    if "--build-linux" in args:
+        prepare_buildroot()
+        subprocess.run(["make", "-C", BUILDROOT], check=True)
+        print(f"the kernel: {BUILT_KERNEL}")
     if "--boot" in args or "--console" in args:
         from py2ver.jtag_uart import JtagUart
         with JtagUart(os.environ.get("QUARTUS_DIR", "/opt/intelFPGA/22.1std/quartus/bin")) as link:
             if "--boot" in args:
-                boot(link)
+                boot(link, args[args.index("--kernel") + 1] if "--kernel" in args else KERNEL)
             watch = args[args.index("--watch") + 1] if "--watch" in args else None
             console(link, None if watch is None else float(watch))
