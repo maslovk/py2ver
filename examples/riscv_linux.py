@@ -17,6 +17,8 @@
 #   python examples/riscv_linux.py --build-linux        # our own kernel and BusyBox (Buildroot)
 #   python examples/riscv_linux.py --build-linux-mmu    # Linux with the MMU, and OpenSBI
 #   python examples/riscv_linux.py --boot --mmu         # (the board programmed) boot it
+#   python examples/riscv_linux.py --console --keys     # the console, each key sent as it is pressed
+#                                                       # (for Doom: type doom; Ctrl-] leaves)
 #
 # (Log in as root, no password. juart-terminal, in Quartus's bin directory, is a
 # console too.)
@@ -37,10 +39,15 @@
 # OpenSBI in machine mode under it (its generic platform, fw_jump); BusyBox,
 # the overlay, as before. --boot --mmu loads OpenSBI (to 0x8000_0000), the
 # kernel (0x8040_0000) and linux_mmu.dts, and starts OpenSBI.
+#
+# Its root has Doom too (DOOM_PACKAGE): doomgeneric with examples/riscv/
+# doom_py2ver.c, its picture on the display, its keys from the console, and
+# the shareware WAD. Run doom from the shell, on a console started with --keys.
 import hashlib
 import os
 import urllib.request
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +63,7 @@ BUILT_KERNEL = os.path.join(BUILDROOT, "output", "images", "Image")
 MMU_OUTPUT = os.path.join(BUILDROOT, "output-mmu")
 MMU_KERNEL = os.path.join(MMU_OUTPUT, "images", "Image")
 MMU_FIRMWARE = os.path.join(MMU_OUTPUT, "images", "fw_jump.bin")
+MMU_EXTERNAL = os.path.join(BUILDROOT, "py2ver_mmu", "external")   # (Doom's package: see DOOM_PACKAGE)
 KERNEL_AT = 0x80000000
 FIRMWARE_AT = 0x80000000                 # (with the MMU: OpenSBI here,
 MMU_KERNEL_AT = 0x80400000               # the kernel here, 4 MB on: Sv32's megapage)
@@ -185,6 +193,7 @@ BR2_TARGET_OPENSBI_PLAT="generic"
 BR2_TARGET_OPENSBI_ADDITIONAL_VARIABLES="PLATFORM_RISCV_ISA=rv32ima_zicsr_zifencei PLATFORM_RISCV_ABI=ilp32 \
 FW_TEXT_START=0x80000000 FW_JUMP_ADDR=0x80400000 FW_JUMP_FDT_ADDR=0x81FFC000"
 BR2_GLOBAL_PATCH_DIR="{patches}"
+BR2_PACKAGE_PY2VER_DOOM=y
 """
 
 # OpenSBI's generic platform sets FW_JUMP_FDT_ADDR (0x8220_0000 on RV32: past
@@ -244,6 +253,64 @@ MMU_KERNEL_OPTIONS = {
 MMU_BUSYBOX_OPTIONS = {**BUSYBOX_OPTIONS, "CONFIG_TC": "n"}
 
 
+# Doom, as a Buildroot package in an external tree of ours (py2ver_mmu/
+# external, given to Buildroot as BR2_EXTERNAL): doomgeneric at DOOM_VERSION
+# (its archive's hash checked), built by its Makefile.linuxvt with our
+# platform file in place of that one, CMAP256 (palette indices, which
+# doom_py2ver.c turns into RGB565) and Doom's own 320 by 200; installed as
+# /usr/bin/doom. With it the shareware WAD, unpacked as Buildroot's doom-wad
+# does (which only its own Doom ports may select) from the same archive, its
+# hash Buildroot's: in /usr/share/games/doom, where Doom looks.
+DOOM_VERSION = "e257a09527062bfb986b6e5e0780839b6cbd5b71"
+DOOM_ARCHIVE_SHA256 = "26f8f60daa6c6e4d3c01e5eac9fb700d592dede803d13ac848154ff356b2a2e7"
+DOOM_SHAREWARE = "https://www.jbserver.com/downloads/games/doom/misc/shareware/doom19s.zip"
+DOOM_SHAREWARE_SHA256 = "cacf0142b31ca1af00796b4a0339e07992ac5f21bc3f81e7532fe1b5e1b486e6"
+DOOM_PLATFORM = os.path.join(R.PROGRAMS, "doom_py2ver.c")
+DOOM_PACKAGE = {
+    "external.desc": "name: PY2VER\ndesc: py2ver's packages for the RISC-V computer's MMU build\n",
+    "Config.in": 'source "$BR2_EXTERNAL_PY2VER_PATH/package/py2ver-doom/Config.in"\n',
+    "external.mk": "include $(sort $(wildcard $(BR2_EXTERNAL_PY2VER_PATH)/package/*/*.mk))\n",
+    "package/py2ver-doom/Config.in": """\
+config BR2_PACKAGE_PY2VER_DOOM
+	bool "py2ver-doom"
+	depends on BR2_USE_MMU
+	help
+	  Doom (doomgeneric) for the py2ver RISC-V computer: its picture
+	  on the display's framebuffer, its keys from the console; and
+	  the shareware WAD.
+""",
+    "package/py2ver-doom/py2ver-doom.hash":
+        f"sha256  {DOOM_ARCHIVE_SHA256}  py2ver-doom-{DOOM_VERSION}.tar.gz\n"
+        f"sha256  {DOOM_SHAREWARE_SHA256}  doom19s.zip\n",
+    "package/py2ver-doom/py2ver-doom.mk": f"""\
+PY2VER_DOOM_VERSION = {DOOM_VERSION}
+PY2VER_DOOM_SITE = $(call github,ozkl,doomgeneric,$(PY2VER_DOOM_VERSION))
+PY2VER_DOOM_EXTRA_DOWNLOADS = {DOOM_SHAREWARE}
+PY2VER_DOOM_LICENSE = GPL-2.0+
+PY2VER_DOOM_LICENSE_FILES = LICENSE
+
+PY2VER_DOOM_CFLAGS = $(TARGET_CFLAGS) -O2 -DCMAP256 -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 \\
+	-DNORMALUNIX -DLINUX -D_DEFAULT_SOURCE
+
+define PY2VER_DOOM_BUILD_CMDS
+	cp $(PY2VER_DOOM_PKGDIR)/doom_py2ver.c $(@D)/doomgeneric/
+	$(SED) 's/doomgeneric_linuxvt\\.o/doom_py2ver.o/' $(@D)/doomgeneric/Makefile.linuxvt
+	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D)/doomgeneric -f Makefile.linuxvt \\
+		CC="$(TARGET_CC)" CFLAGS="$(PY2VER_DOOM_CFLAGS)" OUTPUT=doom
+	$(UNZIP) -p $(PY2VER_DOOM_DL_DIR)/doom19s.zip 'DOOMS_19.[12]' > $(@D)/doom-1.9.zip
+	$(UNZIP) -o -d $(@D) $(@D)/doom-1.9.zip DOOM1.WAD
+endef
+
+define PY2VER_DOOM_INSTALL_TARGET_CMDS
+	$(INSTALL) -D -m 0755 $(@D)/doomgeneric/doom $(TARGET_DIR)/usr/bin/doom
+	$(INSTALL) -D -m 0644 $(@D)/DOOM1.WAD $(TARGET_DIR)/usr/share/games/doom/doom1.wad
+endef
+
+$(eval $(generic-package))
+""",
+}
+
+
 def fragment(options):
     """A configuration fragment: each option set, or (n) not set."""
     return "".join(f"# {o} is not set\n" if v == "n" else f"{o}={v}\n" for o, v in options.items())
@@ -251,8 +318,9 @@ def fragment(options):
 
 def prepare_mmu_buildroot(buildroot=BUILDROOT):
     """The MMU build's configuration (and the overlay, prepare_buildroot's)
-    into Buildroot's folder: py2ver_mmu/defconfig, its two fragments, and
-    the patches (OPENSBI_PATCH)."""
+    into Buildroot's folder: py2ver_mmu/defconfig, its two fragments, the
+    patches (OPENSBI_PATCH), and the external tree with Doom's package
+    (DOOM_PACKAGE, and doom_py2ver.c in it)."""
     prepare_buildroot(buildroot)
     folder = os.path.join(buildroot, "py2ver_mmu")
     os.makedirs(folder, exist_ok=True)
@@ -263,6 +331,12 @@ def prepare_mmu_buildroot(buildroot=BUILDROOT):
     patches = os.path.join(folder, "patches")
     os.makedirs(os.path.join(patches, "opensbi"), exist_ok=True)
     open(os.path.join(patches, "opensbi", "0001-fw-jump-fdt-addr-from-outside.patch"), "w").write(OPENSBI_PATCH)
+    external = os.path.join(folder, "external")
+    for name, text in DOOM_PACKAGE.items():
+        path = os.path.join(external, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write(text)
+    shutil.copy(DOOM_PLATFORM, os.path.join(external, "package", "py2ver-doom"))
     config = os.path.join(folder, "defconfig")
     open(config, "w").write(MMU_CONFIG.format(overlay=os.path.join(buildroot, "py2ver_overlay"),
                                               patches=patches, **files))
@@ -332,22 +406,40 @@ def boot(link, kernel=KERNEL):
     link.write(go_record(KERNEL_AT, TREE_AT))
 
 
-def console(link, seconds=None):
+def console(link, seconds=None, keys=False):
     """Be the board's console: print what it sends, send what is typed (a line
     at a time, as the terminal gives it). Ctrl-C to stop. seconds: only print
-    what it sends, for that long."""
+    what it sends, for that long. keys: send each key as it is pressed (the
+    terminal raw, so Ctrl-C and the arrow keys go to the board too, as Doom
+    wants them); Ctrl-] to stop."""
     end = None if seconds is None else time.time() + seconds
+    raw = keys and end is None and sys.stdin.isatty()
+    if raw:
+        import termios
+        import tty
+        settings_before = termios.tcgetattr(sys.stdin)
+        tty.setraw(sys.stdin)
     try:
         while end is None or time.time() < end:
             sys.stdout.write(link.read(None, 0.05).decode(errors="replace"))
             sys.stdout.flush()
             if end is None and select.select([sys.stdin], [], [], 0)[0]:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-                link.write(line.encode())
+                if raw:
+                    typed = os.read(sys.stdin.fileno(), 64)
+                    if not typed or b"\x1d" in typed:        # (Ctrl-])
+                        break
+                    link.write(typed)
+                else:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    link.write(line.encode())
     except KeyboardInterrupt:
         pass
+    finally:
+        if raw:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings_before)
+            print()
 
 
 if __name__ == "__main__":
@@ -366,8 +458,8 @@ if __name__ == "__main__":
         print(f"the kernel: {BUILT_KERNEL}")
     if "--build-linux-mmu" in args:
         config = prepare_mmu_buildroot()
-        subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}", f"BR2_DEFCONFIG={config}", "defconfig"],
-                       check=True)
+        subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}", f"BR2_EXTERNAL={MMU_EXTERNAL}",
+                        f"BR2_DEFCONFIG={config}", "defconfig"], check=True)
         subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}", "busybox-dirclean", "linux-dirclean"],
                        check=True)
         subprocess.run(["make", "-C", BUILDROOT, f"O={MMU_OUTPUT}"], check=True)
@@ -380,4 +472,4 @@ if __name__ == "__main__":
             elif "--boot" in args:
                 boot(link, args[args.index("--kernel") + 1] if "--kernel" in args else KERNEL)
             watch = args[args.index("--watch") + 1] if "--watch" in args else None
-            console(link, None if watch is None else float(watch))
+            console(link, None if watch is None else float(watch), keys="--keys" in args)

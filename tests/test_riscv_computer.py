@@ -248,6 +248,24 @@ def test_the_mmu_device_tree_and_build_suit_the_cpu():
     assert "# CONFIG_CRYPTO is not set\n" in options and "# CONFIG_LIBCRC32C is not set\n" in options
 
 
+def test_doom_s_package_builds_doomgeneric_with_our_platform_file():
+    import riscv_linux as L
+    config = L.MMU_CONFIG.format(overlay="o", kernel_options="k", busybox_options="b", patches="p")
+    assert "BR2_PACKAGE_PY2VER_DOOM=y" in config
+    package = L.DOOM_PACKAGE["package/py2ver-doom/py2ver-doom.mk"]
+    assert f"PY2VER_DOOM_VERSION = {L.DOOM_VERSION}" in package
+    assert "cp $(PY2VER_DOOM_PKGDIR)/doom_py2ver.c" in package and "-DCMAP256" in package
+    # (the hash file names the archive Buildroot's github helper downloads, and
+    # the shareware WAD's)
+    hashes = L.DOOM_PACKAGE["package/py2ver-doom/py2ver-doom.hash"].split()
+    assert hashes[2] == f"py2ver-doom-{L.DOOM_VERSION}.tar.gz" and hashes[5] == "doom19s.zip"
+    assert "/usr/share/games/doom/doom1.wad" in package
+    platform = open(L.DOOM_PLATFORM).read()
+    for function in ("DG_Init", "DG_DrawFrame", "DG_SleepMs", "DG_GetTicksMs", "DG_GetKey",
+                     "DG_SetWindowTitle", "main"):
+        assert f" {function}(" in platform
+
+
 def test_our_kernel_s_options_take_the_place_of_mini_rv32ima_s():
     import riscv_linux as L
     assert L.git_hash(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"   # (git's own)
