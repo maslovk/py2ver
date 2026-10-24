@@ -1,5 +1,6 @@
-// A test of the SDRAM at 0x8000_0000 from riscv_computer.py's CPU. First it
-// runs a few instructions stored in the SDRAM. Then, pass after pass, it
+// A test of the SDRAM at 0x8000_0000 from riscv_computer.py's CPU, and of its
+// cache. First it runs a few instructions stored in the SDRAM, then changed
+// ones in their place. Then, pass after pass, it
 // writes every word, changes part of each with a byte or halfword store, and
 // reads them back: with a load, or for every other word an atomic add, which
 // must find the word as it was and leave it one more. It prints how many
@@ -55,10 +56,12 @@ static unsigned changed(unsigned x, unsigned k) {
     return x ^ (0xFFFFu << 16 * (k & 1));
 }
 
-// A function's instructions put into the SDRAM, then called there
-static int run_from_sdram(void) {
+// A function's instructions put into the SDRAM, then called there: it returns
+// `value` (under 2048). Called again with another value, it checks that the
+// new instructions are run, not the old ones the cache had.
+static int run_from_sdram(unsigned value) {
     volatile unsigned *code = SDRAM + ALL_WORDS - 2;
-    code[0] = 0x02a00513;                    // li a0, 42
+    code[0] = 0x00000513 | value << 20;      // li a0, value
     code[1] = 0x00008067;                    // ret
     __asm__ volatile ("fence.i");
     int (*function)(void) = (int (*)(void))code;
@@ -67,7 +70,8 @@ static int run_from_sdram(void) {
 
 int main(void) {
     print("SDRAM test\n");
-    print(run_from_sdram() == 42 ? "running from the SDRAM: ok\n" : "running from the SDRAM: wrong\n");
+    int ran = run_from_sdram(42) == 42 && run_from_sdram(43) == 43;
+    print(ran ? "running from the SDRAM: ok\n" : "running from the SDRAM: wrong\n");
     volatile unsigned char *bytes = (volatile unsigned char *)SDRAM;
     volatile unsigned short *halves = (volatile unsigned short *)SDRAM;
     unsigned seed = 1;

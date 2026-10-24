@@ -17,8 +17,10 @@
 #   0x1100_4000  the timer's mtimecmp (and +4, its upper half): the interrupt at mtime
 #   0x1100_BFF8  mtime (and +4): microseconds since reset
 #   0x1110_0000  write 0x5555: power off (the CPU stops); 0x7777: restart
-#   0x8000_0000  the SDRAM, 32 MB (py2ver.devices.sdram's controller): a word in
-#                about 10 clocks; instructions can be fetched from it too
+#   0x8000_0000  the SDRAM, 32 MB (py2ver.devices.sdram's controller), instructions
+#                and data through an 8 KB cache: a hit as fast as the RAM, a miss
+#                the line of 8 words read in about 30 clocks; stores written
+#                through (to the SDRAM, and to the cache if their line is there)
 #
 #   machine_timer --mtime--> cpu --characters--> terminal --color/valid/ready--> ili9341_display
 #                             ^
@@ -44,9 +46,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import terminal as T  # noqa: E402
 from py2ver import connect  # noqa: E402
-from py2ver.devices.sdram import (SDRAM_ATTR, SDRAM_PINS, TIMING, WORDS as SDRAM_WORDS,  # noqa: E402
-                                  sdram_controller, sdram_read, sdram_write)
-from py2ver.protocol import alongside, stream_send  # noqa: E402
+from py2ver.devices.sdram import (LINE_WORDS, SDRAM_ATTR, SDRAM_PINS, TIMING,  # noqa: E402
+                                  WORDS as SDRAM_WORDS, sdram_controller, sdram_read,
+                                  sdram_read_line, sdram_write)
+from py2ver.protocol import alongside, stream_send, wait_until  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAMS = os.path.join(HERE, "riscv")
@@ -57,6 +60,12 @@ LEDS, KEYS = 0x10001000, 0x10001004
 MTIMECMP, MTIME = 0x11004000, 0x1100BFF8
 SYSCON = 0x11100000
 SDRAM = 0x80000000                       # (to 0x81FF_FFFF: an address there has 0x40 above bit 25)
+# The SDRAM's cache: 8 KB, direct mapped, lines of LINE_WORDS words. A line's
+# tag: the address's bits 13 to 24, and bit 12 set (1: the line holds them).
+CACHE_WORDS = 2048
+LINES = CACHE_WORDS // LINE_WORDS
+CACHE_SHIFT = 13                         # (8 KB: the address's bits below 13 choose the word)
+TAG_VALID = 4096
 MASK = 0xFFFFFFFF                       # (the registers are 32 bits)
 MISA = (1 << 30) | (1 << 12) | (1 << 8) | (1 << 0)    # 32 bits; M, I, A
 
@@ -130,7 +139,7 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
 
     Outputs: the console's characters (tx, tx_valid; tx_ready: taken), the
     PC keyboard's kb_ready, leds; the SDRAM controller's requests (req,
-    req_write, req_address, req_data, req_mask). Inputs: tx_ready; the
+    req_write, req_line, req_address, req_data, req_mask). Inputs: tx_ready; the
     keyboard's kb, kb_valid; keys; mtime_lo, mtime_hi (from machine_timer);
     the SDRAM controller's req_ready, resp_valid, resp_data.
     """
@@ -142,8 +151,11 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
     port.req_address = 0
     port.req_data = 0
     port.req_mask = 15
+    port.req_line = 0
     ram = list(image)                            # the memory, the program in it
-    regs = [0] * 32                              # x0 to x31 (x0 never written: always 0)
+    cache = [0] * CACHE_WORDS                    # the SDRAM's cache: its lines' words,
+    tags = [0] * LINES                           # and each line's tag (0: holds nothing)
+    regs = [0] * 32                             # x0 to x31 (x0 never written: always 0)
     pc = 0
     # Machine mode's state (the CSRs)
     interrupts = 0                               # mstatus.MIE: interrupts on
@@ -171,13 +183,27 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
             trap_value = 0
             interrupts_before = interrupts
             interrupts = 0
-            pc = (trap_vector & 0xFFFFFFFC) + (28 if trap_vector & 1 else 0)   # (vectored: + 4 x 7)
-        # ---- fetch ----
-        if pc >> 25 == SDRAM >> 25:
-            instruction = yield from sdram_read(port, (pc >> 2) & (SDRAM_WORDS - 1))
-        else:
-            instruction = ram[(pc >> 2) & (RAM_WORDS - 1)]
-        yield
+            pc = ((trap_vector & 0xFFFFFFFC) + (28 if trap_vector & 1 else 0)) & MASK   # (vectored: + 4 x 7)
+        # ---- fetch: from the RAM, or from the SDRAM through the cache (on a
+        # miss, the line read into it, and the cache looked at again) ----
+        while True:
+            from_ram = ram[(pc >> 2) & (RAM_WORDS - 1)]
+            from_cache = cache[(pc >> 2) & (CACHE_WORDS - 1)]
+            fetch_tag = tags[(pc >> 5) & (LINES - 1)]
+            yield
+            if pc >> 25 != SDRAM >> 25 or fetch_tag == ((pc >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                break
+            yield from sdram_read_line(port, (pc >> 2) & (SDRAM_WORDS - LINE_WORDS))
+            base = (pc >> 2) & (CACHE_WORDS - LINE_WORDS)
+            k = 0
+            while k < LINE_WORDS:
+                yield from wait_until(port, "resp_valid")
+                cache[base + k] = port.resp_data
+                k = k + 1
+                yield
+            tags[(pc >> 5) & (LINES - 1)] = ((pc >> CACHE_SHIFT) & 4095) | TAG_VALID
+            yield
+        instruction = from_cache if pc >> 25 == SDRAM >> 25 else from_ram
         # ---- decode: the instruction's fields, the registers it reads ----
         op = instruction & 0x7F
         rd = (instruction >> 7) & 31
@@ -290,8 +316,24 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 word = ram[address >> 2]
                 yield
                 value = word
-            elif address >> 25 == SDRAM >> 25:
-                value = yield from sdram_read(port, (address >> 2) & (SDRAM_WORDS - 1))
+            elif address >> 25 == SDRAM >> 25:      # (through the cache, as a fetch)
+                while True:
+                    cached = cache[(address >> 2) & (CACHE_WORDS - 1)]
+                    tag = tags[(address >> 5) & (LINES - 1)]
+                    yield
+                    if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                        break
+                    yield from sdram_read_line(port, (address >> 2) & (SDRAM_WORDS - LINE_WORDS))
+                    base = (address >> 2) & (CACHE_WORDS - LINE_WORDS)
+                    k = 0
+                    while k < LINE_WORDS:
+                        yield from wait_until(port, "resp_valid")
+                        cache[base + k] = port.resp_data
+                        k = k + 1
+                        yield
+                    tags[(address >> 5) & (LINES - 1)] = ((address >> CACHE_SHIFT) & 4095) | TAG_VALID
+                    yield
+                value = cached
             elif address == UART or address == UART_STATUS:
                 if not key_waiting:              # (a key from the PC, kept until read)
                     got, key = yield from take_key(port)
@@ -339,17 +381,28 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                     yield
                     at = (address & 3) * 8
                     keep = 255 if f3 == 0 else 65535
-                    ram[k] = (word & (MASK ^ (keep << at))) | ((b & keep) << at)
-            elif address >> 25 == SDRAM >> 25:      # (a byte or a half: the SDRAM writes just those)
+                    # (each & MASK: 32 bits, as the RAM's words; a half at byte 3 traps first)
+                    ram[k] = (word & (MASK ^ ((keep << at) & MASK))) | (((b & keep) << at) & MASK)
+            elif address >> 25 == SDRAM >> 25:
+                # (written through: to the SDRAM, a byte or a half just those,
+                # and into the cache if the line is there)
                 at = (address & 3) * 8
                 data = b
                 byte_mask = 15
+                bits = MASK
                 if f3 == 0:
                     data = ((b & 255) << at) & MASK
                     byte_mask = 1 << (address & 3)
+                    bits = (255 << at) & MASK
                 elif f3 == 1:
                     data = ((b & 65535) << at) & MASK
-                    byte_mask = 3 << (address & 3)
+                    byte_mask = (3 << (address & 3)) & 15
+                    bits = (65535 << at) & MASK
+                cached = cache[(address >> 2) & (CACHE_WORDS - 1)]
+                tag = tags[(address >> 5) & (LINES - 1)]
+                yield
+                if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                    cache[(address >> 2) & (CACHE_WORDS - 1)] = (cached & (MASK ^ bits)) | data
                 yield from sdram_write(port, (address >> 2) & (SDRAM_WORDS - 1), data, byte_mask)
             elif address == UART:
                 yield from stream_send(port, b & 255, data="tx", valid="tx_valid", ready="tx_ready")
@@ -376,7 +429,11 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 trap_with = address
             elif kind == 3:                      # sc.w: done if lr.w's reservation is still here
                 if reserved and reservation == address:
-                    if in_sdram:
+                    if in_sdram:                 # (written through, as a store)
+                        tag = tags[(address >> 5) & (LINES - 1)]
+                        yield
+                        if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                            cache[(address >> 2) & (CACHE_WORDS - 1)] = b
                         yield from sdram_write(port, sdram_word, b)
                     else:
                         ram[k] = b
@@ -386,6 +443,8 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                 reserved = 0
             else:
                 if in_sdram:
+                    # (from the SDRAM itself: every store goes there, so it
+                    # holds what the cache does)
                     word = yield from sdram_read(port, sdram_word)
                 else:
                     word = ram[k]
@@ -413,7 +472,11 @@ def rv32ima(port, image=(0x0000006F,) * RAM_WORDS):
                         new = word if word < b else b
                     elif kind == 28:
                         new = word if word > b else b
-                    if in_sdram:
+                    if in_sdram:                 # (written through, as a store)
+                        tag = tags[(address >> 5) & (LINES - 1)]
+                        yield
+                        if tag == ((address >> CACHE_SHIFT) & 4095) | TAG_VALID:
+                            cache[(address >> 2) & (CACHE_WORDS - 1)] = new
                         yield from sdram_write(port, sdram_word, new)
                     else:
                         ram[k] = new
@@ -542,7 +605,7 @@ PINS.update({("sdram_cs_n" if _name == "cs_n" else _name): _pin for _name, _pin 
 
 # The CPU's requests to the SDRAM controller, and its answers
 SDRAM_WIRES = {**{f"sdram.{n}": f"cpu.{n}" for n in ("req", "req_write", "req_address", "req_data",
-                                                     "req_mask")},
+                                                     "req_mask", "req_line")},
                **{f"cpu.{n}": f"sdram.{n}" for n in ("req_ready", "resp_valid", "resp_data")}}
 
 

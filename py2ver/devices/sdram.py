@@ -7,6 +7,7 @@ request and a response:
 
     req, req_write, req_address, req_data, req_mask  -> the access (address in words,
                                                         the mask: the bytes to write)
+    req_line                                         -> 1: a read of a line, LINE_WORDS words
     req_ready                                        <- 1 for the clock it is taken
     resp_valid, resp_data                            <- a read's word, for a clock
 
@@ -14,6 +15,11 @@ which a client process drives with its steps:
 
     yield from sdram_write(port, address, data)              # (mask=: some bytes only)
     data = yield from sdram_read(port, address)
+    yield from sdram_read_line(port, address)                # (then LINE_WORDS resp_valids)
+
+A line's words (its address a multiple of LINE_WORDS) come a word every two
+clocks, all from one opening of the row: 8 words in 24 clocks, where eight
+reads of a word take 80.
 
 A word is two halfwords next to each other in a row: the controller opens the
 row, reads or writes the two (the second closing the row again), and every
@@ -31,6 +37,7 @@ from typing import NamedTuple
 from ..protocol import wait_until
 
 WORDS = 1 << 23                          # 32 MB in 32-bit words
+LINE_WORDS = 8                           # a line's words (a cache's line: 32 bytes)
 
 
 class SdramTiming(NamedTuple):
@@ -56,8 +63,8 @@ SDRAM_PINS = {"dram_clk": "DRAM_CLK", "cke": "DRAM_CKE", "cs_n": "DRAM_CS_N",
               "dq_out": "DRAM_DQ", "dq_in": "DRAM_DQ"}
 
 # The controller's attr: the client's inputs, and the pins' kinds
-SDRAM_ATTR = {"req": 1, "req_write": 1, "req_address": 23, "req_data": 32, "req_mask": 4,
-              "dq_in": 16, "dq_out": {"width": 16, "tristate": "dq_oe"},
+SDRAM_ATTR = {"req": 1, "req_write": 1, "req_line": 1, "req_address": 23, "req_data": 32,
+              "req_mask": 4, "dq_in": 16, "dq_out": {"width": 16, "tristate": "dq_oe"},
               "dram_clk": {"width": 1, "clock": "inverted"}}
 
 
@@ -112,6 +119,7 @@ def sdram_controller(port, timing=TIMING):
             since = 0
         elif port.req:                               # ---- the client's access ----
             write = port.req_write
+            line = port.req_line
             word = port.req_address
             data = port.req_data
             mask = port.req_mask
@@ -136,6 +144,31 @@ def sdram_controller(port, timing=TIMING):
                 port.dqm = 0
                 yield timing.after
                 since = since + timing.rcd + 2 + timing.after
+            elif line:
+                # A READ a clock, 2 x LINE_WORDS of them (the last closing the
+                # row), each one's halfword read_delay clocks later: clock j
+                # gives READ j and takes the data of READ j - read_delay.
+                j = 0
+                low = 0
+                while j < 2 * LINE_WORDS + timing.read_delay:
+                    port.resp_valid = 0
+                    if j < 2 * LINE_WORDS:
+                        port.cs_n = 0                # READ
+                        port.cas_n = 0
+                        port.addr = column + j if j < 2 * LINE_WORDS - 1 else (1 << 10) | (column + j)
+                    else:
+                        port.cs_n = 1                # NOP
+                        port.cas_n = 1
+                    if j >= timing.read_delay:
+                        if (j - timing.read_delay) & 1:
+                            port.resp_data = (port.dq_in << 16) | low
+                            port.resp_valid = 1
+                        else:
+                            low = port.dq_in
+                    yield
+                    j = j + 1
+                port.resp_valid = 0
+                since = since + timing.rcd + 2 * LINE_WORDS + timing.read_delay
             else:
                 port.addr = column
                 yield from sdram_command(port, 1, 0, 1)          # READ the low half
@@ -163,6 +196,7 @@ def sdram_write(port, address, data, mask=15):
     port.req_data = data
     port.req_mask = mask
     port.req_write = 1
+    port.req_line = 0
     port.req = 1
     yield
     yield from wait_until(port, "req_ready")
@@ -173,12 +207,26 @@ def sdram_read(port, address):
     """Read the word at a word address."""
     port.req_address = address
     port.req_write = 0
+    port.req_line = 0
     port.req = 1
     yield
     yield from wait_until(port, "req_ready")
     port.req = 0
     yield from wait_until(port, "resp_valid")
     return port.resp_data
+
+
+def sdram_read_line(port, address):
+    """Ask for the line of LINE_WORDS words at a word address (a multiple of
+    LINE_WORDS), and return once the controller has taken it: its words then
+    come in order, each on resp_data for the clock resp_valid is 1."""
+    port.req_address = address
+    port.req_write = 0
+    port.req_line = 1
+    port.req = 1
+    yield
+    yield from wait_until(port, "req_ready")
+    port.req = 0
 
 
 # ----------------------------- a model, for testbenches -----------------------------
@@ -250,8 +298,18 @@ class SdramModel:
         elif name == "refresh":
             assert not self.open, f"{where}: a refresh with rows open"
 
+    @staticmethod
+    def _halfword(address):
+        """Where the controller keeps a word: its low halfword's address in the chip."""
+        return ((address >> 21) << 22) | (((address >> 8) & 8191) << 9) | ((address & 255) << 1)
+
     def word(self, address):
         """The 32-bit word at a word address, as the controller stores it."""
-        h = ((address >> 21) << 22) | (((address >> 8) & 8191) << 9) | ((address & 255) << 1)
+        h = self._halfword(address)
         return self.mem.get(h, 0) | (self.mem.get(h + 1, 0) << 16)
+
+    def put(self, address, value):
+        """Store a 32-bit word at a word address, where the controller would."""
+        h = self._halfword(address)
+        self.mem[h], self.mem[h + 1] = value & 0xFFFF, value >> 16
 

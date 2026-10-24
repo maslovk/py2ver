@@ -28,6 +28,7 @@ def memory_test(port, words=WORDS, stride=1):
     port.req_address = 0
     port.req_data = 0
     port.req_mask = 15
+    port.req_line = 0
     port.leds = 0
     yield from jtag_print(port, b"sdram test\n")
     passes = 0
@@ -96,8 +97,8 @@ def sdram_test(words=WORDS, stride=1, timing=SdramTiming()):
     test = functools.partial(memory_test, words=words, stride=stride)
     controller = functools.partial(sdram_controller, timing=timing)
     return connect(sdram=(controller, SDRAM_ATTR), test=(test, TEST_ATTR), name="sdram_test",
-                   wires={f"sdram.{n}": f"test.{n}"
-                          for n in ("req", "req_write", "req_address", "req_data", "req_mask")}
+                   wires={f"sdram.{n}": f"test.{n}" for n in ("req", "req_write", "req_address",
+                                                               "req_data", "req_mask", "req_line")}
                    | {f"test.{n}": f"sdram.{n}" for n in ("req_ready", "resp_valid", "resp_data")})
 
 

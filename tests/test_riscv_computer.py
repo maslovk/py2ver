@@ -43,20 +43,35 @@ def test_a_c_program_prints_and_echoes(sim, monkeypatch, tmp_path):
     assert b"610 987 \n" in printed and printed.endswith(b"I echo:\nok")
 
 
+def _memtest(words, stride, passes, sim, chip):
+    image = R.build("memtest.c", defines=(f"WORDS={words}", f"STRIDE={stride}", f"PASSES={passes}"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        p = Py2ver(R.cpu_with_sdram(image, timing=SdramTiming(power_up=20, refresh=60)))
+    return p.check(R.console(b"done\n", chip=chip), verilog=sim).value
+
+
 @pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
 def test_the_sdram_holds_words_bytes_halves_and_code(sim, monkeypatch, tmp_path):
     # (memtest.c on the CPU and the SDRAM controller, the chip's model behind
-    # them: 24 words spread over the banks, written, changed a byte or a half
-    # at a time, read back by loads and atomic adds; and a function run from
-    # the SDRAM)
+    # them: 24 words spread over the banks, each a line of its own, written,
+    # changed a byte or a half at a time, read back by loads and atomic adds;
+    # and a function run from the SDRAM, then changed and run again)
     monkeypatch.chdir(tmp_path)
-    image = R.build("memtest.c", defines=("WORDS=24", "STRIDE=211001", "PASSES=1"))
-    with contextlib.redirect_stdout(io.StringIO()):
-        p = Py2ver(R.cpu_with_sdram(image, timing=SdramTiming(power_up=20, refresh=60)))
     chip = SdramModel()
-    run = p.check(R.console(b"done\n", chip=chip), verilog=sim)
-    assert run.value == b"SDRAM test\nrunning from the SDRAM: ok\npass 1: 0 words wrong\ndone\n"
+    printed = _memtest(24, 211_001, 1, sim, chip)
+    assert printed == b"SDRAM test\nrunning from the SDRAM: ok\npass 1: 0 words wrong\ndone\n"
     assert chip.word(0) == 0x42021 ^ 0xFF        # (the first random number, its low byte inverted)
+
+
+@pytest.mark.parametrize("sim", [False, pytest.param(True, marks=pytest.mark.sim)])
+@pytest.mark.parametrize("stride", [1, 2049])
+def test_the_cache_keeps_up_with_stores(stride, sim, monkeypatch, tmp_path):
+    # (stride 1: 64 words in 8 lines, the second pass storing into lines the
+    # cache holds; 2049, 8 KB and a word: lines taking each other's place)
+    monkeypatch.chdir(tmp_path)
+    printed = _memtest(64, stride, 2, sim, SdramModel())
+    assert printed.endswith(b"pass 1: 0 words wrong\npass 2: 0 words wrong\ndone\n")
+    assert b"running from the SDRAM: ok\n" in printed
 
 
 def _riscv_tests():
